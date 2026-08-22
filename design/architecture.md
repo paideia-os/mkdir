@@ -98,12 +98,20 @@ rax = MK_OK on success or one of MK_TXN_OPEN_FAIL / MK_MKDIR_FAIL /
 
 The M1 body:
 
-1. **Multi-level guard.** Walk `path` looking for `'/'` (0x2F). If
-   found and `flag_p == 0`, return `MK_MULTI_LEVEL_UNSUPPORTED` — this
-   is the M2 territory (`-p` create-parents). M1 accepts single-level
-   only; `mkdir a/b` without `-p` is the M1 shape rejection.
-2. **-v diagnostic** (if `flag_v == 1`). `emit_stderr("mkdir: creating ")`
-   + `emit_stderr(path)` + `emit_stderr("\n")`.
+1. **Multi-level guard.** Walk `path` looking for `'/'` (0x2F). Any hit
+   returns `MK_MULTI_LEVEL_UNSUPPORTED` at M1 — REGARDLESS of `flag_p`
+   (M1 accepts single-level only). `-p` is stored and recognised by the
+   flag walker at M1-002 but has no code branch until `mkdir.M2-001`
+   lands the multi-level TXN. The M1 code path is intentionally
+   permissive of the flag on the argv and strict on the path, so an M2
+   patch does not have to rewrite the CLI grammar to enable it.
+2. **-v diagnostic** (if `flag_v == 1`). DEFERRED at M1-003: the
+   verbose line lands with the `CreatedDirRecord` text-render at
+   `mkdir.M3-001`. Emitting the path here at M1 needs a `strlen`
+   helper `sys_debug_puts` demands a byte-count; the M3 semantic-pipe
+   send_record carries a typed record so `strlen` is not needed on the
+   `-v` path once M3 lands. `flag_v` is stored at M1-002 and read at
+   M3-001; M1-003 does not read it.
 3. **--dry-run short-circuit** (if `flag_dry_run == 1`). Return `MK_OK`
    without touching either cap. This branch exists at M1 so downstream
    tests can exercise the argv path in isolation from the still-being-

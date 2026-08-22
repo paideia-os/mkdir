@@ -1,10 +1,12 @@
-// src/mkdir.pdx — mkdir.M1-001 + M1-002
+// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003
 // Mkdir module: _init_caps sidecar declaration + _start orchestrator +
-// argv wire-up + flag walk. M1-001 landed the scaffold shape (ring3
-// marker + sys_exit(0)); M1-002 lands the argv surface — Parser::parse_argv
-// (libpdx-argv), well-known flag walk over `-p / -v / --dry-run`, and the
-// missing-operand rejection. M1-003 will land the mkdir_one create
-// sequence and mkdir_run positional walk.
+// argv wire-up + flag walk + mkdir_one create sequence + mkdir_run
+// positional walk. M1-001 landed the scaffold shape (ring3 marker +
+// sys_exit(0)); M1-002 lands the argv surface (Parser::parse_argv,
+// well-known flag walk over `-p / -v / --dry-run`, missing-operand
+// rejection); M1-003 lands the single-level create sequence (multi-
+// level guard, --dry-run short-circuit, and the placeholder TXN-open →
+// create-dir → TXN-commit chain that waits on the M2 substrate).
 //
 // See design/architecture.md §2 (module boundary), §3 (_start shape),
 // §5 (flag semantics table), and §6 (sidecar cap slot map).
@@ -73,6 +75,19 @@ module Mkdir = structure {
 
   pub let err_no_operand_msg  : [u8; 24] = "mkdir: missing operand\n\0"
   pub let err_no_operand_len  : u64 = 23
+
+  // ---- M1-003 mkdir_one diagnostic strings ----
+  pub let err_multi_msg       : [u8; 40] = "mkdir: multi-level path needs M2 (-p)\n\0\0"
+  pub let err_multi_len       : u64 = 38
+
+  pub let err_txn_open_msg    : [u8; 24] = "mkdir: TXN open failed\n\0"
+  pub let err_txn_open_len    : u64 = 23
+
+  pub let err_mkdir_msg       : [u8; 22] = "mkdir: create failed\n\0"
+  pub let err_mkdir_len       : u64 = 21
+
+  pub let err_commit_msg      : [u8; 26] = "mkdir: TXN commit failed\n\0"
+  pub let err_commit_len      : u64 = 25
 
   // ============================================================================
   // Bootstrap argv (mkdir.M1-002 self-test)
@@ -260,9 +275,234 @@ module Mkdir = structure {
     }
 
   // ============================================================================
+  // mkdir_one(path) -> rc                                    (mkdir.M1-003)
+  //
+  // Signature: mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap}
+  //   rdi = path — NUL-terminated string (a live pointer into argv or a
+  //                positional slot in ParsedArgs::pos_ptrs)
+  //   rax = MK_OK                        (0)
+  //       | MK_MULTI_LEVEL_UNSUPPORTED   (3)  — path contains '/'
+  //       | MK_TXN_OPEN_FAIL             (4)  — sys_cap_invoke(SLOT_TXN,...)
+  //       | MK_MKDIR_FAIL                (5)  — sys_cap_invoke(SLOT_PARENT_FILE,...)
+  //       | MK_TXN_COMMIT_FAIL           (6)  — sys_cap_invoke(SLOT_TXN,...) commit
+  //
+  // Steps (per design/architecture.md §4):
+  //   1. Multi-level guard. Any '/' in path → MK_MULTI_LEVEL_UNSUPPORTED
+  //      at M1 (even with -p; multi-level TXN atomic create lands at
+  //      mkdir.M2-001, not M1-003).
+  //   2. -v diagnostic. DEFERRED at M1-003 to keep the file free of a
+  //      strlen helper; verbose emit lands with the CreatedDirRecord
+  //      text-render at mkdir.M3-001 (see design/architecture.md §5).
+  //   3. --dry-run short-circuit. Return MK_OK without touching either
+  //      cap. This is the smoke-witness path at M1 — the bootstrap
+  //      argv includes --dry-run so mkdir_one reaches MK_OK without
+  //      needing the (not-yet-implemented) create-dir op on
+  //      KIND_PDXFS_FILE.
+  //   4. TXN open — placeholder sys_cap_invoke(SLOT_TXN=0,
+  //      PXT_OP_QUERY_ID=0). Real "open TXN" op lands kernel-side
+  //      alongside mkdir.M2-001; QUERY_ID exercises the cap dispatch
+  //      path so a mis-seeded slot 0 surfaces here at M1 rather than
+  //      at M2. Negative rax → MK_TXN_OPEN_FAIL.
+  //   5. Create dir — placeholder sys_cap_invoke(SLOT_PARENT_FILE=1,
+  //      PFF_OP_DEBUG_PRINT=6). Real create-dir op (with the path
+  //      string marshalled through the sidecar or an IPC endpoint)
+  //      lands at mkdir.M2. Negative rax → MK_MKDIR_FAIL.
+  //   6. Cap-tail owner — DEFERRED to mkdir.M2-003. The invoker's
+  //      KIND_USER cap sits in slot 2 unread at M1-003.
+  //   7. TXN commit — placeholder sys_cap_invoke(SLOT_TXN=0,
+  //      PXT_OP_QUERY_STATE=4). Real commit op lands at mkdir.M2.
+  //      Negative rax → MK_TXN_COMMIT_FAIL.
+  //
+  // Register plan (SysV push/pop parity preserved):
+  //   push rbx        — one push aligns rsp for nested `call`s. rbx
+  //                     holds `path` across every emit_stderr /
+  //                     syscall so the caller-save clobber does not
+  //                     lose the pointer.
+  //   rax  = byte load / syscall return / MK_* return value
+  //   rcx  = path walk cursor (Step 1)
+  //   rdi/rsi = syscall args (SysV) / emit_stderr args
+  //   r11  = LEA scratch (paideia-as reserved)
+  //   pop rbx — restores caller's rbx before ret.
+  //
+  // Effects / capabilities:
+  //   mem     — path byte scans + emit_stderr writes.
+  //   sysreg  — every sys_cap_invoke SYSCALL.
+  //   @{cap}  — sys_cap_invoke is cap-gated.
+  // ============================================================================
+  pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (path: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.M1-003 mkdir_one — single-level create sequence. Steps: (1) walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED at M1 (multi-level TXN is M2-001, even with -p; the flag is stored + honoured for the recognizer path but has no code branch at M1); (2) -v diagnostic deferred to mkdir.M3-001 (no strlen helper wired at M1); (3) --dry-run short-circuit returns MK_OK without touching either cap so the M1 smoke witness reaches exit 0 without needing the still-being-built kernel-side create-dir op; (4) placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) — exercises cap dispatch through KIND_PDXFS_TXN, negative rax → MK_TXN_OPEN_FAIL; (5) placeholder sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT) — exercises cap dispatch through KIND_PDXFS_FILE, negative rax → MK_MKDIR_FAIL; (6) cap-tail owner write deferred to M2-003; (7) placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) — TXN commit placeholder, negative rax → MK_TXN_COMMIT_FAIL. Same shape libpdx-cap M1 uses for cap_manifest_verify — freeze the signature at M1 so the M2 body-edit changes zero call sites. paideia-as conformance: one push rbx to align rsp AND preserve path across nested calls (single push = rsp aligned per SysV, verified by count); byte loads via xor rax,rax; mov_b (#1248 mitigation); every cmp reg,imm ≤ 0x7FFFFFFF (max 0x2F = '/'); r11 scratch. Label prefix mkdir_one_ avoids every paideia-as reserved keyword.",
+      block: {
+        // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
+        push rbx;
+        mov rbx, rdi;                             // rbx = path (survives calls)
+
+        // ---- Step 1: multi-level guard. Walk path bytes for '/'. ----
+        mov rcx, rbx;
+
+      mkdir_one_scan_head:
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je  mkdir_one_scan_done;
+        cmp rax, 0x2F;                            // '/'
+        je  mkdir_one_reject_multi;
+        add rcx, 1;
+        jmp mkdir_one_scan_head;
+
+      mkdir_one_reject_multi:
+        lea rdi, [rip + err_multi_msg];
+        mov rsi, 38;                              // err_multi_len
+        call emit_stderr;
+        mov rax, 3;                               // MK_MULTI_LEVEL_UNSUPPORTED
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_scan_done:
+        // ---- Step 2: -v emission deferred (M3-001). ----
+
+        // ---- Step 3: --dry-run short-circuit. ----
+        lea r11, [rip + flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mkdir_one_do_txn_open;
+
+        xor rax, rax;                             // MK_OK
+        jmp mkdir_one_epilogue;
+
+        // ---- Step 4: TXN open (placeholder sys_cap_invoke). ----
+      mkdir_one_do_txn_open:
+        xor rdi, rdi;                             // SLOT_TXN = 0
+        xor rsi, rsi;                             // PXT_OP_QUERY_ID = 0
+        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_one_txn_open_fail;
+
+        // ---- Step 5: create dir (placeholder sys_cap_invoke). ----
+        mov rdi, 1;                               // SLOT_PARENT_FILE = 1
+        mov rsi, 6;                               // PFF_OP_DEBUG_PRINT = 6
+        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_one_mkdir_fail;
+
+        // ---- Step 6: cap-tail owner write — DEFERRED to M2-003. ----
+
+        // ---- Step 7: TXN commit (placeholder sys_cap_invoke). ----
+        xor rdi, rdi;                             // SLOT_TXN = 0
+        mov rsi, 4;                               // PXT_OP_QUERY_STATE = 4
+        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_one_commit_fail;
+
+        xor rax, rax;                             // MK_OK
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_txn_open_fail:
+        lea rdi, [rip + err_txn_open_msg];
+        mov rsi, 23;                              // err_txn_open_len
+        call emit_stderr;
+        mov rax, 4;                               // MK_TXN_OPEN_FAIL
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_mkdir_fail:
+        lea rdi, [rip + err_mkdir_msg];
+        mov rsi, 21;                              // err_mkdir_len
+        call emit_stderr;
+        mov rax, 5;                               // MK_MKDIR_FAIL
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_commit_fail:
+        lea rdi, [rip + err_commit_msg];
+        mov rsi, 25;                              // err_commit_len
+        call emit_stderr;
+        mov rax, 6;                               // MK_TXN_COMMIT_FAIL
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_epilogue:
+        pop rbx;                                  // restore caller's rbx
+        ret
+      }
+    }
+
+  // ============================================================================
+  // mkdir_run() — walk pos_ptrs[0..pos_count], call mkdir_one on each.
+  //
+  // Signature: mkdir_run : () -> () !{mem, sysreg} @{cap}
+  //
+  // On the first non-MK_OK return from mkdir_one, records the code in
+  // MkdirState::exit_code and the offending index in
+  // MkdirState::err_pos_index and stops the walk (fail-fast — no
+  // partial "some created, some not" state at M1).
+  //
+  // Uses MkdirState::mkdir_run_i as loop-counter storage so the counter
+  // survives mkdir_one calls without a callee-save push. Safe at M1
+  // because mkdir_run runs at most once per _start invocation.
+  //
+  // Register plan (leaf-ish; no callee-save needed thanks to the .bss
+  // loop counter):
+  //   rax = index / mkdir_one return
+  //   rcx = pos_count (bound)
+  //   rdi = pos_ptrs[i] (arg to mkdir_one)
+  //   r11 = LEA scratch
+  // ============================================================================
+  pub let mkdir_run : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.M1-003 mkdir_run — positional walk. Iterates MkdirState::mkdir_run_i over 0..ParsedArgs::pos_count; each iteration loads pos_ptrs[i] and calls mkdir_one. On first non-MK_OK return records MkdirState::exit_code + err_pos_index and returns (fail-fast — no partial completion at M1). Loop counter lives in .bss so it survives mkdir_one's clobber of every caller-save reg — same trick dispatch.pdx's echo_builtin uses for its echo_idx slot (see paideia-os src/user/dispatch.pdx L165 justification). paideia-as conformance: r11 scratch (LEA); every cmp reg,imm ≤ 0x7FFFFFFF; no `test` mnemonic; leaf-with-nested-calls but no callee-save state so no push/pop parity needed. Labels prefixed mkdir_run_.",
+      block: {
+        // Initialize i = 0.
+        xor rax, rax;
+        lea r11, [rip + mkdir_run_i];
+        mov [r11], rax;
+
+      mkdir_run_loop_head:
+        lea r11, [rip + mkdir_run_i];
+        mov rax, [r11];
+
+        lea r11, [rip + pos_count];
+        mov rcx, [r11];
+
+        cmp rax, rcx;
+        jge mkdir_run_done;
+
+        // rdi = pos_ptrs[i]
+        lea r11, [rip + pos_ptrs];
+        mov rdi, [r11 + rax*8];
+        call mkdir_one;
+        // rax = mkdir_one return code.
+
+        cmp rax, 0;
+        je  mkdir_run_advance;
+
+        // Non-OK: record + stop.
+        lea r11, [rip + exit_code];
+        mov [r11], rax;
+
+        lea r11, [rip + mkdir_run_i];
+        mov rcx, [r11];
+        lea r11, [rip + err_pos_index];
+        mov [r11], rcx;
+        ret
+
+      mkdir_run_advance:
+        lea r11, [rip + mkdir_run_i];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp mkdir_run_loop_head;
+
+      mkdir_run_done:
+        ret
+      }
+    }
+
+  // ============================================================================
   // _start — user program entry point. Never returns (ends in sys_exit).
   //
-  // M1-002 shape (this milestone):
+  // M1-003 shape (this milestone):
   //   Step 0  ring3 proof-of-life marker on sys_debug_puts.
   //   Step 1  mkdir_state_reset()   — clear MkdirState singletons.
   //   Step 2  reset()               — clear ParsedArgs singletons (libpdx-argv).
@@ -272,7 +512,10 @@ module Mkdir = structure {
   //   Step 5  parse_flags_from_argv() — populate MkdirState::flag_*.
   //   Step 6  Check ParsedArgs::pos_count. If zero → emit err_no_operand_msg
   //           and sys_exit(MK_MISSING_PATH).
-  //   Step 7  sys_exit(MK_OK). mkdir_run() call arrives at mkdir.M1-003.
+  //   Step 7  mkdir_run() — walk positionals, invoke mkdir_one per path.
+  //           On first failure records MkdirState::exit_code + err_pos_index.
+  //   Step 8  sys_exit(MkdirState::exit_code) — 0 on all-success, otherwise
+  //           the first mkdir_one MK_* return.
   //
   // Register discipline
   // -------------------
@@ -291,7 +534,7 @@ module Mkdir = structure {
   pub let _start : () -> () !{mem, sysreg} @{sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched},
-      justification: "mkdir.M1-002 _start orchestrator. Full argv surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + argv_bootstrap build + parse_argv + argv-error diagnostic + parse_flags_from_argv + missing-operand diagnostic + sys_exit. mkdir_run wire-up lands at mkdir.M1-003. Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: 60 sys_exit ID). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `emit_stderr` → local). Bootstrap argv array is built via three lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp).",
+      justification: "mkdir.M1-003 _start orchestrator. Full argv + create surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + argv_bootstrap build + parse_argv + argv-error diagnostic + parse_flags_from_argv + missing-operand diagnostic + mkdir_run + sys_exit(exit_code). Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: 60 sys_exit ID). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `mkdir_run`, `mkdir_one`, `emit_stderr` → local). Bootstrap argv array is built via three lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp). M1 smoke witness: bootstrap argv `-v --dry-run a` → parse OK → flags {v=1, dry_run=1} → pos_count=1 → mkdir_run calls mkdir_one(\"a\") which short-circuits on --dry-run and returns MK_OK → exit_code=0 → exit(0). Real cap invocation (Steps 4/5/7 of mkdir_one) exercises when a shell hands us a real TXN cap at mkdir.M2.",
       block: {
         // ---- Step 0: ring3 proof-of-life marker. ----
         lea rdi, [rip + ring3_msg];
@@ -349,8 +592,12 @@ module Mkdir = structure {
         syscall;
 
       mkdir_after_operand_ok:
-        // ---- Step 7: sys_exit(MK_OK). mkdir_run wire-up at M1-003. ----
-        xor rdi, rdi;                             // MK_OK = 0
+        // ---- Step 7 (M1-003): walk positionals. ----
+        call mkdir_run;
+
+        // ---- Step 8: sys_exit(MkdirState::exit_code). 0 on all-success. ----
+        lea r11, [rip + exit_code];
+        mov rdi, [r11];
         mov rax, 60;                              // SC+ ID 60 = sys_exit
         syscall;
 

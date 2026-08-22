@@ -1,7 +1,9 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M1 (design + skeleton) — in progress.
+**Current milestone:** M1 (design + skeleton) — CLOSED. Ready for M2
+(core implementation: `-p` create-parents multi-level TXN, pre-existing
+idempotence, cap-tail owner write).
 
 ## Milestone rollup
 
@@ -9,7 +11,7 @@
 |-----------------|------------------------------------------------------------------------|--------|
 | M1-001 (#1)     | scaffold + caps.decl (target-parent write cap + TXN cap)               | LANDED |
 | M1-002 (#2)     | argv surface via libpdx-argv (mkdir [-p\|-v\|--dry-run])               | LANDED |
-| M1-003 (#3)     | first runnable: single-level mkdir a in TXN with cap-tail as owner     | pending |
+| M1-003 (#3)     | first runnable: single-level mkdir a in TXN with cap-tail as owner     | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.

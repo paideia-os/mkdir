@@ -48,6 +48,9 @@ module MkdirState = structure {
   pub let mut flag_dry_run    : u64 = uninit @align(8)  // 1 iff --dry-run seen
   pub let mut exit_code       : u64 = uninit @align(8)  // sys_exit arg
   pub let mut err_pos_index   : u64 = uninit @align(8)  // pos_ptrs[i] that failed
+  pub let mut mkdir_run_i     : u64 = uninit @align(8)  // mkdir_run loop counter
+                                                        // (survives mkdir_one calls
+                                                        //  without callee-save push)
 
   // mkdir_state_reset() — zero the three flag slots, the exit code, and
   // the error positional index so a subsequent _start starts from a
@@ -74,6 +77,7 @@ module MkdirState = structure {
         lea r11, [rip + flag_dry_run];  mov [r11], rax;
         lea r11, [rip + exit_code];     mov [r11], rax;
         lea r11, [rip + err_pos_index]; mov [r11], rax;
+        lea r11, [rip + mkdir_run_i];   mov [r11], rax;
         ret
       }
     }
