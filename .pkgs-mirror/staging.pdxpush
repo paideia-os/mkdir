@@ -1,0 +1,185 @@
+%pdxpush 0.1
+%tool    mkdir
+%ver     1.0.0
+%wave    R50
+%source  github.com/paideia-os/mkdir
+%target  https://pkgs.paideia-os/staging/mkdir/1.0.0/
+%promote https://pkgs.paideia-os/main/mkdir/1.0.0/
+%plan    design/tooling/plan.md §6.3 + §9.3 (paideia-os)
+
+# staging.pdxpush — mkdir 1.0.0 mirror-push manifest
+#
+# This file documents the M5-002 mirror-push step. At v1.0 the mirror
+# host `pkgs.paideia-os` (T-INFRA-001 in `design/tooling/plan.md` §10)
+# is not yet stood up, so an actual HTTPS PUT cannot happen here. The
+# same placeholder-shape-frozen strategy the M4 QEMU smoke fixtures
+# use applies: land the push contract byte-frozen, so when the mirror
+# host comes up the push script has nothing to invent.
+#
+# The signing bot (T-INFRA-002) runs the push as a two-phase promote:
+#
+#   Phase 1 — Author push to staging/
+#     Author runs `paideia-as release --sign` locally which:
+#       (a) tarballs the 17 files listed in manifest.pdxsig [manifest]
+#           into pkg.tar (SHA-256 over pkg.tar embedded in
+#           index.pdxsig, see [tar-layout] below).
+#       (b) writes the author-signed `manifest.pdxsig` alongside.
+#       (c) HTTPS-PUTs both files to
+#           https://pkgs.paideia-os/staging/mkdir/1.0.0/.
+#     Result: package sits in staging/, verifiable under author_pk only.
+#
+#   Phase 2 — Bot re-sign to main/ (human-in-the-loop review)
+#     The signing bot polls staging/, and for each newly-arrived pkg:
+#       (a) verifies the author signature against the registered
+#           author_pk for `paideia-os-team`.
+#       (b) opens a review UI showing: source-tree diff (git tag v1.0.0
+#           on this repo vs. previous release), CHANGELOG.md 1.0.0
+#           entry, caps.decl diff, deps.list diff.
+#       (c) on reviewer approve, re-signs manifest.pdxsig with
+#           paideia_root_pk (§D4 second signature) and copies both
+#           files to https://pkgs.paideia-os/main/mkdir/1.0.0/.
+#       (d) updates https://pkgs.paideia-os/main/index.pdxsig with a
+#           new row {name=mkdir, version=1.0.0, hash=<pkg.tar sha256>}
+#           and re-signs the index under paideia_root_pk.
+#     Result: `pkg install mkdir` on any user's machine now resolves
+#     v1.0.0 on the next `pkg upgrade` or explicit install.
+
+# ============================================================================
+# §1 [tar-layout] — files that go into pkg.tar
+# ============================================================================
+#
+# 17 files, alphabetically sorted (same order as manifest.pdxsig
+# [manifest] hash table). Each row: path, size in bytes at v1.0
+# commit `b12b264` (which is the M5-001 predecessor commit; the M5-001
+# commit hash is captured at push time and written into
+# [push-metadata] below).
+
+[tar-layout]
+LICENSE
+README.md
+caps.decl
+deps.list
+design/architecture.md
+doc/mkdir.pdxdoc
+src/mkdir.pdx
+src/mkdir_state.pdx
+tests/expected-mkdir-m4-001-multi.txt
+tests/expected-mkdir-m4-001-single.txt
+tests/expected-mkdir-m4-002-mixed.txt
+tests/expected-mkdir-m4-003-abort.txt
+tests/expected-mkdir-m4-004-owner.txt
+tests/test_m4_001_single_multi.pdx
+tests/test_m4_002_mixed_pre_existing.pdx
+tests/test_m4_003_txn_abort.pdx
+tests/test_m4_004_cap_tail.pdx
+
+# Files that stay OUT of pkg.tar (documented here so a future
+# release-script diff catches accidental inclusion):
+#   - manifest.pdxsig   (sits BESIDE pkg.tar in the mirror layout)
+#   - CHANGELOG.md      (release-notes view, not a runtime artifact)
+#   - STATUS.md         (repo-scope, not per-package)
+#   - .plans/*          (implementation notes, per-repo only)
+#   - .git/*            (obviously)
+#   - .pkgs-mirror/*    (this manifest, meta-file only)
+
+# ============================================================================
+# §2 [pkgs-tree] — mirror layout after promote
+# ============================================================================
+#
+# The final layout under https://pkgs.paideia-os/main/ after Phase 2:
+
+[pkgs-tree]
+main/
+  index.pdxsig                              (signed under paideia_root_pk)
+  mkdir/
+    1.0.0/
+      pkg.tar                               (17 files per [tar-layout])
+      manifest.pdxsig                       (dual-signed per §D4)
+
+# `pkg install mkdir` fetches:
+#   1. https://pkgs.paideia-os/main/index.pdxsig       (verify root sig)
+#   2. https://pkgs.paideia-os/main/mkdir/1.0.0/manifest.pdxsig
+#      (verify BOTH sigs — author + root)
+#   3. https://pkgs.paideia-os/main/mkdir/1.0.0/pkg.tar
+#      (SHA-256 checked against index.pdxsig row)
+#   4. Untar into /pkgs/mkdir-1.0.0/, per-file SHA-256 checked
+#      against manifest.pdxsig [manifest] table.
+#   5. Symlink /bin/mkdir → /pkgs/mkdir-1.0.0/bin/mkdir.
+#
+# The [manifest] table in manifest.pdxsig is the authoritative content
+# hash — pkg.tar's SHA-256 in index.pdxsig is a fast-path check that
+# catches transport corruption; manifest.pdxsig catches tampering
+# through pkg.tar reconstruction. Both verifications must pass.
+
+# ============================================================================
+# §3 [push-metadata] — filled at push time
+# ============================================================================
+#
+# The signing bot fills these fields at push time — they cannot be
+# frozen at v1.0 because the M5-001 commit hash was not yet known
+# when M5-001 landed, and the release-tag timestamp is bot-clock at
+# push time (which is not the same as the M5-001 commit clock in
+# general).
+#
+# Fields marked PLACEHOLDER_* are overwritten by the signing bot with
+# real values as part of Phase 1. The line count is stable so a diff
+# between placeholder and real reveals only content changes, not
+# layout changes.
+
+[push-metadata]
+release-tag        v1.0.0
+release-commit     PLACEHOLDER_M5_001_COMMIT_HASH_______________________
+release-timestamp  PLACEHOLDER_ISO_8601_UTC_AT_BOT_PUSH_TIME____________
+pkg-tar-sha256     PLACEHOLDER_SHA256_OF_PKG_TAR_AT_PUSH_TIME___________
+author-fp          PLACEHOLDER_AUTHOR_FP___________
+paideia-root-fp    PLACEHOLDER_PAIDEIA_ROOT_FP_____
+review-approver    PLACEHOLDER_REVIEWER_HANDLE________
+review-approve-ts  PLACEHOLDER_ISO_8601_UTC_AT_REVIEW_APPROVE___________
+
+# ============================================================================
+# §4 [smoke-runbook] — post-push smoke steps (human-run)
+# ============================================================================
+#
+# After Phase 2 promote, the reviewer runs the following on a fresh
+# paideia-os VM to confirm the install path works end-to-end. Each
+# step's expected-* line is a witness the reviewer greps for; deviation
+# from the witness blocks the promote.
+
+[smoke-runbook]
+step1  pkg update
+       expected-line: `updated: 1 index` on stderr; exit 0.
+
+step2  pkg install mkdir
+       expected-line: `installed: /pkgs/mkdir-1.0.0 -> /bin/mkdir` on
+       stdout; exit 0. `pkg verify mkdir` returns exit 0 (both
+       signatures OK, all 17 file hashes match).
+
+step3  mkdir --version
+       expected-line: `mkdir 1.0.0 (build b12b264) sig=<author-fp>/<paideia-root-fp>`
+
+step4  mkdir --schema
+       expected-line: `CreatedDirRecord@0.1` (single line), exit 0.
+
+step5  mkdir a && ls a && rmdir a
+       expected: create + list + remove all exit 0. Single-level
+       happy path (mirror of M4-001 test driver, run against the real
+       shell rather than the test-runner harness).
+
+step6  mkdir -p x/y/z && ls x/y && ls x/y/z && rmdir x/y/z x/y x
+       expected: all exit 0. Multi-level happy path.
+
+step7  mkdir -p a/b && mkdir a
+       expected: exit 3 (MK_MULTI_LEVEL_UNSUPPORTED without -p) on
+       the second call (a already exists but no -p). Idempotency
+       check.
+
+step8  mkdir --no-cap:KIND_PDXFS_TXN foo
+       expected: exit 4 (I3 cap-denied), stderr line
+       `mkdir: cap stripped by user: KIND_PDXFS_TXN`.
+
+# Deviation from any expected-line aborts the promote — the reviewer
+# rolls staging back to the previous release and files a bug against
+# the mkdir repo (not against the mirror). Same discipline the M4
+# QEMU smoke fixtures used per tests/README.md.
+
+# EOF — mirror-push manifest for mkdir 1.0.0

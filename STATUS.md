@@ -1,8 +1,8 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M5-001 (dual-signed release + .pdxdoc) — LANDED.
-M5-002 (mirror push) queued.
+**Current milestone:** M5 — CLOSED. Tag `v1.0.0` at HEAD.
+mkdir is *released* per the `r49-r50-plan.md` §5.9 rubric.
 
 ## Milestone rollup
 
@@ -22,7 +22,7 @@ M5-002 (mirror push) queued.
 | M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | LANDED |
 | M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | LANDED |
 | M5-001 (#14)    | dual-signed release + .pdxdoc                                          | LANDED |
-| M5-002 (#15)    | mirror push to pkgs.paideia-os                                         | QUEUED |
+| M5-002 (#15)    | mirror push to pkgs.paideia-os                                         | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
@@ -58,6 +58,10 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
   `mkdir_run`, `mkdir_split_path`, `emit_stderr`, audit-emit helper).
 - `tests/` — M4 coreutil test drivers + `expected-*.txt` witnesses
   (M4-001..M4-004 all LANDED).
+- `.pkgs-mirror/` (M5-002) — mirror-push staging manifest
+  (`staging.pdxpush`) documenting the two-phase push flow to
+  `pkgs.paideia-os` per plan.md §6.3 + §9.3. Placeholder rows fill
+  once T-INFRA-001 (mirror host) + T-INFRA-002 (signing bot) land.
 - `.plans/` — per-milestone implementation notes.
 
 ## v1.0 release pointer
