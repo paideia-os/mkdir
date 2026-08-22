@@ -8,7 +8,7 @@
 | ID              | Title                                                                  | State  |
 |-----------------|------------------------------------------------------------------------|--------|
 | M1-001 (#1)     | scaffold + caps.decl (target-parent write cap + TXN cap)               | LANDED |
-| M1-002 (#2)     | argv surface via libpdx-argv (mkdir [-p\|-v\|--dry-run])               | pending |
+| M1-002 (#2)     | argv surface via libpdx-argv (mkdir [-p\|-v\|--dry-run])               | LANDED |
 | M1-003 (#3)     | first runnable: single-level mkdir a in TXN with cap-tail as owner     | pending |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full

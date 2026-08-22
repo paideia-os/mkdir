@@ -49,15 +49,24 @@ module MkdirState = structure {
   pub let mut exit_code       : u64 = uninit @align(8)  // sys_exit arg
   pub let mut err_pos_index   : u64 = uninit @align(8)  // pos_ptrs[i] that failed
 
-  // reset() — zero the three flag slots, the exit code, and the error
-  // positional index so a subsequent _start starts from a known-empty
-  // MkdirState. rax=0 is the value written; xor rax,rax is one byte
-  // cheaper than mov rax,0 and produces the same result. r11 is scratch
-  // (paideia-as conformance). Leaf function — no callee-save touched.
-  pub let reset : () -> () !{mem} @{} =
+  // mkdir_state_reset() — zero the three flag slots, the exit code, and
+  // the error positional index so a subsequent _start starts from a
+  // known-empty MkdirState. rax=0 is the value written; xor rax,rax is
+  // one byte cheaper than mov rax,0 and produces the same result. r11
+  // is scratch (paideia-as conformance). Leaf function — no callee-save
+  // touched.
+  //
+  // Name discipline: prefixed `mkdir_state_` per the paideia-as flat
+  // linker-name convention (`call symname`, never `call Module::name`).
+  // libpdx-argv exports its own reset as `reset` (see
+  // libpdx-argv/src/parsed_args.pdx:33); a duplicate `reset` here would
+  // collide at link time as soon as mkdir starts consuming
+  // libpdx-argv (mkdir.M1-002 calls `Parser::parse_argv`, which drags in
+  // libpdx-argv's `reset` symbol as a link neighbour).
+  pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 MkdirState::reset. Five lea+mov stores zero the singleton flag/exit/err slots so parse_flags_from_argv and mkdir_run start from a known baseline. Same discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx — the .bss arrays that back this module have no live tail past what the flag_* slots record, so zeroing the counters is sufficient. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 (renamed at M1-002 to dodge libpdx-argv reset collision) MkdirState mkdir_state_reset. Five lea+mov stores zero the singleton flag/exit/err slots so parse_flags_from_argv and mkdir_run start from a known baseline. Same discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx — the .bss arrays that back this module have no live tail past what the flag_* slots record, so zeroing the counters is sufficient. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
         lea r11, [rip + flag_p];        mov [r11], rax;

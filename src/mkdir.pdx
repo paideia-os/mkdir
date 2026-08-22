@@ -1,11 +1,13 @@
-// src/mkdir.pdx — mkdir.M1-001
-// Mkdir module: _init_caps sidecar declaration + _start skeleton. M1-001
-// lands the scaffold shape only — no argv parse, no cap invocations.
-// mkdir.M1-002 adds the libpdx-argv wire-up + flag walk; mkdir.M1-003
-// adds the mkdir_one create sequence (single-level, TXN-scoped).
+// src/mkdir.pdx — mkdir.M1-001 + M1-002
+// Mkdir module: _init_caps sidecar declaration + _start orchestrator +
+// argv wire-up + flag walk. M1-001 landed the scaffold shape (ring3
+// marker + sys_exit(0)); M1-002 lands the argv surface — Parser::parse_argv
+// (libpdx-argv), well-known flag walk over `-p / -v / --dry-run`, and the
+// missing-operand rejection. M1-003 will land the mkdir_one create
+// sequence and mkdir_run positional walk.
 //
-// See design/architecture.md §2 (module boundary) and §6 (sidecar cap
-// slot map) for the shape this file lands.
+// See design/architecture.md §2 (module boundary), §3 (_start shape),
+// §5 (flag semantics table), and §6 (sidecar cap slot map).
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
 
 module Mkdir = structure {
@@ -28,7 +30,7 @@ module Mkdir = structure {
   //   WRITE=0x002, INVOKE=0x008 → 0x00A.
   //
   // target_ptr at M1 is 0 for every row — the shell fills it via
-  // sys_cap_transfer before the exec landing. This matches echo_client's
+  // sys_cap_transfer before the exec landing. Matches echo_client's
   // sidecar shape at R31.M2-1590 (endpoint_ids were baked in there
   // because the loader claimed both endpoints by id; here the parent
   // shell owns the resolution).
@@ -52,62 +54,304 @@ module Mkdir = structure {
   ]
 
   // ============================================================================
-  // Static stderr strings. sys_debug_puts (SC+ ID 12) is the M1 stderr
-  // proxy; M3-001 replaces every call with a schema-tagged send_record
-  // on the KIND_IPC_ENDPOINT at slot 3.
+  // Static stderr / diagnostic strings.
+  //
+  // sys_debug_puts (SC+ ID 12) is the M1 stderr proxy; M3-001 replaces
+  // every call site with a schema-tagged send_record over the
+  // KIND_IPC_ENDPOINT at slot 3.
   //
   // Each string is NUL-terminated so a future emit_stderr overload that
   // takes a NUL-terminated pointer can share the byte storage; the
-  // paired *_len constants are what M1 passes to sys_debug_puts.
+  // paired *_len constants are what M1 passes to sys_debug_puts today.
   // ============================================================================
 
-  pub let ring3_msg      : [u8; 20] = "mkdir: M1 ring3 ok\n\0"
-  pub let ring3_len      : u64 = 19
+  pub let ring3_msg           : [u8; 20] = "mkdir: M1 ring3 ok\n\0"
+  pub let ring3_len           : u64 = 19
+
+  pub let err_argv_msg        : [u8; 26] = "mkdir: argv parse error\n\0\0"
+  pub let err_argv_len        : u64 = 24
+
+  pub let err_no_operand_msg  : [u8; 24] = "mkdir: missing operand\n\0"
+  pub let err_no_operand_len  : u64 = 23
+
+  // ============================================================================
+  // Bootstrap argv (mkdir.M1-002 self-test)
+  //
+  // Real argv arrives via the shell at mkdir.M2 once shell.M4 publishes
+  // the argv-in-sidecar wire. Until then _start builds a static argv
+  // that exercises the parse path end to end — one short flag (-v),
+  // one long flag (--dry-run), and one positional (a). The three
+  // flag/positional strings live in .rodata; the argv pointer array
+  // (`argv_bootstrap_ptrs`) is built at _start entry via three lea+mov
+  // stores. Parser::parse_argv walks the pointer array and does NOT
+  // mutate the strings themselves at the shapes M1-002 exercises (no
+  // `--foo=bar` form appears here), so the strings staying .rodata is
+  // safe.
+  //
+  // Bootstrap invocation shape (three args, matches `mkdir -v --dry-run a`):
+  //   argv[0] = "-v"          → short flag, sets MkdirState::flag_v
+  //   argv[1] = "--dry-run"   → long flag, sets MkdirState::flag_dry_run
+  //   argv[2] = "a"           → positional, becomes pos_ptrs[0]
+  // The `-p` recognition is exercised via the byte-compare table in
+  // parse_flags_from_argv even though the bootstrap argv does not name
+  // it; the recognizer is data-driven and there is no code branch that
+  // fires only when `-p` is present at M1-002.
+  // ============================================================================
+
+  pub let argv_flag_v         : [u8; 3]  = "-v\0"
+  pub let argv_flag_dry_run   : [u8; 10] = "--dry-run\0"
+  pub let argv_positional_a   : [u8; 2]  = "a\0"
+
+  pub let mut argv_bootstrap_ptrs : [u64; 3] = uninit @align(8)
+  pub let argv_bootstrap_argc     : u64 = 3
+
+  // ============================================================================
+  // Well-known flag names — byte-exact compare table for
+  // parse_flags_from_argv. Every entry is NUL-terminated; the compare
+  // walks each byte in order and rejects on the first mismatch.
+  //
+  // libpdx-argv predates any strcmp helper (see the inline pdx-schema
+  // byte compare in libpdx-argv/src/parser.pdx L151..L161). We repeat
+  // the pattern here rather than pull in a strcmp dependency; when
+  // libpdx-argv.M2 factors `well_known_flag_id(name) → i64`, every
+  // consumer switches to it and this table disappears.
+  //
+  // Short-flag names are one letter (parse_argv stores just the letter,
+  // not the leading '-', at flag_names[k] after skipping the hyphen).
+  // Long-flag names are the post-`--` string (parse_argv stores that
+  // pointer at flag_names[k] with the leading `--` already stripped).
+  // ============================================================================
+
+  pub let flag_p_name         : [u8; 2]  = "p\0"
+  pub let flag_v_name         : [u8; 2]  = "v\0"
+  pub let flag_dry_run_name   : [u8; 8]  = "dry-run\0"
+
+  // ============================================================================
+  // emit_stderr(buf, len)
+  //
+  // Signature: emit_stderr : (u64, u64) -> u64 !{mem, sysreg} @{}
+  //   rdi = buf pointer (u8*)
+  //   rsi = byte count
+  //   rax = sys_debug_puts return (echoed count on success)
+  //
+  // Thin wrapper around sys_debug_puts (SC+ ID 12). Kept as its own
+  // symbol so mkdir.M3-001's rewrite is a one-line body swap (from
+  // sys_debug_puts to a semantic-pipe send_record) at exactly one call
+  // site rather than every diagnostic site. Same idiom libpdx-cap uses
+  // for cap_manifest_verify — freeze the signature at M1, evolve the
+  // body across milestones.
+  //
+  // Register plan (leaf, all caller-save; no push/pop parity):
+  //   rax = SC+ ID / syscall return
+  //   rdi = buf (untouched — passed straight through)
+  //   rsi = len (untouched — passed straight through)
+  // ============================================================================
+  pub let emit_stderr : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "mkdir.M1-002 emit_stderr — thin sys_debug_puts wrapper. SC+ ID 12 loaded into rax; rdi/rsi come straight from the SysV caller (arity 2 < 4, no arg shuffle). Kept as its own symbol so mkdir.M3-001 can swap sys_debug_puts for a semantic-pipe send_record at exactly one call site rather than every diagnostic emit. Leaf function; no callee-save touched; no push/pop parity to preserve; no cmp; no test mnemonic.",
+      block: {
+        mov rax, 12;                              // SC+ ID 12 = sys_debug_puts
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // parse_flags_from_argv()
+  //
+  // Walk ParsedArgs::flag_names[0..flag_count] and for each entry
+  // byte-compare against the three well-known names (`p`, `v`,
+  // `dry-run`). On a match, write 1 into the corresponding MkdirState
+  // slot (`flag_p`, `flag_v`, `flag_dry_run`). Unknown flags at M1-002
+  // are silently ignored — the 9-flag standard-vocabulary rejection
+  // path lands at libpdx-argv.M2-002.
+  //
+  // Called AFTER Parser::parse_argv has populated ParsedArgs; must be
+  // called BEFORE mkdir_run so mkdir_one sees the correct flag state.
+  //
+  // Register plan (leaf, all caller-save):
+  //   rax = byte load scratch (always preceded by xor rax, rax per #1248)
+  //   rcx = flag_names[k] name pointer
+  //   r8  = k (loop counter over flag_count)
+  //   r9  = flag_count (loaded once at head)
+  //   r10 = byte offset into the current name during the byte compare
+  //   r11 = LEA scratch (paideia-as reserved)
+  // ============================================================================
+  pub let parse_flags_from_argv : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkdir.M1-002 parse_flags_from_argv. Walks ParsedArgs::flag_names[0..flag_count] and byte-matches each name against `p` / `v` / `dry-run` (the three flags mkdir recognizes at M1). Sets MkdirState::flag_p / flag_v / flag_dry_run to 1 on match. Unknown flags silently ignored — libpdx-argv.M2-002 lands the 9-flag standard-vocabulary rejection path; until then the recognizer is permissive so an over-argument does not sink the whole invocation. paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every cmp reg,imm is a single-byte ASCII value ≤ 0x7A; r11 is scratch (LEA); no push/pop parity (leaf); no test mnemonic. Label prefix `mkdir_pff_` avoids every paideia-as reserved keyword.",
+      block: {
+        // Load flag_count once — the loop bound.
+        lea r11, [rip + flag_count];
+        mov r9, [r11];
+
+        // r8 = k = 0
+        xor r8, r8;
+
+      mkdir_pff_loop_head:
+        cmp r8, r9;
+        jge mkdir_pff_done;
+
+        // rcx = flag_names[k]
+        lea r11, [rip + flag_names];
+        mov rcx, [r11 + r8*8];
+
+        // ---- Try short flag `p`: name is [rcx] == 'p' && [rcx+1] == NUL ----
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0x70;                            // 'p'
+        jne mkdir_pff_try_v;
+
+        xor rax, rax;
+        mov_b rax, [rcx + 1];
+        cmp rax, 0;
+        jne mkdir_pff_try_dry_run;                // 'p...' with more bytes — not our -p
+
+        mov rax, 1;
+        lea r11, [rip + flag_p];
+        mov [r11], rax;
+        jmp mkdir_pff_advance;
+
+      mkdir_pff_try_v:
+        // ---- Try short flag `v`: name is [rcx] == 'v' && [rcx+1] == NUL ----
+        // rax already holds byte0 from the failed `p` compare, so we
+        // reload rather than assume — cheaper to reload than to branch.
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0x76;                            // 'v'
+        jne mkdir_pff_try_dry_run;
+
+        xor rax, rax;
+        mov_b rax, [rcx + 1];
+        cmp rax, 0;
+        jne mkdir_pff_try_dry_run;
+
+        mov rax, 1;
+        lea r11, [rip + flag_v];
+        mov [r11], rax;
+        jmp mkdir_pff_advance;
+
+      mkdir_pff_try_dry_run:
+        // ---- Try long flag `dry-run`: byte-compare 7 chars + NUL ----
+        // Inline byte-by-byte compare matching libpdx-argv's own
+        // pdx-schema compare pattern (parser.pdx L151..L161).
+        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x64; jne mkdir_pff_advance;  // 'd'
+        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x72; jne mkdir_pff_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x79; jne mkdir_pff_advance;  // 'y'
+        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x2D; jne mkdir_pff_advance;  // '-'
+        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x72; jne mkdir_pff_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x75; jne mkdir_pff_advance;  // 'u'
+        xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0x6E; jne mkdir_pff_advance;  // 'n'
+        xor rax, rax; mov_b rax, [rcx + 7]; cmp rax, 0;    jne mkdir_pff_advance;  // NUL
+
+        mov rax, 1;
+        lea r11, [rip + flag_dry_run];
+        mov [r11], rax;
+
+      mkdir_pff_advance:
+        add r8, 1;
+        jmp mkdir_pff_loop_head;
+
+      mkdir_pff_done:
+        ret
+      }
+    }
 
   // ============================================================================
   // _start — user program entry point. Never returns (ends in sys_exit).
   //
-  // M1-001 shape: emit the ring-3 proof-of-life marker on sys_debug_puts
-  // and exit(0). This is the smoke-matrix witness for mkdir.M1-001 —
-  // exact analogue of the "R31 ECHO CLIENT RING3 OK" line in
-  // echo_client.pdx that R31.M2-1590 uses to prove a task reached its
-  // entry point before any further code runs.
-  //
-  // mkdir.M1-002 replaces the exit(0) with the argv parse + flag walk;
-  // mkdir.M1-003 replaces the parse-only path with the full mkdir_one
-  // create sequence.
+  // M1-002 shape (this milestone):
+  //   Step 0  ring3 proof-of-life marker on sys_debug_puts.
+  //   Step 1  mkdir_state_reset()   — clear MkdirState singletons.
+  //   Step 2  reset()               — clear ParsedArgs singletons (libpdx-argv).
+  //   Step 3  Build argv_bootstrap_ptrs from the three static strings.
+  //   Step 4  parse_argv(argv, argc). On error → emit err_argv_msg and
+  //           sys_exit(MK_ARGV_ERR).
+  //   Step 5  parse_flags_from_argv() — populate MkdirState::flag_*.
+  //   Step 6  Check ParsedArgs::pos_count. If zero → emit err_no_operand_msg
+  //           and sys_exit(MK_MISSING_PATH).
+  //   Step 7  sys_exit(MK_OK). mkdir_run() call arrives at mkdir.M1-003.
   //
   // Register discipline
   // -------------------
-  // Straight-line, ends in sys_exit — no callee-save state needed, no
-  // SysV push/pop parity to preserve. All state in caller-save regs
-  // (rax/rdi/rsi/rdx/rcx/r10/r11).
+  // Straight-line body ending in sys_exit — no callee-save state
+  // needed, no SysV push/pop parity to preserve. Each nested call is
+  // to a leaf helper that uses only caller-save regs; `syscall` and
+  // `call` are both safe at any rsp alignment because none of the
+  // callees push additional callee-save (echo_client.pdx precedent).
   //
   // Effects / capabilities
   // ----------------------
-  //   mem     — string load for the debug_puts buffer.
+  //   mem     — string loads for debug_puts + argv_bootstrap array init.
   //   sysreg  — every SYSCALL.
   //   @{sched} — sys_exit terminates the task (sched teardown).
   // ============================================================================
   pub let _start : () -> () !{mem, sysreg} @{sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched},
-      justification: "mkdir.M1-001 _start scaffold. Emits `mkdir: M1 ring3 ok\\n` on sys_debug_puts (SC+ ID 12) and calls sys_exit(0) (SC+ ID 60). Same proof-of-life shape as echo_client's R31 ring3 marker — if this line does not print, the task never reached its entry point and every M1-002/M1-003 hypothesis about argv or cap dispatch is moot. Straight-line body ending in sys_exit; no callee-save touched, no SysV push/pop parity. All immediates ≤ 0x7FFFFFFF (19, 12, 0, 60). No `test` mnemonic. No cross-module label collisions (only two labels needed and both use the mkdir_ prefix).",
+      justification: "mkdir.M1-002 _start orchestrator. Full argv surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + argv_bootstrap build + parse_argv + argv-error diagnostic + parse_flags_from_argv + missing-operand diagnostic + sys_exit. mkdir_run wire-up lands at mkdir.M1-003. Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: 60 sys_exit ID). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `emit_stderr` → local). Bootstrap argv array is built via three lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp).",
       block: {
-        // ---- Step 0: MkdirState reset so any future re-entry path
-        //              starts clean. Leaf call — safe to make before
-        //              the debug marker.
-        call MkdirState::reset;
-
-        // ---- Step 1: proof-of-life marker on sys_debug_puts.
+        // ---- Step 0: ring3 proof-of-life marker. ----
         lea rdi, [rip + ring3_msg];
-        mov rsi, 19;                             // ring3_len
-        mov rax, 12;                             // SC+ ID 12 = sys_debug_puts
+        mov rsi, 19;                              // ring3_len
+        mov rax, 12;                              // SC+ ID 12 = sys_debug_puts
         syscall;
 
-        // ---- Step 2: sys_exit(MK_OK). Never returns.
-        xor rdi, rdi;                            // status = MK_OK = 0
-        mov rax, 60;                             // SC+ ID 60 = sys_exit
+        // ---- Step 1: MkdirState reset. Leaf call. ----
+        call mkdir_state_reset;
+
+        // ---- Step 2: ParsedArgs reset (libpdx-argv). Leaf call. ----
+        call reset;
+
+        // ---- Step 3: build argv_bootstrap_ptrs (three static entries). ----
+        lea rcx, [rip + argv_bootstrap_ptrs];
+        lea r11, [rip + argv_flag_v];         mov [rcx + 0],  r11;
+        lea r11, [rip + argv_flag_dry_run];   mov [rcx + 8],  r11;
+        lea r11, [rip + argv_positional_a];   mov [rcx + 16], r11;
+
+        // ---- Step 4: parse_argv(argv, argc). rdi=argv_ptr, rsi=argc. ----
+        lea rdi, [rip + argv_bootstrap_ptrs];
+        mov rsi, 3;                               // argv_bootstrap_argc
+        call parse_argv;
+        // rax = ParsedArgs::ERR_OK (0) on success.
+
+        cmp rax, 0;
+        je  mkdir_after_parse_ok;
+
+        // Argv parse error branch: emit diagnostic + sys_exit(MK_ARGV_ERR=1).
+        lea rdi, [rip + err_argv_msg];
+        mov rsi, 24;                              // err_argv_len
+        call emit_stderr;
+
+        mov rdi, 1;                               // MK_ARGV_ERR
+        mov rax, 60;                              // SC+ ID 60 = sys_exit
+        syscall;
+
+      mkdir_after_parse_ok:
+        // ---- Step 5: parse_flags_from_argv. Leaf call. ----
+        call parse_flags_from_argv;
+
+        // ---- Step 6: missing-operand check. pos_count from libpdx-argv. ----
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mkdir_after_operand_ok;
+
+        // Missing operand branch.
+        lea rdi, [rip + err_no_operand_msg];
+        mov rsi, 23;                              // err_no_operand_len
+        call emit_stderr;
+
+        mov rdi, 2;                               // MK_MISSING_PATH
+        mov rax, 60;                              // SC+ ID 60 = sys_exit
+        syscall;
+
+      mkdir_after_operand_ok:
+        // ---- Step 7: sys_exit(MK_OK). mkdir_run wire-up at M1-003. ----
+        xor rdi, rdi;                             // MK_OK = 0
+        mov rax, 60;                              // SC+ ID 60 = sys_exit
         syscall;
 
         // Defensive belt-and-suspenders — sys_exit never returns.
