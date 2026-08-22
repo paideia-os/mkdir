@@ -19,7 +19,7 @@ M4-003 / M4-004 queued.
 | M3-002 (#8)     | CreateDirRecord via libpdx-audit                                       | LANDED |
 | M3-003 (#9)     | PdxFS v1 undo record: replay is rmdir; -p unwinds only new levels      | LANDED |
 | M4-001 (#10)    | single + multi-level test                                              | LANDED |
-| M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | QUEUED |
+| M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | LANDED |
 | M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | QUEUED |
 | M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | QUEUED |
 

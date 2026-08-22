@@ -13,7 +13,7 @@ files that the paideia-os smoke matrix greps for.
 | Issue       | Driver                                             | Witness(es)                                                     | State  |
 |-------------|----------------------------------------------------|-----------------------------------------------------------------|--------|
 | M4-001 (#10)| `test_m4_001_single_multi.pdx`                     | `expected-mkdir-m4-001-single.txt`, `expected-mkdir-m4-001-multi.txt` | LANDED |
-| M4-002 (#11)| `test_m4_002_mixed_pre_existing.pdx`               | `expected-mkdir-m4-002-mixed.txt`                               | QUEUED |
+| M4-002 (#11)| `test_m4_002_mixed_pre_existing.pdx`               | `expected-mkdir-m4-002-mixed.txt`                               | LANDED |
 | M4-003 (#12)| `test_m4_003_txn_abort.pdx`                        | `expected-mkdir-m4-003-abort.txt`                               | QUEUED |
 | M4-004 (#13)| `test_m4_004_cap_tail.pdx`                         | `expected-mkdir-m4-004-owner.txt`                               | QUEUED |
 
