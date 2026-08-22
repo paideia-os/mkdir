@@ -1,4 +1,4 @@
-// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002
+// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002 + M2-003
 // Mkdir module: _init_caps sidecar declaration + _start orchestrator +
 // argv wire-up + flag walk + mkdir_one create sequence + mkdir_run
 // positional walk. M1-001 landed the scaffold shape (ring3 marker +
@@ -13,7 +13,11 @@
 // `MkdirState::newly_created_count` for the M3-003 undo record; M2-002
 // adds a per-component pre-existence probe (placeholder until
 // mkdir.M2-substrate-002) so `-p` treats pre-existing levels as
-// no-ops rather than errors and does NOT queue them for undo.
+// no-ops rather than errors and does NOT queue them for undo; M2-003
+// stamps the invoker's KIND_USER cap (SLOT_USER) as the owner tail
+// on every newly-created inode (placeholder until
+// mkdir.M2-substrate-003), so the M3-001 CreatedDirRecord's
+// `owner:KIND_USER_ref` field renders correctly.
 //
 // See design/architecture.md §2 (module boundary), §3 (_start shape),
 // §4 (mkdir_one create sequence), §4a (mkdir_split_path — M2-001),
@@ -116,6 +120,23 @@ module Mkdir = structure {
 
   pub let err_too_deep_msg    : [u8; 40] = "mkdir: path too deep (max 16 levels)\n\0\0\0"
   pub let err_too_deep_len    : u64 = 37
+
+  // ---- M2-003 cap-tail owner stamp diagnostic string ----
+  //
+  // The cap-tail stamp records the invoker's KIND_USER cap into the
+  // newly-created inode's owner slot. Failure here fires when
+  // sys_cap_invoke through SLOT_USER returns negative — usually
+  // because slot 2 was mis-seeded by the loader / shell. M2-003
+  // treats stamp failure as a hard error: the directory was created
+  // but its owner slot is unset, which would show up as
+  // `ls --long <dir>` rendering an anonymous owner — a D3/D4
+  // violation. Rolling back via TXN abort is left to
+  // mkdir.M2-substrate-001 (the placeholder stamp cannot fail at M2,
+  // since it uses a QUERY op that already passed the cap-invoke
+  // gate; the return-negative path guards against a future substrate
+  // wire that DOES fail conditionally).
+  pub let err_cap_tail_msg    : [u8; 32] = "mkdir: cap-tail stamp failed\n\0\0\0"
+  pub let err_cap_tail_len    : u64 = 29
 
   // ============================================================================
   // Bootstrap argv (mkdir.M1-002 self-test)
@@ -511,7 +532,7 @@ module Mkdir = structure {
   pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 + M2-002 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe. Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp deferred. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
+      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe and a per-create cap-tail stamp. Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
       block: {
         // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
         push rbx;
@@ -690,7 +711,27 @@ module Mkdir = structure {
         add rax, 1;
         mov [r11], rax;
 
-        // Step 6d: cap-tail owner stamp — DEFERRED to mkdir.M2-003.
+        // Step 6d: cap-tail owner stamp (M2-003 placeholder).
+        // Records the invoker's KIND_USER cap (SLOT_USER=2) into the
+        // newly-created inode's cap-tail owner slot. Real
+        // "stamp-owner" op lives on KIND_PDXFS_FILE and takes SLOT_USER
+        // as its cap argument — that dispatch is
+        // mkdir.M2-substrate-003 at paideia-os. The M2-003 placeholder
+        // invokes USER_OP_QUERY_FP0 (0) on SLOT_USER; this exercises
+        // the KIND_USER slot dispatch (kind_user.pdx L1146 checks
+        // op_id <= USER_OP_MAX = 7) so a mis-seeded slot 2 surfaces
+        // here at M2 rather than silently succeeding into an
+        // unowned inode. Negative rax → MK_CAP_TAIL_FAIL (hard error
+        // — a directory without a recorded owner would fail the
+        // D3/D4 `ls --long` render). Same slot the M3-001
+        // CreatedDirRecord will marshal into the `owner:KIND_USER_ref`
+        // field, so a M2-003 pass here proves the field will render.
+        mov rdi, 2;                               // SLOT_USER = 2
+        xor rsi, rsi;                             // USER_OP_QUERY_FP0 = 0
+        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_one_cap_tail_fail;
 
       mkdir_one_advance_walk:
         // Advance walk_i.
@@ -732,6 +773,13 @@ module Mkdir = structure {
         mov rsi, 25;                              // err_commit_len
         call emit_stderr;
         mov rax, 6;                               // MK_TXN_COMMIT_FAIL
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_cap_tail_fail:
+        lea rdi, [rip + err_cap_tail_msg];
+        mov rsi, 29;                              // err_cap_tail_len
+        call emit_stderr;
+        mov rax, 9;                               // MK_CAP_TAIL_FAIL
         jmp mkdir_one_epilogue;
 
       mkdir_one_epilogue:

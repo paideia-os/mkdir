@@ -1,8 +1,9 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M2 (core implementation) — IN PROGRESS. M1
-(design + skeleton) CLOSED.
+**Current milestone:** M2 (core implementation) — CLOSED. Ready for M3
+(semantic-pipe / audit integration: CreatedDirRecord[] schema bind,
+CreateDirRecord via libpdx-audit, PdxFS v1 undo record).
 
 ## Milestone rollup
 
@@ -13,7 +14,7 @@
 | M1-003 (#3)     | first runnable: single-level mkdir a in TXN with cap-tail as owner     | LANDED |
 | M2-001 (#4)     | -p create-parents: multi-level path atomic in single TXN               | LANDED |
 | M2-002 (#5)     | -p pre-existing dir handling (no-op, not error)                        | LANDED |
-| M2-003 (#6)     | cap-tail write on every created directory (KIND_USER_ref in inode)     | OPEN   |
+| M2-003 (#6)     | cap-tail write on every created directory (KIND_USER_ref in inode)     | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.

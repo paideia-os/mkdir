@@ -235,6 +235,36 @@ the branch structure: `comp_pre_existed[i]` bookkeeping, conditional
 contract (`rax == 1` = exists) that `mkdir.M2-substrate-002` fills
 without a signature change to `mkdir_one`.
 
+## 4d. `mkdir_one` M2-003 additions — cap-tail owner stamp
+
+Step 6 grows a step 6d after the `newly_created_count` increment: a
+per-create stamp of the invoker's `KIND_USER` cap (`SLOT_USER = 2`)
+into the newly-created inode's owner tail. This is the mechanism by
+which `ls --long <dir>` renders the correct owner (via
+`libpdx-cap`'s cap-decode path) and by which the M3-001
+`CreatedDirRecord`'s `owner:KIND_USER_ref` field gets a valid
+reference.
+
+- **6d. Cap-tail owner stamp.** `sys_cap_invoke(SLOT_USER,
+  USER_OP_QUERY_FP0)`. Negative `rax` → `MK_CAP_TAIL_FAIL`. This is a
+  hard error: a directory that was created but whose owner slot is
+  unset would render as anonymous under `ls --long` — a D3/D4
+  violation. TXN rollback of the already-created level is left to
+  `mkdir.M2-substrate-001` (the placeholder cannot fail cleanly at
+  M2 since `USER_OP_QUERY_FP0` is a QUERY op that reaches after the
+  cap-invoke gate; the return-negative guard fires only against a
+  future substrate wire that DOES fail conditionally).
+
+The M2-003 placeholder invokes `USER_OP_QUERY_FP0` on `SLOT_USER` —
+this exercises the KIND_USER slot dispatch (`kind_user.pdx` at
+`src/kernel/core/cap/kind_user.pdx` checks `op_id <= USER_OP_MAX = 7`
+per its handler at L1146) so a mis-seeded slot 2 surfaces at M2
+rather than silently succeeding into an unowned inode. The real
+"stamp-owner" op lives on `KIND_PDXFS_FILE` and takes `SLOT_USER` as
+its cap argument — that dispatch is `mkdir.M2-substrate-003` at the
+paideia-os repo. The M2-003 branch structure is what lands here; the
+substrate wire fills the actual owner-write behind it.
+
 ## 5. Flag semantics at M1
 
 | flag        | M1 behaviour                                             | M2 wire-up                    |
@@ -295,20 +325,22 @@ apply to userspace tooling at v0.33+:
   label in the module uses the `mkdir_` or `mks_` prefix. Recorded here
   as a persistent gotcha per the paideia-as reserved-labels rule.
 
-## 8. What M2-002 explicitly does not do
+## 8. What M2 (as a whole) explicitly does not do
 
-Called out here so a reader of M2-002 code does not mistake absence
-for bug:
+M2-001/002/003 have all landed at HEAD. What remains queued:
 
-- No real per-component existence probe. The M2-002 branch structure
-  is in place — `comp_pre_existed[i]` bookkeeping, conditional
-  `newly_created_count` advancement, `rax == 1` return convention —
-  but the placeholder probe (`PFF_OP_QUERY_INODE` at HEAD) does not
-  distinguish per-component existence yet. The real existence check
-  is `mkdir.M2-substrate-002` at the paideia-os repo.
-- No cap-tail write. `mkdir_one` step 6d has a "cap-tail owner stamp —
-  DEFERRED to mkdir.M2-003" comment where the M2-003 placeholder
-  invocation on `SLOT_USER` will slot in.
+- No real kernel-side ops. Every `sys_cap_invoke` in `mkdir_one`
+  today is a QUERY / DEBUG_PRINT placeholder. The three substrate
+  follow-ups at paideia-os fill them:
+  - `mkdir.M2-substrate-001` — open-TXN / create-dir / commit-TXN
+    ops on KIND_PDXFS_TXN + KIND_PDXFS_FILE.
+  - `mkdir.M2-substrate-002` — per-component existence probe that
+    returns 1 when the level exists, 0 otherwise.
+  - `mkdir.M2-substrate-003` — stamp-owner op on KIND_PDXFS_FILE
+    that writes the passed SLOT_USER cap reference into the just-
+    created inode's owner tail.
+- No `CreatedDirRecord[]` emission. `mkdir_one` writes only stderr
+  text via `sys_debug_puts` (`mkdir.M3-001`).
 - No `CreatedDirRecord[]` emission. `mkdir_one` writes only stderr text
   via `sys_debug_puts` (`mkdir.M3-001`).
 - No `libpdx-audit` journal. Every op currently emits nothing to the

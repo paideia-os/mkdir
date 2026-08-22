@@ -20,6 +20,7 @@ module MkdirState = structure {
   pub let MK_TXN_COMMIT_FAIL          : u64 = 6  // TXN commit placeholder failed
   pub let MK_ABS_PATH_UNSUPPORTED     : u64 = 7  // path starts with '/' — M2 rejects
   pub let MK_PATH_TOO_DEEP            : u64 = 8  // > PATH_MAX_COMPONENTS levels
+  pub let MK_CAP_TAIL_FAIL            : u64 = 9  // KIND_USER cap-tail stamp placeholder failed
 
   // --- M2-001: per-invocation path decomposition bounds. Cap at 16
   //     levels: enough for every realistic paideia-os path (deepest at
