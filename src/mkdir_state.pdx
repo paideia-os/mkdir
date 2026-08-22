@@ -1,6 +1,7 @@
-// src/mkdir_state.pdx — mkdir.M1-001
+// src/mkdir_state.pdx — mkdir.M1-001 + M2-001
 // MkdirState module: return-code constants, sidecar slot number constants,
-// singleton .bss slots for parsed flags, and the reset() entry point.
+// singleton .bss slots for parsed flags, per-invocation path-component
+// bookkeeping (M2-001), and the reset() entry point.
 // See design/architecture.md §2 for the module split rationale and §7 for
 // the paideia-as encoding constraints this module observes.
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
@@ -17,6 +18,15 @@ module MkdirState = structure {
   pub let MK_TXN_OPEN_FAIL            : u64 = 4  // sys_cap_invoke on SLOT_TXN failed
   pub let MK_MKDIR_FAIL               : u64 = 5  // sys_cap_invoke on SLOT_PARENT_FILE failed
   pub let MK_TXN_COMMIT_FAIL          : u64 = 6  // TXN commit placeholder failed
+  pub let MK_ABS_PATH_UNSUPPORTED     : u64 = 7  // path starts with '/' — M2 rejects
+  pub let MK_PATH_TOO_DEEP            : u64 = 8  // > PATH_MAX_COMPONENTS levels
+
+  // --- M2-001: per-invocation path decomposition bounds. Cap at 16
+  //     levels: enough for every realistic paideia-os path (deepest at
+  //     R48 is /system/audit/user-events/pkg-<ts>-<id>.pdxevent = 4).
+  //     The cap keeps the component-index .bss arrays static and lets
+  //     `cmp reg, imm` compare against 16 (well under 0x7FFFFFFF).
+  pub let PATH_MAX_COMPONENTS : u64 = 16
 
   // --- Sidecar cap slot numbers. Every consumer reads by name so the
   //     row order in caps.decl stays authoritative. See §6 in
@@ -52,6 +62,36 @@ module MkdirState = structure {
                                                         // (survives mkdir_one calls
                                                         //  without callee-save push)
 
+  // --- M2-001: per-invocation path-component decomposition.
+  //
+  //     `mkdir_split_path` populates the two 16-entry arrays and
+  //     `comp_count`. Under `-p`, `mkdir_one` iterates
+  //     `0..comp_count`, invoking a placeholder create per level in a
+  //     single TXN scope. When `flag_p == 0`, the arrays are unused
+  //     (the M1 multi-level guard rejects paths containing '/' before
+  //     the split runs); the caller still sets `comp_count = 1` in
+  //     that path so the walk-loop shape is one-size-fits-all.
+  //
+  //     Only the counter needs zeroing at reset() — trailing entries
+  //     beyond comp_count are unreachable by the walk. Mirrors
+  //     ParsedArgs's flag_names/pos_ptrs consume-by-index discipline.
+  //
+  //     `newly_created_count` records how many of the walked levels
+  //     were actually created this invocation. Pre-existing levels
+  //     (M2-002) do not advance it. mkdir.M3-003's undo record reads
+  //     this counter to unwind exactly the levels this invocation
+  //     added, preserving `undo mkdir -p a/b/c` correctness when a
+  //     pre-existed.
+  //
+  //     `walk_i` is the .bss loop counter used by the component walk
+  //     inside mkdir_one (mirrors mkdir_run_i's role for the outer
+  //     positional walk).
+  pub let mut comp_start_offsets : [u64; 16] = uninit @align(8)
+  pub let mut comp_lengths       : [u64; 16] = uninit @align(8)
+  pub let mut comp_count         : u64       = uninit @align(8)
+  pub let mut newly_created_count : u64      = uninit @align(8)
+  pub let mut walk_i             : u64       = uninit @align(8)
+
   // mkdir_state_reset() — zero the three flag slots, the exit code, and
   // the error positional index so a subsequent _start starts from a
   // known-empty MkdirState. rax=0 is the value written; xor rax,rax is
@@ -69,15 +109,18 @@ module MkdirState = structure {
   pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 (renamed at M1-002 to dodge libpdx-argv reset collision) MkdirState mkdir_state_reset. Five lea+mov stores zero the singleton flag/exit/err slots so parse_flags_from_argv and mkdir_run start from a known baseline. Same discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx — the .bss arrays that back this module have no live tail past what the flag_* slots record, so zeroing the counters is sufficient. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 + M2-001 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Nine lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters so parse_flags_from_argv, mkdir_one, and mkdir_run start from a known baseline. The comp_start_offsets / comp_lengths arrays are consumed by index up to comp_count, so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
-        lea r11, [rip + flag_p];        mov [r11], rax;
-        lea r11, [rip + flag_v];        mov [r11], rax;
-        lea r11, [rip + flag_dry_run];  mov [r11], rax;
-        lea r11, [rip + exit_code];     mov [r11], rax;
-        lea r11, [rip + err_pos_index]; mov [r11], rax;
-        lea r11, [rip + mkdir_run_i];   mov [r11], rax;
+        lea r11, [rip + flag_p];             mov [r11], rax;
+        lea r11, [rip + flag_v];             mov [r11], rax;
+        lea r11, [rip + flag_dry_run];       mov [r11], rax;
+        lea r11, [rip + exit_code];          mov [r11], rax;
+        lea r11, [rip + err_pos_index];      mov [r11], rax;
+        lea r11, [rip + mkdir_run_i];        mov [r11], rax;
+        lea r11, [rip + comp_count];         mov [r11], rax;
+        lea r11, [rip + newly_created_count];mov [r11], rax;
+        lea r11, [rip + walk_i];             mov [r11], rax;
         ret
       }
     }

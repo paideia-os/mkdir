@@ -88,7 +88,7 @@ Step 7  sys_exit(exit_code)
 error code into `exit_code` and stops the loop. `mkdir_one` (§4) is the
 single-directory create sequence.
 
-## 4. `mkdir_one(path)` — the M1 create sequence
+## 4. `mkdir_one(path)` — create sequence (M1 baseline + M2-001 -p walk)
 
 ```
 rdi = path (NUL-terminated string)
@@ -145,13 +145,73 @@ Kernel-side, `KIND_PDXFS_TXN` and `KIND_PDXFS_FILE` expose only
 #1623/#1624); the create-dir op is a `mkdir.M2-substrate` follow-up
 tracked in the paideia-os repo.
 
+## 4a. `mkdir_split_path(path)` — M2-001 component splitter
+
+Signature: `mkdir_split_path : (u64) -> u64 !{mem} @{}` (leaf).
+
+`rdi` in = path; `rax` out ∈ { `MK_OK`, `MK_ABS_PATH_UNSUPPORTED`,
+`MK_PATH_TOO_DEEP` }.
+
+Populates three `MkdirState` `.bss` slots:
+
+- `comp_start_offsets[i]` — byte offset within `path` where component
+  `i` begins.
+- `comp_lengths[i]` — byte length of component `i` (excludes the
+  trailing `'/'` or `NUL`).
+- `comp_count` — number of non-empty components (0..16).
+
+Rules:
+
+- Path starting with `'/'` → `MK_ABS_PATH_UNSUPPORTED` immediately
+  (v1.0 invoker-subtree constraint per `r49-r50-plan.md` §5.9).
+- Empty components (from `foo//bar` or trailing `/`) are silently
+  skipped — no error, no entry recorded.
+- Empty path (first byte `NUL`) → `MK_OK` with `comp_count = 0`
+  (POSIX-idempotent `mkdir -p ""`).
+- Dot components (`foo/./bar`) are NOT normalised at M2 — dot
+  propagates to the placeholder create as a level named `.`.
+  Dot-elimination is a kernel-side concern deferred to
+  `mkdir.M2-substrate-001`.
+- More than `PATH_MAX_COMPONENTS = 16` non-empty levels →
+  `MK_PATH_TOO_DEEP`, checked at every close rather than only at end
+  so overflow surfaces at the first over-limit level.
+
+Only `comp_count` needs zeroing at `mkdir_state_reset` — the two arrays
+are consumed by index up to `comp_count`, so trailing entries are
+unreachable (same discipline `ParsedArgs::reset` uses for
+`flag_names`/`pos_ptrs`).
+
+## 4b. `mkdir_one` M2-001 additions
+
+The M1 body (§4 above) has three additions at M2-001:
+
+1. **Step 1 gated on `flag_p`.** Under `-p`, the multi-level `'/'` guard
+   is bypassed and `mkdir_split_path` handles the path decomposition.
+   Under no `-p`, the guard still fires (POSIX-canonical); the caller
+   then sets `comp_count = 1` so the walk-loop shape is unified.
+2. **New Step 6: per-component walk.** `MkdirState::walk_i` is the
+   `.bss` loop counter that survives the placeholder `sys_cap_invoke`
+   without a callee-save push (same `.bss`-over-`rbx` idiom
+   `mkdir_run` already uses). Each iteration calls the placeholder
+   create + increments `newly_created_count`. `newly_created_count` is
+   the counter the M3-003 undo record reads to unwind exactly the
+   levels this invocation created.
+3. **Split validation runs BEFORE the `--dry-run` short-circuit.**
+   `mkdir -p --dry-run /abs/path` still surfaces
+   `MK_ABS_PATH_UNSUPPORTED` — POSIX-canonical validate-not-execute.
+
+Every non-`MK_OK` return under M2-001 still routes through
+`mkdir_one_epilogue`, preserving the one-push / one-pop `rbx` parity
+from M1.
+
 ## 5. Flag semantics at M1
 
 | flag        | M1 behaviour                                             | M2 wire-up                    |
 |-------------|----------------------------------------------------------|-------------------------------|
-| `-p`        | Detected + stored in `MkdirState::flag_p`. `mkdir_one`   | mkdir.M2-001 multi-level TXN  |
-|             | still rejects paths containing `/` with                  |                               |
-|             | `MK_MULTI_LEVEL_UNSUPPORTED`.                            |                               |
+| `-p`        | LANDED at M2-001. `mkdir_one` bypasses the multi-level   | Pre-existing dir handling     |
+|             | guard when `flag_p == 1` and routes the path through     | is M2-002; cap-tail stamp is  |
+|             | `mkdir_split_path`. Walk iterates over `comp_count`      | M2-003.                       |
+|             | components in a single TXN scope.                        |                               |
 | `-v`        | Detected + stored. `mkdir_one` emits a stderr line per   | Format upgraded to `CreatedDirRecord` |
 |             | created directory.                                       | text-render at M3-001.        |
 | `--dry-run` | Detected + stored. `mkdir_one` returns `MK_OK` before    | Unchanged; extended at M4-004 |
@@ -204,19 +264,19 @@ apply to userspace tooling at v0.33+:
   label in the module uses the `mkdir_` or `mks_` prefix. Recorded here
   as a persistent gotcha per the paideia-as reserved-labels rule.
 
-## 8. What M1 explicitly does not do
+## 8. What M2-001 explicitly does not do
 
-Called out here so a reader of M1 code does not mistake absence for bug:
+Called out here so a reader of M2-001 code does not mistake absence
+for bug:
 
-- No `-p` **behaviour**. The flag is detected + stored; `mkdir_one`
-  rejects any path containing `/` when `flag_p == 0`. `mkdir.M2-001`
-  lands the multi-level TXN.
-- No pre-existing-dir handling. Under `-p` (M2), `mkdir a/b` where `a`
-  already exists is a no-op on `a`, a create on `b`; M1 has no `-p`
-  logic and therefore no idempotence path (`mkdir.M2-002`).
-- No cap-tail write. `mkdir_one` steps 4/5/7 are placeholder cap
-  invocations; the invoker's KIND_USER cap sits in slot 2 unread
-  (`mkdir.M2-003`).
+- No pre-existing-dir handling. Under `-p` (M2-002), `mkdir a/b` where
+  `a` already exists is a no-op on `a`, a create on `b`. M2-001 walks
+  every component as if newly-created and calls the placeholder create
+  per level; M2-002 slots the existence probe in without a signature
+  change to `mkdir_one`.
+- No cap-tail write. `mkdir_one` step 6 has a "cap-tail owner stamp —
+  DEFERRED to mkdir.M2-003" comment where the M2-003 placeholder
+  invocation on `SLOT_USER` will slot in.
 - No `CreatedDirRecord[]` emission. `mkdir_one` writes only stderr text
   via `sys_debug_puts` (`mkdir.M3-001`).
 - No `libpdx-audit` journal. Every op currently emits nothing to the
