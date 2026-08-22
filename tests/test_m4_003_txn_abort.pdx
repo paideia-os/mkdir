@@ -1,5 +1,5 @@
 // tests/test_m4_003_txn_abort.pdx — mkdir.M4-003
-// MkdirTestM4003 module: TXN-abort mid-create leaves NO directories.
+// TestM4TxnAbort module: TXN-abort mid-create leaves NO directories.
 //
 // Per design/tooling/r49-r50-plan.md §5.9 (paideia-os) M4 line:
 //   "TXN-abort mid-create: no dirs left"
@@ -65,7 +65,7 @@
 //
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
 
-module MkdirTestM4003 = structure {
+module TestM4TxnAbort = structure {
 
   // ============================================================================
   // Witness strings.
