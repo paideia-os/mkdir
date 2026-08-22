@@ -1,0 +1,71 @@
+// src/mkdir_state.pdx — mkdir.M1-001
+// MkdirState module: return-code constants, sidecar slot number constants,
+// singleton .bss slots for parsed flags, and the reset() entry point.
+// See design/architecture.md §2 for the module split rationale and §7 for
+// the paideia-as encoding constraints this module observes.
+// Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
+
+module MkdirState = structure {
+
+  // --- Return codes (0 = OK). mkdir_one and mkdir_run return one of
+  //     these; _start passes it to sys_exit. Every code below fits in a
+  //     u8 so the shell's `$?` render (post-shell.M4) is unambiguous.
+  pub let MK_OK                       : u64 = 0
+  pub let MK_ARGV_ERR                 : u64 = 1  // libpdx-argv reported non-zero
+  pub let MK_MISSING_PATH             : u64 = 2  // pos_count == 0
+  pub let MK_MULTI_LEVEL_UNSUPPORTED  : u64 = 3  // path has '/' without -p at M1
+  pub let MK_TXN_OPEN_FAIL            : u64 = 4  // sys_cap_invoke on SLOT_TXN failed
+  pub let MK_MKDIR_FAIL               : u64 = 5  // sys_cap_invoke on SLOT_PARENT_FILE failed
+  pub let MK_TXN_COMMIT_FAIL          : u64 = 6  // TXN commit placeholder failed
+
+  // --- Sidecar cap slot numbers. Every consumer reads by name so the
+  //     row order in caps.decl stays authoritative. See §6 in
+  //     design/architecture.md.
+  pub let SLOT_TXN          : u64 = 0
+  pub let SLOT_PARENT_FILE  : u64 = 1
+  pub let SLOT_USER         : u64 = 2
+  pub let SLOT_STDERR       : u64 = 3
+
+  // --- Placeholder op ordinals. M1 exercises the cap dispatch path
+  //     using QUERY_ID and DEBUG_PRINT until the create-dir substrate
+  //     lands at M2. Constants mirror
+  //     src/kernel/core/cap/kind_pdxfs_{txn,file}.pdx.
+  pub let PXT_OP_QUERY_ID     : u64 = 0
+  pub let PXT_OP_QUERY_STATE  : u64 = 4
+  pub let PFF_OP_DEBUG_PRINT  : u64 = 6
+
+  // --- SC+ IDs mkdir inlines directly (echoes echo_client.pdx idiom —
+  //     no link dependency on syscall_shim.pdx).
+  pub let SC_CAP_INVOKE  : u64 = 4
+  pub let SC_DEBUG_PUTS  : u64 = 12
+  pub let SC_EXIT        : u64 = 60
+
+  // --- Singleton .bss storage. All slots are 8-byte aligned (mirrors
+  //     ParsedArgs' bootstrap-scope layout in libpdx-argv). One
+  //     invocation per process is enough for the R49/R50 tool shape.
+  pub let mut flag_p          : u64 = uninit @align(8)  // 1 iff -p seen
+  pub let mut flag_v          : u64 = uninit @align(8)  // 1 iff -v seen
+  pub let mut flag_dry_run    : u64 = uninit @align(8)  // 1 iff --dry-run seen
+  pub let mut exit_code       : u64 = uninit @align(8)  // sys_exit arg
+  pub let mut err_pos_index   : u64 = uninit @align(8)  // pos_ptrs[i] that failed
+
+  // reset() — zero the three flag slots, the exit code, and the error
+  // positional index so a subsequent _start starts from a known-empty
+  // MkdirState. rax=0 is the value written; xor rax,rax is one byte
+  // cheaper than mov rax,0 and produces the same result. r11 is scratch
+  // (paideia-as conformance). Leaf function — no callee-save touched.
+  pub let reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkdir.M1-001 MkdirState::reset. Five lea+mov stores zero the singleton flag/exit/err slots so parse_flags_from_argv and mkdir_run start from a known baseline. Same discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx — the .bss arrays that back this module have no live tail past what the flag_* slots record, so zeroing the counters is sufficient. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + flag_p];        mov [r11], rax;
+        lea r11, [rip + flag_v];        mov [r11], rax;
+        lea r11, [rip + flag_dry_run];  mov [r11], rax;
+        lea r11, [rip + exit_code];     mov [r11], rax;
+        lea r11, [rip + err_pos_index]; mov [r11], rax;
+        ret
+      }
+    }
+}

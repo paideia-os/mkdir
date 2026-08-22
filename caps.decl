@@ -1,0 +1,66 @@
+# mkdir — caps.decl
+#
+# Wave: R50
+# Doc:  design/tooling/r49-r50-plan.md §4.9 + §5.9 in the paideia-os repo.
+#
+# mkdir is a coreutil that opens a KIND_PDXFS_TXN, creates one or more
+# directories under a target parent, writes the invoker's KIND_USER cap
+# as the created inode's cap-tail owner, and commits. Every op takes
+# place within the invoker's own subtree — mkdir has NO libpdx-elevate
+# dependency at v1.0 (see §5.9 "no elevate dependency" line).
+#
+# Every cap listed here MUST arrive via the loader's InitCap sidecar
+# (src/kernel/core/loader/init_caps.pdx in paideia-os) or be passed
+# through a KIND_IPC_ENDPOINT cap-transfer from the shell that spawns
+# mkdir. cap_manifest_verify (libpdx-cap M2-001) runs at _start against
+# THIS FILE'S declaration and refuses any cap not named below.
+#
+# M1 seeds four slots via the sidecar (see src/mkdir.pdx _init_caps
+# layout). M2 layers the -p multi-level TXN atomicity on top; the cap
+# set does not grow.
+requires:
+  # slot 0 — KIND_PDXFS_TXN. One TXN per mkdir invocation. Under -p
+  # every level created lives inside this one TXN so an abort mid-create
+  # leaves zero new directories on disk (M4-003 acceptance).
+  - kind: KIND_PDXFS_TXN
+    rights: R_PDXFS_TXN_INVOKE | R_PDXFS_TXN_OBSERVE
+    slot: 0
+
+  # slot 1 — KIND_PDXFS_FILE(write) over the target parent directory
+  # inode. Every created child inherits from this parent's cap chain;
+  # the derivation gate for KIND_PDXFS_FILE (kind_pdxfs_file.pdx
+  # dispatch) enforces that a mint request never widens the parent's
+  # byte reach. M1 exercises the invoke path only against DEBUG_PRINT
+  # (ordinal 6) as a placeholder until the create-dir op lands
+  # kernel-side per the M2 substrate follow-up.
+  - kind: KIND_PDXFS_FILE
+    rights: R_PDXFS_FILE_INVOKE
+    slot: 1
+
+  # slot 2 — KIND_USER. The invoker's user cap. Recorded verbatim into
+  # each created directory's cap tail so `ls --long` (libpdx-cap M3-001)
+  # can render the owner. M1 stores the cap-slot number only; M2 wires
+  # the sign-inode helper (libpdx-cap M3-002) that stamps the inode
+  # against the invoker's user_sk when the vault is unlocked.
+  - kind: KIND_USER
+    rights: R_USER_INVOKE
+    slot: 2
+
+  # slot 3 — KIND_IPC_ENDPOINT (semantic pipe). Bound at M3-001 to the
+  # `CreatedDirRecord@0.1` schema via libpdx-semantic-pipe; used at M1
+  # only as an untyped stderr sink through sys_debug_puts (SC+ ID 12)
+  # while libpdx-semantic-pipe.M2 lands. The M3 rewrite replaces every
+  # sys_debug_puts call site with a schema-tagged send_record; the cap
+  # slot and its declared rights do not change.
+  - kind: KIND_IPC_ENDPOINT
+    rights: R_IPC_WRITE | R_IPC_INVOKE
+    slot: 3
+
+# Declared output schemas — mkdir emits CreatedDirRecord[] on the
+# semantic pipe at slot 3 (M3-001 wire-up). Per I4 in
+# design/tooling/plan.md, mkdir's text layer is stderr-only: -v mode
+# and every error prints a one-line diagnostic; the primary output is
+# the schema stream. The schema handle format matches libpdx-argv's
+# PdxArgvParsed declaration (schema_id@version).
+declares_output_schemas:
+  - CreatedDirRecord@0.1

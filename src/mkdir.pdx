@@ -1,0 +1,118 @@
+// src/mkdir.pdx — mkdir.M1-001
+// Mkdir module: _init_caps sidecar declaration + _start skeleton. M1-001
+// lands the scaffold shape only — no argv parse, no cap invocations.
+// mkdir.M1-002 adds the libpdx-argv wire-up + flag walk; mkdir.M1-003
+// adds the mkdir_one create sequence (single-level, TXN-scoped).
+//
+// See design/architecture.md §2 (module boundary) and §6 (sidecar cap
+// slot map) for the shape this file lands.
+// Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
+
+module Mkdir = structure {
+
+  // ============================================================================
+  // _init_caps sidecar — FOUR entries. Layout per
+  // design/loader/init-caps-sidecar.md §2 (paideia-os) and
+  // src/kernel/core/loader/init_caps.pdx (R20b.M4).
+  //
+  // Word packing per entry (16 bytes each):
+  //   word0 = (rights << 32) | (kind << 16) | slot
+  //   word1 = target_ptr  (kind-specific; 0 at M1 — populated by the
+  //           loader from the shell's cap_transfer at spawn time)
+  //
+  // Entry 0: slot=0, kind=KIND_PDXFS_TXN(0x196), rights=INVOKE|OBSERVE
+  //   INVOKE=0x008, OBSERVE=0x400 → 0x408.
+  // Entry 1: slot=1, kind=KIND_PDXFS_FILE(0x195), rights=INVOKE(0x008)
+  // Entry 2: slot=2, kind=KIND_USER(0x190), rights=INVOKE(0x008)
+  // Entry 3: slot=3, kind=KIND_IPC_ENDPOINT(0x005), rights=WRITE|INVOKE
+  //   WRITE=0x002, INVOKE=0x008 → 0x00A.
+  //
+  // target_ptr at M1 is 0 for every row — the shell fills it via
+  // sys_cap_transfer before the exec landing. This matches echo_client's
+  // sidecar shape at R31.M2-1590 (endpoint_ids were baked in there
+  // because the loader claimed both endpoints by id; here the parent
+  // shell owns the resolution).
+  // ============================================================================
+
+  pub let _init_caps_count : u64 = 4
+
+  pub let _init_caps : [u64; 8] = [
+    // Entry 0 — KIND_PDXFS_TXN at slot 0.
+    0x0000040801960000,
+    0x0000000000000000,
+    // Entry 1 — KIND_PDXFS_FILE at slot 1.
+    0x0000000801950001,
+    0x0000000000000000,
+    // Entry 2 — KIND_USER at slot 2.
+    0x0000000801900002,
+    0x0000000000000000,
+    // Entry 3 — KIND_IPC_ENDPOINT at slot 3.
+    0x0000000A00050003,
+    0x0000000000000000
+  ]
+
+  // ============================================================================
+  // Static stderr strings. sys_debug_puts (SC+ ID 12) is the M1 stderr
+  // proxy; M3-001 replaces every call with a schema-tagged send_record
+  // on the KIND_IPC_ENDPOINT at slot 3.
+  //
+  // Each string is NUL-terminated so a future emit_stderr overload that
+  // takes a NUL-terminated pointer can share the byte storage; the
+  // paired *_len constants are what M1 passes to sys_debug_puts.
+  // ============================================================================
+
+  pub let ring3_msg      : [u8; 20] = "mkdir: M1 ring3 ok\n\0"
+  pub let ring3_len      : u64 = 19
+
+  // ============================================================================
+  // _start — user program entry point. Never returns (ends in sys_exit).
+  //
+  // M1-001 shape: emit the ring-3 proof-of-life marker on sys_debug_puts
+  // and exit(0). This is the smoke-matrix witness for mkdir.M1-001 —
+  // exact analogue of the "R31 ECHO CLIENT RING3 OK" line in
+  // echo_client.pdx that R31.M2-1590 uses to prove a task reached its
+  // entry point before any further code runs.
+  //
+  // mkdir.M1-002 replaces the exit(0) with the argv parse + flag walk;
+  // mkdir.M1-003 replaces the parse-only path with the full mkdir_one
+  // create sequence.
+  //
+  // Register discipline
+  // -------------------
+  // Straight-line, ends in sys_exit — no callee-save state needed, no
+  // SysV push/pop parity to preserve. All state in caller-save regs
+  // (rax/rdi/rsi/rdx/rcx/r10/r11).
+  //
+  // Effects / capabilities
+  // ----------------------
+  //   mem     — string load for the debug_puts buffer.
+  //   sysreg  — every SYSCALL.
+  //   @{sched} — sys_exit terminates the task (sched teardown).
+  // ============================================================================
+  pub let _start : () -> () !{mem, sysreg} @{sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "mkdir.M1-001 _start scaffold. Emits `mkdir: M1 ring3 ok\\n` on sys_debug_puts (SC+ ID 12) and calls sys_exit(0) (SC+ ID 60). Same proof-of-life shape as echo_client's R31 ring3 marker — if this line does not print, the task never reached its entry point and every M1-002/M1-003 hypothesis about argv or cap dispatch is moot. Straight-line body ending in sys_exit; no callee-save touched, no SysV push/pop parity. All immediates ≤ 0x7FFFFFFF (19, 12, 0, 60). No `test` mnemonic. No cross-module label collisions (only two labels needed and both use the mkdir_ prefix).",
+      block: {
+        // ---- Step 0: MkdirState reset so any future re-entry path
+        //              starts clean. Leaf call — safe to make before
+        //              the debug marker.
+        call MkdirState::reset;
+
+        // ---- Step 1: proof-of-life marker on sys_debug_puts.
+        lea rdi, [rip + ring3_msg];
+        mov rsi, 19;                             // ring3_len
+        mov rax, 12;                             // SC+ ID 12 = sys_debug_puts
+        syscall;
+
+        // ---- Step 2: sys_exit(MK_OK). Never returns.
+        xor rdi, rdi;                            // status = MK_OK = 0
+        mov rax, 60;                             // SC+ ID 60 = sys_exit
+        syscall;
+
+        // Defensive belt-and-suspenders — sys_exit never returns.
+      mkdir_unreachable:
+        jmp mkdir_unreachable;
+      }
+    }
+}
