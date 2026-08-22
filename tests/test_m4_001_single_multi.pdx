@@ -1,5 +1,5 @@
 // tests/test_m4_001_single_multi.pdx — mkdir.M4-001
-// MkdirTestM4001 module: single-level and multi-level coreutil test drivers.
+// TestM4SingleMulti module: single-level and multi-level coreutil test drivers.
 //
 // Per design/tooling/r49-r50-plan.md §5.9 (paideia-os) M4 line:
 //   "single + multi-level test"
@@ -37,7 +37,7 @@
 // substrate wire there.
 //
 // paideia-as conformance mirrors src/mkdir.pdx:
-//   - Module name PascalCase basename (`MkdirTestM4001`).
+//   - Module name PascalCase basename (`TestM4SingleMulti`).
 //   - No `test` mnemonic — every zero-check is `cmp reg, 0`.
 //   - r11 scratch only (LEA); byte loads via xor rax,rax + mov_b.
 //   - Every `cmp reg, imm` uses an immediate ≤ 0x7F (max seen: 3 for
@@ -52,7 +52,7 @@
 //
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
 
-module MkdirTestM4001 = structure {
+module TestM4SingleMulti = structure {
 
   // ============================================================================
   // Witness strings — the smoke matrix grep target.
