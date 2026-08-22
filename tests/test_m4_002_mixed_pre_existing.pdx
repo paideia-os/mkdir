@@ -1,5 +1,5 @@
 // tests/test_m4_002_mixed_pre_existing.pdx — mkdir.M4-002
-// MkdirTestM4002 module: mixed pre-existing + newly-created levels
+// TestM4MixedPreExisting module: mixed pre-existing + newly-created levels
 // under `-p`; undo removes only the newly-created ones.
 //
 // Per design/tooling/r49-r50-plan.md §5.9 (paideia-os) M4 line:
@@ -77,7 +77,7 @@
 //
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
 
-module MkdirTestM4002 = structure {
+module TestM4MixedPreExisting = structure {
 
   // ============================================================================
   // Witness strings.
@@ -112,7 +112,7 @@ module MkdirTestM4002 = structure {
 
   // ============================================================================
   // Bootstrap argv (Path A).
-  //   `mkdir -p a/b/c` — same shape as MkdirTestM4001's multi driver
+  //   `mkdir -p a/b/c` — same shape as TestM4SingleMulti's multi driver
   //   (deliberately shared shape so a regression that breaks multi also
   //   breaks mixed's baseline assertion — makes the two failures
   //   distinguishable via witness prefix but linked by shared substrate).
