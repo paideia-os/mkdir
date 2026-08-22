@@ -194,7 +194,7 @@ module MkdirTestM4004 = structure {
         mov rsi, 22;                              // ok_owner_len
         call emit_stderr;
         xor rax, rax;
-        ret
+        ret;
 
       // ---- Failures ----
 
@@ -203,21 +203,21 @@ module MkdirTestM4004 = structure {
         mov rsi, 29;                              // fail_rc_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4c_fail_cdr_count:
         lea rdi, [rip + fail_cdr_count_msg];
         mov rsi, 28;                              // fail_cdr_count_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4c_fail_owner_slot:
         lea rdi, [rip + fail_owner_slot_msg];
         mov rsi, 36;                              // fail_owner_slot_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
       }
     }
 }
