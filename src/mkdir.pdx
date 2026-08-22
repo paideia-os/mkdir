@@ -472,7 +472,9 @@ module Mkdir = structure {
 
       msp_loop:
         xor rax, rax;
-        mov_b rax, [rdi + rcx];
+        add rdi, rcx;
+        mov_b rax, [rdi];
+        sub rdi, rcx;
         cmp rax, 0;
         je  msp_close_final;
         cmp rax, 0x2F;                           // '/'
