@@ -1,9 +1,9 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M4 (tests + smoke) — IN PROGRESS.
-M4-001 LANDED (single + multi-level test drivers + witnesses); M4-002 /
-M4-003 / M4-004 queued.
+**Current milestone:** M4 (tests + smoke) — LANDED.
+M4-001 through M4-004 all landed at HEAD; M5 (1.0 signed release +
+mirror push) is next per r49-r50-plan.md §5.9.
 
 ## Milestone rollup
 
@@ -21,7 +21,7 @@ M4-003 / M4-004 queued.
 | M4-001 (#10)    | single + multi-level test                                              | LANDED |
 | M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | LANDED |
 | M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | LANDED |
-| M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | QUEUED |
+| M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | LANDED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
