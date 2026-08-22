@@ -1,5 +1,5 @@
 // tests/test_m4_004_cap_tail.pdx — mkdir.M4-004
-// MkdirTestM4004 module: cap-tail correctness — the owner_slot_ref
+// TestM4CapTail module: cap-tail correctness — the owner_slot_ref
 // field of every CreatedDirRecord matches SLOT_USER (== 2 at v1.0).
 //
 // Per design/tooling/r49-r50-plan.md §5.9 (paideia-os) M4 line:
@@ -51,7 +51,7 @@
 //
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
 
-module MkdirTestM4004 = structure {
+module TestM4CapTail = structure {
 
   // ============================================================================
   // Witness strings.
