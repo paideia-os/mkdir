@@ -204,6 +204,37 @@ Every non-`MK_OK` return under M2-001 still routes through
 `mkdir_one_epilogue`, preserving the one-push / one-pop `rbx` parity
 from M1.
 
+## 4c. `mkdir_one` M2-002 additions — pre-existence probe
+
+Step 6a inside the walk (was Step 6a "placeholder create" at M2-001)
+now runs a pre-existence probe first. The M2-002 loop shape becomes:
+
+- **6a. Pre-existence probe.** `sys_cap_invoke(SLOT_PARENT_FILE,
+  PFF_OP_QUERY_INODE)`. Return convention (established at M2-002):
+    - `rax == 1` → level exists on-disk. Set `comp_pre_existed[i] = 1`;
+      skip create; advance `walk_i` without touching
+      `newly_created_count`. This is the "no-op, not error" path the
+      plan doc §5.9 M2-002 line requires.
+    - `rax >= 0 && rax != 1` → level does not exist. Set
+      `comp_pre_existed[i] = 0`; proceed to Step 6b.
+    - `rax < 0` → hard failure. Return `MK_MKDIR_FAIL`.
+- **6b. Placeholder create.** Unchanged from M2-001.
+- **6c. `newly_created_count += 1`.** Now gated on Step 6a not hitting
+  the "exists" branch — so the M3-003 undo record only queues levels
+  this invocation actually created, preserving `undo mkdir -p a/b/c`
+  correctness when `a` pre-existed.
+- **6d. Cap-tail owner stamp.** Deferred to M2-003.
+
+At M2-002 the probe is still a placeholder — the real per-component
+existence check on `KIND_PDXFS_FILE` is `mkdir.M2-substrate-002` at
+the paideia-os repo. The placeholder currently reports "not exists"
+for every level, so the runtime behaviour of the M2-002 build is
+indistinguishable from M2-001. The value the M2-002 change lands is
+the branch structure: `comp_pre_existed[i]` bookkeeping, conditional
+`newly_created_count` advancement, and the return-convention
+contract (`rax == 1` = exists) that `mkdir.M2-substrate-002` fills
+without a signature change to `mkdir_one`.
+
 ## 5. Flag semantics at M1
 
 | flag        | M1 behaviour                                             | M2 wire-up                    |
@@ -264,17 +295,18 @@ apply to userspace tooling at v0.33+:
   label in the module uses the `mkdir_` or `mks_` prefix. Recorded here
   as a persistent gotcha per the paideia-as reserved-labels rule.
 
-## 8. What M2-001 explicitly does not do
+## 8. What M2-002 explicitly does not do
 
-Called out here so a reader of M2-001 code does not mistake absence
+Called out here so a reader of M2-002 code does not mistake absence
 for bug:
 
-- No pre-existing-dir handling. Under `-p` (M2-002), `mkdir a/b` where
-  `a` already exists is a no-op on `a`, a create on `b`. M2-001 walks
-  every component as if newly-created and calls the placeholder create
-  per level; M2-002 slots the existence probe in without a signature
-  change to `mkdir_one`.
-- No cap-tail write. `mkdir_one` step 6 has a "cap-tail owner stamp —
+- No real per-component existence probe. The M2-002 branch structure
+  is in place — `comp_pre_existed[i]` bookkeeping, conditional
+  `newly_created_count` advancement, `rax == 1` return convention —
+  but the placeholder probe (`PFF_OP_QUERY_INODE` at HEAD) does not
+  distinguish per-component existence yet. The real existence check
+  is `mkdir.M2-substrate-002` at the paideia-os repo.
+- No cap-tail write. `mkdir_one` step 6d has a "cap-tail owner stamp —
   DEFERRED to mkdir.M2-003" comment where the M2-003 placeholder
   invocation on `SLOT_USER` will slot in.
 - No `CreatedDirRecord[]` emission. `mkdir_one` writes only stderr text

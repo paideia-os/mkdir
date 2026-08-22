@@ -12,7 +12,7 @@
 | M1-002 (#2)     | argv surface via libpdx-argv (mkdir [-p\|-v\|--dry-run])               | LANDED |
 | M1-003 (#3)     | first runnable: single-level mkdir a in TXN with cap-tail as owner     | LANDED |
 | M2-001 (#4)     | -p create-parents: multi-level path atomic in single TXN               | LANDED |
-| M2-002 (#5)     | -p pre-existing dir handling (no-op, not error)                        | OPEN   |
+| M2-002 (#5)     | -p pre-existing dir handling (no-op, not error)                        | LANDED |
 | M2-003 (#6)     | cap-tail write on every created directory (KIND_USER_ref in inode)     | OPEN   |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full

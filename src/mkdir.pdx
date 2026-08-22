@@ -1,4 +1,4 @@
-// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001
+// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002
 // Mkdir module: _init_caps sidecar declaration + _start orchestrator +
 // argv wire-up + flag walk + mkdir_one create sequence + mkdir_run
 // positional walk. M1-001 landed the scaffold shape (ring3 marker +
@@ -10,7 +10,10 @@
 // M2-001 lifts the multi-level guard when `-p` is present, adds a
 // leaf `mkdir_split_path` component splitter, and wraps a single-TXN
 // scope around a per-component walk that tracks
-// `MkdirState::newly_created_count` for the M3-003 undo record.
+// `MkdirState::newly_created_count` for the M3-003 undo record; M2-002
+// adds a per-component pre-existence probe (placeholder until
+// mkdir.M2-substrate-002) so `-p` treats pre-existing levels as
+// no-ops rather than errors and does NOT queue them for undo.
 //
 // See design/architecture.md §2 (module boundary), §3 (_start shape),
 // §4 (mkdir_one create sequence), §4a (mkdir_split_path — M2-001),
@@ -508,7 +511,7 @@ module Mkdir = structure {
   pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk. Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber) invokes placeholder create per component + increments newly_created_count. M2-002 will slot the pre-existence probe here without a signature change. M2-003 will slot the cap-tail stamp here without a signature change. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword. Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
+      justification: "mkdir.M1-003 + M2-001 + M2-002 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe. Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp deferred. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
       block: {
         // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
         push rbx;
@@ -620,7 +623,57 @@ module Mkdir = structure {
         cmp rax, rcx;
         jge mkdir_one_do_commit;
 
-        // Step 6a: placeholder create.
+        // Step 6a: pre-existence probe (M2-002 placeholder).
+        // Real per-component existence check on KIND_PDXFS_FILE is
+        // mkdir.M2-substrate-002 at paideia-os. The placeholder invokes
+        // PFF_OP_QUERY_INODE (0) on SLOT_PARENT_FILE — it exercises the
+        // KIND_PDXFS_FILE dispatch through the same slot the create
+        // uses, but its return value at M2 does NOT distinguish
+        // per-component existence (it always reports the parent inode).
+        // Contract established at M2-002: probe returns 1 → level
+        // already exists (skip create, do NOT advance
+        // newly_created_count); probe returns 0 → level does not
+        // exist (proceed to create); probe returns negative → hard
+        // failure, return MK_MKDIR_FAIL. At M2-002 the placeholder
+        // always returns 0 (or the parent inode number, treated as
+        // "not the sentinel 1" per the same rule), so every level in
+        // the walk still hits the create path. The substrate wire
+        // (M2-substrate-002) will make the probe return 1 for a
+        // pre-existing level; the branch below already handles it.
+        mov rdi, 1;                               // SLOT_PARENT_FILE = 1
+        xor rsi, rsi;                             // PFF_OP_QUERY_INODE = 0
+        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_one_mkdir_fail;
+
+        // Store per-component pre_existed bit. `rax == 1` = exists;
+        // anything else = not exists.
+        lea r11, [rip + walk_i];
+        mov rcx, [r11];
+        cmp rax, 1;
+        je  mkdir_one_probe_exists;
+
+        // Not-existing: comp_pre_existed[i] = 0.
+        xor rax, rax;
+        lea r11, [rip + comp_pre_existed];
+        mov [r11 + rcx*8], rax;
+        jmp mkdir_one_do_create;
+
+      mkdir_one_probe_exists:
+        // Existing: comp_pre_existed[i] = 1; skip create (idempotent).
+        // This is the "-p pre-existing dir handling: no-op, not error"
+        // path the plan doc §5.9 M2-002 line requires. Under `-p`,
+        // `mkdir a/b` where `a` exists is a no-op on `a` (do not
+        // advance newly_created_count so M3-003 undo does not queue
+        // `a` for removal) and a create on `b`.
+        mov rax, 1;
+        lea r11, [rip + comp_pre_existed];
+        mov [r11 + rcx*8], rax;
+        jmp mkdir_one_advance_walk;
+
+      mkdir_one_do_create:
+        // Step 6b: placeholder create.
         mov rdi, 1;                               // SLOT_PARENT_FILE = 1
         mov rsi, 6;                               // PFF_OP_DEBUG_PRINT = 6
         mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
@@ -628,15 +681,18 @@ module Mkdir = structure {
         cmp rax, 0;
         jl  mkdir_one_mkdir_fail;
 
-        // Step 6b: newly_created_count += 1. (M2-002 branch will
-        // conditionally skip this when the pre-existence probe hits.)
+        // Step 6c: newly_created_count += 1 (only on actual create,
+        // not on pre-existing skip — this is the invariant the M3-003
+        // undo record reads to unwind exactly this invocation's
+        // additions).
         lea r11, [rip + newly_created_count];
         mov rax, [r11];
         add rax, 1;
         mov [r11], rax;
 
-        // Step 6c: cap-tail owner stamp — DEFERRED to mkdir.M2-003.
+        // Step 6d: cap-tail owner stamp — DEFERRED to mkdir.M2-003.
 
+      mkdir_one_advance_walk:
         // Advance walk_i.
         lea r11, [rip + walk_i];
         mov rax, [r11];

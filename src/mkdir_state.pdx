@@ -92,6 +92,28 @@ module MkdirState = structure {
   pub let mut newly_created_count : u64      = uninit @align(8)
   pub let mut walk_i             : u64       = uninit @align(8)
 
+  // --- M2-002: per-component pre-existence bitmap. `mkdir_one`'s
+  //     walk sets `comp_pre_existed[i] = 1` when the existence probe
+  //     reports the level already exists on-disk, and 0 otherwise.
+  //     A pre-existing level SKIPS the placeholder create and does
+  //     NOT advance `newly_created_count` — so the mkdir.M3-003 undo
+  //     record can distinguish "created this invocation" (removable
+  //     on undo) from "was there before" (must survive undo). This
+  //     is the mechanism the plan doc §5.9 M2 line calls out:
+  //     "`-p` unwinds only the levels this invocation actually
+  //     created (the TXN log distinguishes newly-created from
+  //     pre-existing)."
+  //
+  //     The probe itself is a placeholder at M2-002 — the real
+  //     per-component existence check on `KIND_PDXFS_FILE` is
+  //     `mkdir.M2-substrate-002` at the paideia-os repo. Until then
+  //     the probe always reports "not exists" (comp_pre_existed[i]
+  //     stays 0), which is safe: idempotence code path exists,
+  //     substrate wire fills its return convention. Consumed by
+  //     index up to `comp_count`, so trailing entries need no
+  //     zeroing.
+  pub let mut comp_pre_existed   : [u64; 16] = uninit @align(8)
+
   // mkdir_state_reset() — zero the three flag slots, the exit code, and
   // the error positional index so a subsequent _start starts from a
   // known-empty MkdirState. rax=0 is the value written; xor rax,rax is
@@ -109,7 +131,7 @@ module MkdirState = structure {
   pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 + M2-001 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Nine lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters so parse_flags_from_argv, mkdir_one, and mkdir_run start from a known baseline. The comp_start_offsets / comp_lengths arrays are consumed by index up to comp_count, so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 + M2-001 + M2-002 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Nine lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters so parse_flags_from_argv, mkdir_one, and mkdir_run start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed arrays (the third added at M2-002) are consumed by index up to comp_count, so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
         lea r11, [rip + flag_p];             mov [r11], rax;
