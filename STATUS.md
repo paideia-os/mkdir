@@ -1,9 +1,9 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M3 (semantic-pipe / audit integration) — IN PROGRESS.
-M3-001 LANDED (CreatedDirRecord[] schema staged + substrate flip to
-real PXT_OP_CREATE / PXT_OP_COMMIT); M3-002 / M3-003 queued.
+**Current milestone:** M4 (tests + smoke) — IN PROGRESS.
+M4-001 LANDED (single + multi-level test drivers + witnesses); M4-002 /
+M4-003 / M4-004 queued.
 
 ## Milestone rollup
 
@@ -16,8 +16,12 @@ real PXT_OP_CREATE / PXT_OP_COMMIT); M3-002 / M3-003 queued.
 | M2-002 (#5)     | -p pre-existing dir handling (no-op, not error)                        | LANDED |
 | M2-003 (#6)     | cap-tail write on every created directory (KIND_USER_ref in inode)     | LANDED |
 | M3-001 (#7)     | CreatedDirRecord[] schema bind (path, parent_txn_id, owner)            | LANDED |
-| M3-002 (#8)     | CreateDirRecord via libpdx-audit                                       | QUEUED |
-| M3-003 (#9)     | PdxFS v1 undo record: replay is rmdir; -p unwinds only new levels      | QUEUED |
+| M3-002 (#8)     | CreateDirRecord via libpdx-audit                                       | LANDED |
+| M3-003 (#9)     | PdxFS v1 undo record: replay is rmdir; -p unwinds only new levels      | LANDED |
+| M4-001 (#10)    | single + multi-level test                                              | LANDED |
+| M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | QUEUED |
+| M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | QUEUED |
+| M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | QUEUED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
@@ -34,5 +38,6 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
 - `src/mkdir.pdx` — `Mkdir` module (`_init_caps` sidecar, `_start`
   orchestrator, `parse_flags_from_argv`, `mkdir_one`, `mkdir_run`,
   `emit_stderr`).
-- `tests/` — empty until `mkdir.M4-001` lands the coreutil test matrix.
+- `tests/` — M4 coreutil test drivers + `expected-*.txt` witnesses
+  (M4-001 landed at HEAD; M4-002..004 queued).
 - `.plans/` — per-milestone implementation notes.

@@ -1,0 +1,428 @@
+// tests/test_m4_001_single_multi.pdx — mkdir.M4-001
+// MkdirTestM4001 module: single-level and multi-level coreutil test drivers.
+//
+// Per design/tooling/r49-r50-plan.md §5.9 (paideia-os) M4 line:
+//   "single + multi-level test"
+//
+// M4-001 lands TWO test drivers behind ONE issue because they share the
+// same fixture shape (bootstrap argv into MkdirState + mkdir_split_path
+// + mkdir_one) and both prove the same load-bearing invariant: after a
+// mkdir invocation returns MK_OK, MkdirState is in the exact "one
+// record per created level, TXN scoped by parent_txn_id, owner stamped
+// to SLOT_USER" shape that CreatedDirRecord[] (M3-001) + RmdirUndoRecord[]
+// (M3-003) freeze at commit time.
+//
+// Test driver convention (also documented in tests/README.md at M4-001):
+//   Each M4-* test lands as a Mkdir<TestId> module exporting exactly one
+//   `run_test_m4_<id> : () -> u64 !{mem, sysreg} @{cap}` function that
+//   returns 0 on PASS or 1 on FAIL. The driver:
+//     1. Calls mkdir_state_reset() + reset() (libpdx-argv) to zero state.
+//     2. Seeds a bootstrap argv over the mkdir-owned .rodata strings.
+//     3. Calls parse_argv → parse_flags_from_argv → mkdir_run
+//        (identically to mkdir's own _start Steps 3..7).
+//     4. Asserts on MkdirState singletons via cmp against expected values.
+//     5. Emits a fixed witness line on OK (`mkdir.M4-001 single OK\n` /
+//        `mkdir.M4-001 multi OK\n`) or a per-check FAIL diagnostic before
+//        returning 1.
+//
+// The tests DO NOT define their own `_start`. A test-runner binary lives
+// at paideia-os `tests/mkdir/mkdir_test_runner.pdx` (M4-substrate-001
+// follow-up) — that binary owns `_start`, calls each `run_test_m4_XXX`
+// in sequence, sums the failures, and sys_exits with the sum. Until the
+// runner lands the drivers stay shape-frozen; the expected witness lines
+// live at `tests/expected-mkdir-m4-001-single.txt` and
+// `tests/expected-mkdir-m4-001-multi.txt` so the paideia-os smoke matrix
+// grep already knows what to look for. Same seam the CDR array (M3-001)
+// and undo-record array (M3-003) freeze at commit time: shape here,
+// substrate wire there.
+//
+// paideia-as conformance mirrors src/mkdir.pdx:
+//   - Module name PascalCase basename (`MkdirTestM4001`).
+//   - No `test` mnemonic — every zero-check is `cmp reg, 0`.
+//   - r11 scratch only (LEA); byte loads via xor rax,rax + mov_b.
+//   - Every `cmp reg, imm` uses an immediate ≤ 0x7F (max seen: 3 for
+//     comp_count assertion; SC+ IDs 12/60 ≤ 60).
+//   - Labels prefixed `t4s_` (short for test-m4-001-single) and `t4m_`
+//     (test-m4-001-multi) to avoid every paideia-as reserved keyword
+//     (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`, `structure`,
+//     `unsafe`, `block`).
+//   - Every non-leaf helper preserves SysV push/pop parity — the drivers
+//     use zero callee-save state (all loop counters and comparison
+//     scratch live in caller-save regs), so no push/pop needed.
+//
+// Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
+
+module MkdirTestM4001 = structure {
+
+  // ============================================================================
+  // Witness strings — the smoke matrix grep target.
+  //
+  // Format matches paideia-os `tests/r31/expected-spawn-pair.txt` line
+  // shape: a stable prefix + a scenario tag + `OK`. The fixed prefix
+  // `mkdir.M4-001` names the milestone; the scenario suffix (`single` /
+  // `multi`) disambiguates which driver produced the line. The paideia-os
+  // smoke matrix at `tests/mkdir/expected-*.txt` (M4-substrate-001) will
+  // depend on the exact byte sequence — every character is load-bearing.
+  //
+  // FAIL diagnostics are per-check because a single generic "FAIL" line
+  // does not tell the reader which invariant broke. Each check point gets
+  // its own witness (`mkdir.M4-001 single FAIL rc\n` etc.) so the smoke
+  // matrix output localises the regression to a step. This mirrors how
+  // src/mkdir.pdx pairs each error path with a distinct err_*_msg.
+  // ============================================================================
+
+  pub let ok_single_msg   : [u8; 24] = "mkdir.M4-001 single OK\n\0"
+  pub let ok_single_len   : u64 = 23
+
+  pub let ok_multi_msg    : [u8; 23] = "mkdir.M4-001 multi OK\n\0"
+  pub let ok_multi_len    : u64 = 22
+
+  // Per-check FAIL diagnostics. Each names the invariant that broke.
+  //
+  //   fail_rc               — mkdir_run left exit_code != 0.
+  //   fail_comp_count       — MkdirState::comp_count did not match.
+  //   fail_newly_created    — MkdirState::newly_created_count did not match.
+  //   fail_cdr_count        — created_dir_records_count did not match
+  //                            newly_created_count (freeze invariant).
+  //   fail_rur_count        — rmdir_undo_records_count did not match
+  //                            newly_created_count (twin-freeze invariant).
+  pub let fail_rc_msg              : [u8; 32] = "mkdir.M4-001 FAIL rc nonzero\n\0\0\0"
+  pub let fail_rc_len              : u64 = 29
+
+  pub let fail_comp_count_msg      : [u8; 32] = "mkdir.M4-001 FAIL comp_count\n\0\0\0"
+  pub let fail_comp_count_len      : u64 = 29
+
+  pub let fail_newly_created_msg   : [u8; 40] = "mkdir.M4-001 FAIL newly_created_count\n\0\0"
+  pub let fail_newly_created_len   : u64 = 38
+
+  pub let fail_cdr_count_msg       : [u8; 32] = "mkdir.M4-001 FAIL cdr_count\n\0\0\0\0"
+  pub let fail_cdr_count_len       : u64 = 28
+
+  pub let fail_rur_count_msg       : [u8; 32] = "mkdir.M4-001 FAIL rur_count\n\0\0\0\0"
+  pub let fail_rur_count_len       : u64 = 28
+
+  // ============================================================================
+  // Bootstrap argv — single scenario.
+  //
+  // Invocation: `mkdir a`
+  //   argv[0] = "a"            → positional, becomes pos_ptrs[0]
+  //   no flags — flag_p / flag_v / flag_dry_run all 0.
+  //
+  // Runs mkdir_one("a") which:
+  //   - Skips the multi-level guard (single-component path, no '/').
+  //   - Sets comp_count = 1 in the mkdir_one_no_slash branch.
+  //   - --dry-run flag is 0 → NO short-circuit; proceeds to Step 5.
+  //   - Step 5 placeholder TXN QUERY_ID → txn_id captured to
+  //     current_txn_id.
+  //   - Step 6 walk once: probe (stub returns not-exists) → create
+  //     placeholder PXT_OP_CREATE → newly_created_count = 1 → cap-tail
+  //     stamp placeholder → CDR + RUR stage at index 0.
+  //   - Step 7 commit placeholder → freeze both counts at 1.
+  //   - Return MK_OK.
+  //
+  // Expected post-condition (asserted below):
+  //   exit_code                    == 0    (MK_OK)
+  //   comp_count                   == 1
+  //   newly_created_count          == 1
+  //   created_dir_records_count    == 1
+  //   rmdir_undo_records_count     == 1
+  // ============================================================================
+
+  pub let argv_single_a       : [u8; 2]  = "a\0"
+  pub let mut argv_single_ptrs : [u64; 1] = uninit @align(8)
+  pub let argv_single_argc     : u64 = 1
+
+  // ============================================================================
+  // Bootstrap argv — multi scenario.
+  //
+  // Invocation: `mkdir -p a/b/c`
+  //   argv[0] = "-p"           → short flag, sets flag_p = 1
+  //   argv[1] = "a/b/c"        → positional, becomes pos_ptrs[0]
+  //
+  // Runs mkdir_one("a/b/c") which (with flag_p == 1):
+  //   - Skips the multi-level guard (mkdir_one_split branch).
+  //   - Calls mkdir_split_path("a/b/c") → comp_count = 3.
+  //   - --dry-run flag is 0 → NO short-circuit.
+  //   - Step 5 TXN QUERY_ID stub → current_txn_id populated.
+  //   - Step 6 walks THREE times: probe (all not-exists) → create (all
+  //     succeed) → newly_created_count = 3 → cap-tail stamp x3 → CDR
+  //     stage x3 + RUR stage x3.
+  //   - Step 7 commit → freeze CDR count = RUR count = 3.
+  //   - Return MK_OK.
+  //
+  // Expected post-condition:
+  //   exit_code                    == 0    (MK_OK)
+  //   comp_count                   == 3
+  //   newly_created_count          == 3
+  //   created_dir_records_count    == 3
+  //   rmdir_undo_records_count     == 3
+  //
+  // The bootstrap argv chooses `-p a/b/c` (matches src/mkdir.pdx's own
+  // _start bootstrap for M2, minus the -v and --dry-run flags — this
+  // driver deliberately does NOT set --dry-run because the M4-001 multi
+  // scenario must exercise Steps 5-7 (TXN open → walk → commit), not
+  // short-circuit before Step 5).
+  // ============================================================================
+
+  pub let argv_multi_p        : [u8; 3]  = "-p\0"
+  pub let argv_multi_abc      : [u8; 6]  = "a/b/c\0"
+  pub let mut argv_multi_ptrs : [u64; 2] = uninit @align(8)
+  pub let argv_multi_argc     : u64 = 2
+
+  // ============================================================================
+  // run_test_m4_001_single() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  //   rax = 0 on PASS, 1 on FAIL.
+  //
+  // Sequence:
+  //   1. mkdir_state_reset (zero MkdirState singletons).
+  //   2. reset (libpdx-argv ParsedArgs).
+  //   3. Build argv_single_ptrs[0] = &argv_single_a.
+  //   4. parse_argv(argv_single_ptrs, 1). Expected ERR_OK.
+  //   5. parse_flags_from_argv.
+  //   6. mkdir_run.
+  //   7. Assert:
+  //        MkdirState::exit_code                == 0
+  //        MkdirState::comp_count               == 1
+  //        MkdirState::newly_created_count      == 1
+  //        MkdirState::created_dir_records_count == 1
+  //        MkdirState::rmdir_undo_records_count == 1
+  //   8. Emit ok_single_msg + return 0.
+  //
+  // Any assert-fail emits the per-check FAIL diagnostic + returns 1.
+  //
+  // Register plan (all caller-save; no push/pop parity):
+  //   rax = state loads / cross-module call return
+  //   rdi/rsi = call args (SysV)
+  //   r11 = LEA scratch
+  // ============================================================================
+  pub let run_test_m4_001_single : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.M4-001 run_test_m4_001_single — single-level test driver. Resets MkdirState + ParsedArgs, seeds bootstrap argv `a` (one positional, no flags), calls parse_argv + parse_flags_from_argv + mkdir_run identically to src/mkdir.pdx _start Steps 1..7. Asserts on FIVE MkdirState singletons: exit_code == 0 (mkdir_run MK_OK); comp_count == 1 (mkdir_one_no_slash branch sets it); newly_created_count == 1 (single walk beat); created_dir_records_count == 1 (M3-001 freeze at Step 7); rmdir_undo_records_count == 1 (M3-003 twin-freeze at same Step 7 beat). Any assert-fail emits its per-check FAIL diagnostic then returns 1; all-pass emits ok_single_msg then returns 0. paideia-as conformance: no `test` mnemonic (every zero-check `cmp reg, 0`); r11 LEA scratch only; every cmp reg,imm ≤ 3 (max: comp_count assertion); byte loads N/A (only u64 field reads); no push/pop parity — driver is straight-line with only leaf-return calls (mkdir_state_reset, reset, parse_argv, parse_flags_from_argv, mkdir_run, emit_stderr all restore their own callee-save). Labels prefixed t4s_ (test-m4-001-single) — avoids every paideia-as reserved keyword. Cross-module calls by unqualified linker name per paideia-as flat convention (mkdir_state_reset / reset / parse_argv / parse_flags_from_argv / mkdir_run / emit_stderr).",
+      block: {
+        // ---- Step 1: MkdirState reset. ----
+        call mkdir_state_reset;
+
+        // ---- Step 2: ParsedArgs reset (libpdx-argv). ----
+        call reset;
+
+        // ---- Step 3: build argv_single_ptrs[0] = &argv_single_a. ----
+        lea r11, [rip + argv_single_a];
+        lea rcx, [rip + argv_single_ptrs];
+        mov [rcx + 0], r11;
+
+        // ---- Step 4: parse_argv(argv_single_ptrs, 1). ----
+        lea rdi, [rip + argv_single_ptrs];
+        mov rsi, 1;                               // argv_single_argc
+        call parse_argv;
+        cmp rax, 0;
+        jne t4s_fail_rc;
+
+        // ---- Step 5: parse_flags_from_argv. ----
+        call parse_flags_from_argv;
+
+        // ---- Step 6: mkdir_run. ----
+        call mkdir_run;
+
+        // ---- Step 7: assertions. ----
+
+        // exit_code == 0.
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne t4s_fail_rc;
+
+        // comp_count == 1.
+        lea r11, [rip + comp_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne t4s_fail_comp_count;
+
+        // newly_created_count == 1.
+        lea r11, [rip + newly_created_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne t4s_fail_newly_created;
+
+        // created_dir_records_count == 1.
+        lea r11, [rip + created_dir_records_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne t4s_fail_cdr_count;
+
+        // rmdir_undo_records_count == 1.
+        lea r11, [rip + rmdir_undo_records_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne t4s_fail_rur_count;
+
+        // ---- Step 8: emit OK witness + return 0. ----
+        lea rdi, [rip + ok_single_msg];
+        mov rsi, 23;                              // ok_single_len
+        call emit_stderr;
+        xor rax, rax;
+        ret
+
+      t4s_fail_rc:
+        lea rdi, [rip + fail_rc_msg];
+        mov rsi, 29;                              // fail_rc_len
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4s_fail_comp_count:
+        lea rdi, [rip + fail_comp_count_msg];
+        mov rsi, 29;                              // fail_comp_count_len
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4s_fail_newly_created:
+        lea rdi, [rip + fail_newly_created_msg];
+        mov rsi, 38;                              // fail_newly_created_len
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4s_fail_cdr_count:
+        lea rdi, [rip + fail_cdr_count_msg];
+        mov rsi, 28;                              // fail_cdr_count_len
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4s_fail_rur_count:
+        lea rdi, [rip + fail_rur_count_msg];
+        mov rsi, 28;                              // fail_rur_count_len
+        call emit_stderr;
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // run_test_m4_001_multi() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  //   rax = 0 on PASS, 1 on FAIL.
+  //
+  // Sequence mirrors the single driver but seeds `-p a/b/c` (two argv
+  // entries: `-p` flag + `a/b/c` positional). Post-condition asserts:
+  //   exit_code                    == 0
+  //   comp_count                   == 3   (a, b, c)
+  //   newly_created_count          == 3   (no pre-existing levels)
+  //   created_dir_records_count    == 3   (M3-001 freeze)
+  //   rmdir_undo_records_count     == 3   (M3-003 twin-freeze)
+  //
+  // Emits ok_multi_msg on all-pass, per-check FAIL on any deviation.
+  // Same register plan + paideia-as conformance rules as the single
+  // driver. Labels prefixed t4m_ (test-m4-001-multi) to keep the two
+  // drivers' labels distinct within the module.
+  // ============================================================================
+  pub let run_test_m4_001_multi : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.M4-001 run_test_m4_001_multi — multi-level -p test driver. Resets MkdirState + ParsedArgs, seeds bootstrap argv `-p a/b/c` (two argv slots — one short flag, one positional), calls parse_argv + parse_flags_from_argv + mkdir_run. Asserts on the same FIVE singletons as the single driver but with comp_count / newly_created_count / created_dir_records_count / rmdir_undo_records_count all expected == 3 (one entry per level in a/b/c). Proves the M2-001 -p split, the M2-003 cap-tail stamp per level, the M3-001 CDR array per level, and the M3-003 RUR array per level all track the same walk count through Step 7's twin-freeze beat. Same failure diagnostics as single (fail_*_msg shared across both drivers within the module). paideia-as conformance identical to run_test_m4_001_single. Labels prefixed t4m_ (test-m4-001-multi).",
+      block: {
+        // ---- Step 1: MkdirState reset. ----
+        call mkdir_state_reset;
+
+        // ---- Step 2: ParsedArgs reset. ----
+        call reset;
+
+        // ---- Step 3: build argv_multi_ptrs. ----
+        lea rcx, [rip + argv_multi_ptrs];
+        lea r11, [rip + argv_multi_p];        mov [rcx + 0], r11;
+        lea r11, [rip + argv_multi_abc];      mov [rcx + 8], r11;
+
+        // ---- Step 4: parse_argv(argv_multi_ptrs, 2). ----
+        lea rdi, [rip + argv_multi_ptrs];
+        mov rsi, 2;                               // argv_multi_argc
+        call parse_argv;
+        cmp rax, 0;
+        jne t4m_fail_rc;
+
+        // ---- Step 5: parse_flags_from_argv. ----
+        call parse_flags_from_argv;
+
+        // ---- Step 6: mkdir_run. ----
+        call mkdir_run;
+
+        // ---- Step 7: assertions. ----
+
+        // exit_code == 0.
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne t4m_fail_rc;
+
+        // comp_count == 3.
+        lea r11, [rip + comp_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne t4m_fail_comp_count;
+
+        // newly_created_count == 3.
+        lea r11, [rip + newly_created_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne t4m_fail_newly_created;
+
+        // created_dir_records_count == 3.
+        lea r11, [rip + created_dir_records_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne t4m_fail_cdr_count;
+
+        // rmdir_undo_records_count == 3.
+        lea r11, [rip + rmdir_undo_records_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne t4m_fail_rur_count;
+
+        // ---- Step 8: emit OK witness + return 0. ----
+        lea rdi, [rip + ok_multi_msg];
+        mov rsi, 22;                              // ok_multi_len
+        call emit_stderr;
+        xor rax, rax;
+        ret
+
+      t4m_fail_rc:
+        lea rdi, [rip + fail_rc_msg];
+        mov rsi, 29;
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4m_fail_comp_count:
+        lea rdi, [rip + fail_comp_count_msg];
+        mov rsi, 29;
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4m_fail_newly_created:
+        lea rdi, [rip + fail_newly_created_msg];
+        mov rsi, 38;
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4m_fail_cdr_count:
+        lea rdi, [rip + fail_cdr_count_msg];
+        mov rsi, 28;
+        call emit_stderr;
+        mov rax, 1;
+        ret
+
+      t4m_fail_rur_count:
+        lea rdi, [rip + fail_rur_count_msg];
+        mov rsi, 28;
+        call emit_stderr;
+        mov rax, 1;
+        ret
+      }
+    }
+}
