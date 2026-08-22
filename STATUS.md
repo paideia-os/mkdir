@@ -20,7 +20,7 @@ M4-003 / M4-004 queued.
 | M3-003 (#9)     | PdxFS v1 undo record: replay is rmdir; -p unwinds only new levels      | LANDED |
 | M4-001 (#10)    | single + multi-level test                                              | LANDED |
 | M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | LANDED |
-| M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | QUEUED |
+| M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | LANDED |
 | M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | QUEUED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
