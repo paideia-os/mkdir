@@ -1,4 +1,4 @@
-// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002 + M2-003 + M3-001
+// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-002
 // Mkdir module: _init_caps sidecar declaration + _start orchestrator +
 // argv wire-up + flag walk + mkdir_one create sequence + mkdir_run
 // positional walk. M1-001 landed the scaffold shape (ring3 marker +
@@ -27,8 +27,8 @@
 module Mkdir = structure {
 
   // ============================================================================
-  // _init_caps sidecar — FOUR entries. Layout per
-  // design/loader/init-caps-sidecar.md §2 (paideia-os) and
+  // _init_caps sidecar — FIVE entries (M3-002 added the audit endpoint).
+  // Layout per design/loader/init-caps-sidecar.md §2 (paideia-os) and
   // src/kernel/core/loader/init_caps.pdx (R20b.M4).
   //
   // Word packing per entry (16 bytes each):
@@ -42,6 +42,11 @@ module Mkdir = structure {
   // Entry 2: slot=2, kind=KIND_USER(0x190), rights=INVOKE(0x008)
   // Entry 3: slot=3, kind=KIND_IPC_ENDPOINT(0x005), rights=WRITE|INVOKE
   //   WRITE=0x002, INVOKE=0x008 → 0x00A.
+  // Entry 4: slot=4, kind=KIND_IPC_ENDPOINT(0x005), rights=WRITE|INVOKE
+  //   Same as entry 3; bound to svc.audit-journal by the shell at
+  //   spawn time (M3-002). Kept separate from slot 3 (semantic pipe)
+  //   so a future revoke of the schema pipe does not also revoke
+  //   audit — audit is an independent audit-first (D3) commitment.
   //
   // target_ptr at M1 is 0 for every row — the shell fills it via
   // sys_cap_transfer before the exec landing. Matches echo_client's
@@ -50,9 +55,9 @@ module Mkdir = structure {
   // shell owns the resolution).
   // ============================================================================
 
-  pub let _init_caps_count : u64 = 4
+  pub let _init_caps_count : u64 = 5
 
-  pub let _init_caps : [u64; 8] = [
+  pub let _init_caps : [u64; 10] = [
     // Entry 0 — KIND_PDXFS_TXN at slot 0.
     0x0000040801960000,
     0x0000000000000000,
@@ -62,8 +67,11 @@ module Mkdir = structure {
     // Entry 2 — KIND_USER at slot 2.
     0x0000000801900002,
     0x0000000000000000,
-    // Entry 3 — KIND_IPC_ENDPOINT at slot 3.
+    // Entry 3 — KIND_IPC_ENDPOINT at slot 3 (semantic pipe).
     0x0000000A00050003,
+    0x0000000000000000,
+    // Entry 4 — KIND_IPC_ENDPOINT at slot 4 (svc.audit-journal). M3-002.
+    0x0000000A00050004,
     0x0000000000000000
   ]
 
@@ -224,6 +232,76 @@ module Mkdir = structure {
       justification: "mkdir.M1-002 emit_stderr — thin sys_debug_puts wrapper. SC+ ID 12 loaded into rax; rdi/rsi come straight from the SysV caller (arity 2 < 4, no arg shuffle). Kept as its own symbol so mkdir.M3-001 can swap sys_debug_puts for a semantic-pipe send_record at exactly one call site rather than every diagnostic emit. Leaf function; no callee-save touched; no push/pop parity to preserve; no cmp; no test mnemonic.",
       block: {
         mov rax, 12;                              // SC+ ID 12 = sys_debug_puts
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // emit_audit_event(event_kind) — M3-002 audit-journal emit.
+  //
+  // Signature: emit_audit_event : (u64) -> u64 !{mem, sysreg} @{cap}
+  //   rdi = event_kind — one of UEJ_KIND_TOOL_INVOKE (130) /
+  //         UEJ_KIND_TOOL_ERROR (131) / UEJ_KIND_TOOL_CREATE_DIR (a
+  //         mkdir-local synthetic kind used per-created level).
+  //   rax = sys_cap_invoke return (any value; callers IGNORE the
+  //         return per the plan-doc §4.9 audit-first / D3
+  //         non-degrading rule — a full audit journal MUST NOT
+  //         sink the mkdir op, otherwise a tool that CAN suppress
+  //         its own audit trail exists).
+  //
+  // Sends via KIND_IPC_ENDPOINT dispatch on SLOT_AUDIT_EP (4). The
+  // op_arg packs op_code = IPC_OP_SEND (3) in bits [7:0] and
+  // event_kind in bits [63:8]; the kernel-side KindIpc handler at
+  // src/kernel/core/cap/kind_ipc.pdx L48 decodes op_code = SEND and
+  // enqueues the payload byte (== event_kind here) onto the global
+  // channel. The svc.audit-journal daemon body — the real consumer
+  // that will decode event_kind, marshal the payload into a
+  // /system/audit/user-events/*.pdxevent record, and durably persist
+  // it — has not landed yet (design/tooling/r49-r50-plan.md §5.0
+  // R49-PREP-006). Until then the send lands in the R12 IPC MVP's
+  // global SPSC channel, exercising the dispatch path and the
+  // rights gate (WRITE | INVOKE required, matches our
+  // R_IPC_WRITE|R_IPC_INVOKE = 0x0A cap).
+  //
+  // The M3-substrate-002 follow-up at paideia-os will replace this
+  // one-syscall shape with the libpdx-audit-M2 marshalling call
+  // that builds a full UejRecord (event_kind + actor_fp_lo +
+  // subject_fp_lo + body0..2 + tick_ns) and calls sys_ipc_send with
+  // a header + payload buffer — same signature (u64 event_kind ->
+  // u64) so no call-site rewrite here.
+  //
+  // Register plan (leaf; SysV-clean):
+  //   rax = SC+ ID / syscall return
+  //   rdi = SLOT_AUDIT_EP (overwrites incoming event_kind)
+  //   rsi = op_arg = (event_kind << 8) | IPC_OP_SEND
+  //   r10 = event_kind (preserved across the rdi overwrite)
+  //   r11 = shift scratch
+  //
+  // Effects / capabilities:
+  //   mem     — kind_ipc handler transitively writes ipc queues.
+  //   sysreg  — SYSCALL.
+  //   @{cap}  — sys_cap_invoke is cap-gated.
+  // ============================================================================
+  pub let emit_audit_event : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (event_kind: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.M3-002 emit_audit_event — audit-journal emit shim. Packs event_kind into op_arg[63:8] and IPC_OP_SEND (3) into op_arg[7:0], then invokes SLOT_AUDIT_EP (4) via sys_cap_invoke. Kernel-side KindIpc handler at src/kernel/core/cap/kind_ipc.pdx L48 decodes op_code=SEND, checks the WRITE|INVOKE (0x0A) rights we hold, and enqueues the payload byte onto the R12 IPC MVP global channel. The svc.audit-journal daemon body (design/tooling/r49-r50-plan.md §5.0 R49-PREP-006) will later replace the R12 global channel with a per-broker sink that decodes event_kind and durably persists a /system/audit/user-events/*.pdxevent record. Caller ignores the return per D3 non-degrading rule — a full audit journal must not sink the tool op. Leaf function; SysV-clean (no push/pop); r11 scratch used only for the shl of event_kind before the OR; no test mnemonic. Labels prefixed mkdir_aud_.",
+      block: {
+        // r10 = event_kind (preserve before overwriting rdi with slot).
+        mov r10, rdi;
+
+        // rsi = (event_kind << 8) | IPC_OP_SEND (3).
+        mov rsi, r10;
+        shl rsi, 8;
+        mov r11, 3;                               // IPC_OP_SEND
+        or  rsi, r11;
+
+        // rdi = SLOT_AUDIT_EP (4).
+        mov rdi, 4;
+
+        // sys_cap_invoke.
+        mov rax, 4;                               // SC+ ID 4
         syscall;
         ret
       }
@@ -977,18 +1055,24 @@ module Mkdir = structure {
   // ============================================================================
   // _start — user program entry point. Never returns (ends in sys_exit).
   //
-  // M1-003 shape (this milestone):
+  // Shape (M1-003 + M3-002 audit hooks):
   //   Step 0  ring3 proof-of-life marker on sys_debug_puts.
   //   Step 1  mkdir_state_reset()   — clear MkdirState singletons.
   //   Step 2  reset()               — clear ParsedArgs singletons (libpdx-argv).
+  //   Step 2a M3-002 emit_audit_event(UEJ_KIND_TOOL_INVOKE=130); set
+  //           audit_emitted_invoke = 1 (D3 audit-first: journal
+  //           records the invocation BEFORE any argv work).
   //   Step 3  Build argv_bootstrap_ptrs from the three static strings.
-  //   Step 4  parse_argv(argv, argc). On error → emit err_argv_msg and
+  //   Step 4  parse_argv(argv, argc). On error → emit err_argv_msg,
+  //           M3-002 emit_audit_event(UEJ_KIND_TOOL_ERROR=131),
   //           sys_exit(MK_ARGV_ERR).
   //   Step 5  parse_flags_from_argv() — populate MkdirState::flag_*.
-  //   Step 6  Check ParsedArgs::pos_count. If zero → emit err_no_operand_msg
-  //           and sys_exit(MK_MISSING_PATH).
+  //   Step 6  Check ParsedArgs::pos_count. If zero → emit err_no_operand_msg,
+  //           M3-002 emit_audit_event(UEJ_KIND_TOOL_ERROR),
+  //           sys_exit(MK_MISSING_PATH).
   //   Step 7  mkdir_run() — walk positionals, invoke mkdir_one per path.
   //           On first failure records MkdirState::exit_code + err_pos_index.
+  //   Step 7a M3-002 IFF exit_code != 0: emit_audit_event(UEJ_KIND_TOOL_ERROR).
   //   Step 8  sys_exit(MkdirState::exit_code) — 0 on all-success, otherwise
   //           the first mkdir_one MK_* return.
   //
@@ -1009,7 +1093,7 @@ module Mkdir = structure {
   pub let _start : () -> () !{mem, sysreg} @{sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched},
-      justification: "mkdir.M1-003 + M2-001 _start orchestrator. Full argv + create surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + argv_bootstrap build + parse_argv + argv-error diagnostic + parse_flags_from_argv + missing-operand diagnostic + mkdir_run + sys_exit(exit_code). Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: 60 sys_exit ID). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `mkdir_run`, `mkdir_one`, `mkdir_split_path`, `emit_stderr` → local). Bootstrap argv array is built via four lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp). M2 smoke witness: bootstrap argv `-p -v --dry-run a/b/c` → parse OK → flags {p=1, v=1, dry_run=1} → pos_count=1 → mkdir_run calls mkdir_one(\"a/b/c\") which under flag_p=1 calls mkdir_split_path (comp_count=3 for a, b, c) then short-circuits on --dry-run and returns MK_OK → exit_code=0 → exit(0). This exercises the M2-001 mkdir_split_path end-to-end (three components split correctly, non-empty each, no absolute-path or too-deep trigger) while the placeholder cap invocations wait on mkdir.M2-substrate-001 in paideia-os.",
+      justification: "mkdir.M1-003 + M2-001 + M3-002 _start orchestrator. Full argv + create + audit surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + M3-002 TOOL_INVOKE audit emit (with audit_emitted_invoke gate raised on the same beat) + argv_bootstrap build + parse_argv + argv-error diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + parse_flags_from_argv + missing-operand diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + mkdir_run + M3-002 conditional TOOL_ERROR emit when exit_code != 0 + sys_exit(exit_code). Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: UEJ_KIND_TOOL_ERROR = 131 and sys_exit ID 60). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `mkdir_run`, `mkdir_one`, `mkdir_split_path`, `emit_stderr`, `emit_audit_event` → local). Bootstrap argv array is built via four lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp). D3 audit-first invariant: the TOOL_INVOKE emit at Step 2 precedes every argv-parse or user-visible action, and every non-zero exit path (argv-parse fail, missing operand, mkdir_run partial) is paired with a TOOL_ERROR emit before its sys_exit — a tool that can suppress its own audit trail is the exact attack the D3 upgrade forecloses. All audit-emit returns are IGNORED (the sink must never be able to sink the tool op). M2 smoke witness: bootstrap argv `-p -v --dry-run a/b/c` → INVOKE emit → parse OK → flags {p=1, v=1, dry_run=1} → pos_count=1 → mkdir_run calls mkdir_one(\"a/b/c\") which under flag_p=1 calls mkdir_split_path (comp_count=3 for a, b, c) then short-circuits on --dry-run and returns MK_OK → exit_code=0 → NO TOOL_ERROR emit → exit(0). This exercises the M2-001 mkdir_split_path end-to-end (three components split correctly, non-empty each, no absolute-path or too-deep trigger) plus the M3-002 audit-emit-only-on-error branch while the placeholder cap invocations wait on mkdir.M2-substrate-001 in paideia-os.",
       block: {
         // ---- Step 0: ring3 proof-of-life marker. ----
         lea rdi, [rip + ring3_msg];
@@ -1022,6 +1106,21 @@ module Mkdir = structure {
 
         // ---- Step 2: ParsedArgs reset (libpdx-argv). Leaf call. ----
         call reset;
+
+        // ---- M3-002: emit UEJ_KIND_TOOL_INVOKE at entry. ----
+        // Every mkdir invocation records ONE TOOL_INVOKE event before
+        // any argv parsing. This is the D3 audit-first commitment: a
+        // tool invocation is journaled before it can suppress its own
+        // audit trail. audit_emitted_invoke is set to 1 on the same
+        // straight-line beat so the exit paths know not to re-emit
+        // (defence in depth — nothing today re-enters _start, but the
+        // gate keeps the invariant explicit).
+        mov rdi, 130;                             // UEJ_KIND_TOOL_INVOKE
+        call emit_audit_event;                    // return ignored (D3)
+
+        mov rax, 1;
+        lea r11, [rip + audit_emitted_invoke];
+        mov [r11], rax;
 
         // ---- Step 3: build argv_bootstrap_ptrs (four static entries). ----
         lea rcx, [rip + argv_bootstrap_ptrs];
@@ -1044,6 +1143,11 @@ module Mkdir = structure {
         mov rsi, 24;                              // err_argv_len
         call emit_stderr;
 
+        // M3-002: emit UEJ_KIND_TOOL_ERROR (131) before sys_exit so the
+        // audit journal sees the failure. Return ignored (D3).
+        mov rdi, 131;                             // UEJ_KIND_TOOL_ERROR
+        call emit_audit_event;
+
         mov rdi, 1;                               // MK_ARGV_ERR
         mov rax, 60;                              // SC+ ID 60 = sys_exit
         syscall;
@@ -1063,6 +1167,10 @@ module Mkdir = structure {
         mov rsi, 23;                              // err_no_operand_len
         call emit_stderr;
 
+        // M3-002: emit UEJ_KIND_TOOL_ERROR (131) before sys_exit.
+        mov rdi, 131;                             // UEJ_KIND_TOOL_ERROR
+        call emit_audit_event;
+
         mov rdi, 2;                               // MK_MISSING_PATH
         mov rax, 60;                              // SC+ ID 60 = sys_exit
         syscall;
@@ -1071,6 +1179,25 @@ module Mkdir = structure {
         // ---- Step 7 (M1-003): walk positionals. ----
         call mkdir_run;
 
+        // ---- M3-002: emit UEJ_KIND_TOOL_ERROR (131) if exit_code != 0. ----
+        // mkdir_run records the first-failed mkdir_one's return in
+        // MkdirState::exit_code (0 == all-success). On any non-zero
+        // exit the audit journal MUST see one TOOL_ERROR record before
+        // sys_exit — every mkdir_one failure path already emit_stderr'd
+        // its user-facing diagnostic, so this hook only closes the
+        // audit stream (no re-emit of diagnostic text). Return of
+        // emit_audit_event is ignored per the D3 non-degrading rule.
+        // The audit_emitted_invoke gate at Step 2 guarantees the paired
+        // TOOL_INVOKE record has already reached the journal.
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mkdir_after_audit_error;
+
+        mov rdi, 131;                             // UEJ_KIND_TOOL_ERROR
+        call emit_audit_event;                    // return ignored (D3)
+
+      mkdir_after_audit_error:
         // ---- Step 8: sys_exit(MkdirState::exit_code). 0 on all-success. ----
         lea r11, [rip + exit_code];
         mov rdi, [r11];

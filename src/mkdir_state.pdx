@@ -1,8 +1,9 @@
-// src/mkdir_state.pdx — mkdir.M1-001 + M2-001 + M3-001
+// src/mkdir_state.pdx — mkdir.M1-001 + M2-001 + M3-001 + M3-002
 // MkdirState module: return-code constants, sidecar slot number constants,
 // singleton .bss slots for parsed flags, per-invocation path-component
 // bookkeeping (M2-001), the M3-001 CreatedDirRecord[] schema-emit
-// bookkeeping, and the reset() entry point.
+// bookkeeping, the M3-002 audit-emit bookkeeping, and the reset() entry
+// point.
 // See design/architecture.md §2 for the module split rationale and §7 for
 // the paideia-as encoding constraints this module observes.
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
@@ -37,6 +38,15 @@ module MkdirState = structure {
   pub let SLOT_PARENT_FILE  : u64 = 1
   pub let SLOT_USER         : u64 = 2
   pub let SLOT_STDERR       : u64 = 3
+  // M3-002: fifth cap slot, KIND_IPC_ENDPOINT bound to
+  // svc.audit-journal (registered kernel-side by
+  // audit_journal_broker_register at
+  // src/kernel/core/ipc/audit_journal_broker.pdx L158). The shell
+  // resolves the broker name at spawn time and seeds this slot via
+  // cap-transfer; mkdir treats it as write-only (R_IPC_WRITE |
+  // R_IPC_INVOKE = 0x0A). Every audit emit sends via
+  // sys_cap_invoke(SLOT_AUDIT_EP, op_arg = OP_SEND | (event_kind << 8)).
+  pub let SLOT_AUDIT_EP     : u64 = 4
 
   // --- Placeholder op ordinals. M1 exercises the cap dispatch path
   //     using QUERY_ID and DEBUG_PRINT until the create-dir substrate
@@ -77,6 +87,33 @@ module MkdirState = structure {
   //     unreachable at v1.0.
   pub let PXT_OP_COMMIT       : u64 = 7
   pub let PXT_OP_CREATE       : u64 = 9
+
+  // ============================================================================
+  // M3-002 audit constants.
+  //
+  // IPC_OP_SEND = 3 is the KIND_IPC_ENDPOINT dispatch op-code for
+  // sys_cap_invoke (see src/kernel/core/cap/kind_ipc.pdx L48-49).
+  // The op_arg encoding is bits [7:0] = op_code, bits [63:8] =
+  // payload; audit calls pack the UEJ_KIND_TOOL_* event kind into
+  // the payload byte so the kernel-side dispatch bumps the right
+  // per-event counter even before libpdx-audit lands a real
+  // marshaller.
+  pub let IPC_OP_SEND : u64 = 3
+
+  // UEJ_KIND_TOOL_* event constants (kernel-side authority at
+  // src/kernel/core/ipc/audit_journal_broker.pdx L60-65). mkdir
+  // emits TOOL_INVOKE at _start entry and TOOL_ERROR on any non-
+  // zero exit. UEJ_KIND_TOOL_INSTALL / UEJ_KIND_TOOL_REMOVE are
+  // pkg-specific and unused here.
+  pub let UEJ_KIND_TOOL_INVOKE : u64 = 130
+  pub let UEJ_KIND_TOOL_ERROR  : u64 = 131
+
+  // audit_emitted_invoke: 1 iff the _start entry emitted its
+  // TOOL_INVOKE record. Guarded so a re-entry (defensive belt-and-
+  // suspenders) cannot double-emit the invoke event. Set once at
+  // the head of _start (after MkdirState reset) and never cleared
+  // within an invocation.
+  pub let mut audit_emitted_invoke : u64 = uninit @align(8)
 
   // --- SC+ IDs mkdir inlines directly (echoes echo_client.pdx idiom —
   //     no link dependency on syscall_shim.pdx).
@@ -248,7 +285,7 @@ module MkdirState = structure {
   pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Eleven lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count so parse_flags_from_argv, mkdir_one, mkdir_run, and the M3-001 record staging path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records arrays (the fourth added at M3-001) are consumed by index up to their respective counters (comp_count / created_dir_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 + M3-002 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Twelve lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count plus the M3-002 audit_emitted_invoke gate so parse_flags_from_argv, mkdir_one, mkdir_run, the M3-001 record staging path, and the M3-002 audit-emit path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records arrays are consumed by index up to their respective counters (comp_count / created_dir_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
         lea r11, [rip + flag_p];                    mov [r11], rax;
@@ -262,6 +299,7 @@ module MkdirState = structure {
         lea r11, [rip + walk_i];                    mov [r11], rax;
         lea r11, [rip + current_txn_id];            mov [r11], rax;
         lea r11, [rip + created_dir_records_count]; mov [r11], rax;
+        lea r11, [rip + audit_emitted_invoke];      mov [r11], rax;
         ret
       }
     }
