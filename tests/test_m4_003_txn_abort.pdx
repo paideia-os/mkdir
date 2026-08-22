@@ -244,7 +244,7 @@ module MkdirTestM4003 = structure {
         mov rsi, 22;                              // ok_abort_len
         call emit_stderr;
         xor rax, rax;
-        ret
+        ret;
 
       // ---- Path A failures ----
 
@@ -253,21 +253,21 @@ module MkdirTestM4003 = structure {
         mov rsi, 31;                              // fail_a_rc_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4a_fail_a_baseline:
         lea rdi, [rip + fail_a_baseline_msg];
         mov rsi, 35;                              // fail_a_baseline_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4a_fail_a_err_pos:
         lea rdi, [rip + fail_a_err_pos_msg];
         mov rsi, 28;                              // fail_a_err_pos_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       // ---- Path B failures ----
 
@@ -276,28 +276,28 @@ module MkdirTestM4003 = structure {
         mov rsi, 30;                              // fail_b_exit_code_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4a_fail_b_newly_created:
         lea rdi, [rip + fail_b_newly_created_msg];
         mov rsi, 40;                              // fail_b_newly_created_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4a_fail_b_cdr_count:
         lea rdi, [rip + fail_b_cdr_count_msg];
         mov rsi, 38;                              // fail_b_cdr_count_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4a_fail_b_rur_count:
         lea rdi, [rip + fail_b_rur_count_msg];
         mov rsi, 38;                              // fail_b_rur_count_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
       }
     }
 }
