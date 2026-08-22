@@ -263,42 +263,42 @@ module MkdirTestM4001 = structure {
         mov rsi, 23;                              // ok_single_len
         call emit_stderr;
         xor rax, rax;
-        ret
+        ret;
 
       t4s_fail_rc:
         lea rdi, [rip + fail_rc_msg];
         mov rsi, 29;                              // fail_rc_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4s_fail_comp_count:
         lea rdi, [rip + fail_comp_count_msg];
         mov rsi, 29;                              // fail_comp_count_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4s_fail_newly_created:
         lea rdi, [rip + fail_newly_created_msg];
         mov rsi, 38;                              // fail_newly_created_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4s_fail_cdr_count:
         lea rdi, [rip + fail_cdr_count_msg];
         mov rsi, 28;                              // fail_cdr_count_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4s_fail_rur_count:
         lea rdi, [rip + fail_rur_count_msg];
         mov rsi, 28;                              // fail_rur_count_len
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
       }
     }
 
@@ -387,42 +387,42 @@ module MkdirTestM4001 = structure {
         mov rsi, 22;                              // ok_multi_len
         call emit_stderr;
         xor rax, rax;
-        ret
+        ret;
 
       t4m_fail_rc:
         lea rdi, [rip + fail_rc_msg];
         mov rsi, 29;
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4m_fail_comp_count:
         lea rdi, [rip + fail_comp_count_msg];
         mov rsi, 29;
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4m_fail_newly_created:
         lea rdi, [rip + fail_newly_created_msg];
         mov rsi, 38;
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4m_fail_cdr_count:
         lea rdi, [rip + fail_cdr_count_msg];
         mov rsi, 28;
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
 
       t4m_fail_rur_count:
         lea rdi, [rip + fail_rur_count_msg];
         mov rsi, 28;
         call emit_stderr;
         mov rax, 1;
-        ret
+        ret;
       }
     }
 }
