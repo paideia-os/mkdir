@@ -233,7 +233,7 @@ module Mkdir = structure {
       block: {
         mov rax, 12;                              // SC+ ID 12 = sys_debug_puts
         syscall;
-        ret
+        ret;
       }
     }
 
@@ -303,7 +303,7 @@ module Mkdir = structure {
         // sys_cap_invoke.
         mov rax, 4;                               // SC+ ID 4
         syscall;
-        ret
+        ret;
       }
     }
 
@@ -405,7 +405,7 @@ module Mkdir = structure {
         jmp mkdir_pff_loop_head;
 
       mkdir_pff_done:
-        ret
+        ret;
       }
     }
 
@@ -524,15 +524,15 @@ module Mkdir = structure {
         lea r11, [rip + comp_count];
         mov [r11], r8;
         xor rax, rax;                            // MK_OK
-        ret
+        ret;
 
       msp_abs_path:
         mov rax, 7;                              // MK_ABS_PATH_UNSUPPORTED
-        ret
+        ret;
 
       msp_too_deep:
         mov rax, 8;                              // MK_PATH_TOO_DEEP
-        ret
+        ret;
       }
     }
 
@@ -1049,7 +1049,7 @@ module Mkdir = structure {
 
       mkdir_one_epilogue:
         pop rbx;                                  // restore caller's rbx
-        ret
+        ret;
       }
     }
 
@@ -1111,7 +1111,7 @@ module Mkdir = structure {
         mov rcx, [r11];
         lea r11, [rip + err_pos_index];
         mov [r11], rcx;
-        ret
+        ret;
 
       mkdir_run_advance:
         lea r11, [rip + mkdir_run_i];
@@ -1121,7 +1121,7 @@ module Mkdir = structure {
         jmp mkdir_run_loop_head;
 
       mkdir_run_done:
-        ret
+        ret;
       }
     }
 
