@@ -1,4 +1,4 @@
-// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-002
+// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-002 + M3-003
 // Mkdir module: _init_caps sidecar declaration + _start orchestrator +
 // argv wire-up + flag walk + mkdir_one create sequence + mkdir_run
 // positional walk. M1-001 landed the scaffold shape (ring3 marker +
@@ -610,7 +610,7 @@ module Mkdir = structure {
   pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6b create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, flips the Step 7 commit placeholder to real PXT_OP_COMMIT (7), captures the TXN's txn_id into current_txn_id at Step 5 (via PXT_OP_QUERY_ID), populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref), and freezes created_dir_records_count == newly_created_count before the commit syscall so a commit failure leaves the record array + M3-003 undo array in the consistent 'staged, uncommitted' state. Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
+      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6b create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, flips the Step 7 commit placeholder to real PXT_OP_COMMIT (7), captures the TXN's txn_id into current_txn_id at Step 5 (via PXT_OP_QUERY_ID), populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref), and freezes created_dir_records_count == newly_created_count before the commit syscall so a commit failure leaves the record array + M3-003 undo array in the consistent 'staged, uncommitted' state. M3-003 adds one RmdirUndoRecord per newly-created level in the same Step 6f beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay), and freezes rmdir_undo_records_count == newly_created_count at the same Step 7 commit-freeze point so both readers (CDR/undo-log/audit) see one consistent snapshot per invocation. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
       block: {
         // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
         push rbx;
@@ -902,6 +902,72 @@ module Mkdir = structure {
         mov rax, 2;                              // SLOT_USER
         mov [r11 + rcx*8 + 24], rax;             // owner_slot_ref
 
+        // ---- Step 6f (M3-003): stage a RmdirUndoRecord for this level.
+        // Every level that reached this beat was actually created by
+        // this invocation (Step 6a's pre-existence probe would have
+        // jumped straight to mkdir_one_advance_walk on a hit, and the
+        // real create + cap-tail must have both succeeded to arrive
+        // here). So one undo record per successful create — matching
+        // the CDR count invariant. The array is written in walk order
+        // (outer → inner); the PdxFS v1 undo-log walker replays in
+        // REVERSE insertion order, giving inner → outer removal so
+        // each rmdir sees an empty target inode.
+        //
+        // Field layout freezes against `RmdirUndoRecord@0.1`:
+        //   [+0]  path_ptr        = rbx (unchanged since the prologue)
+        //   [+8]  path_len        = comp_start_offsets[walk_i] +
+        //                            comp_lengths[walk_i] (recomputed
+        //                            — the CDR staging above did not
+        //                            leave path_len live in any GPR
+        //                            after the owner_slot_ref store)
+        //   [+16] parent_txn_id   = current_txn_id (captured at Step 5)
+        //
+        // Byte offset arithmetic: the encoder has no *24 scaled-index
+        // stride (see kernel/core/acpi/gpe_io.pdx L127 justification),
+        // so record_idx * 24 is formed as (record_idx * 8) +
+        // (record_idx * 16) via two shls. r9 is the shift scratch;
+        // freeing rcx for the +24 accumulator + subsequent SIB-1
+        // addressing into the record base.
+        //
+        // Register plan (all caller-save; no push/pop touched):
+        //   rcx = record_idx * 24 (byte offset from array base)
+        //   rdx = walk_i
+        //   rax = path_len (then parent_txn_id)
+        //   r9  = shift scratch for record_idx * 8
+        //   r10 = &rmdir_undo_records[record_idx] (base + offset)
+        //   r11 = LEA scratch
+        lea r11, [rip + newly_created_count];
+        mov rcx, [r11];
+        sub rcx, 1;                              // record_idx
+
+        mov r9, rcx;                             // r9 = record_idx
+        shl r9, 3;                               // r9 = record_idx * 8
+        shl rcx, 4;                              // rcx = record_idx * 16
+        add rcx, r9;                             // rcx = record_idx * 24
+
+        // r10 = &rmdir_undo_records[record_idx] (base + byte offset).
+        lea r11, [rip + rmdir_undo_records];
+        mov r10, r11;
+        add r10, rcx;                            // r10 = record base
+
+        // Compute path_len from comp_start_offsets + comp_lengths.
+        lea r11, [rip + walk_i];
+        mov rdx, [r11];                          // walk_i
+        lea r11, [rip + comp_start_offsets];
+        mov rax, [r11 + rdx*8];
+        lea r11, [rip + comp_lengths];
+        mov r9, [r11 + rdx*8];
+        add rax, r9;                             // path_len
+
+        // Write path_ptr + path_len at the record base.
+        mov [r10 + 0], rbx;                      // path_ptr
+        mov [r10 + 8], rax;                      // path_len
+
+        // Write parent_txn_id.
+        lea r11, [rip + current_txn_id];
+        mov rax, [r11];
+        mov [r10 + 16], rax;                     // parent_txn_id
+
       mkdir_one_advance_walk:
         // Advance walk_i.
         lea r11, [rip + walk_i];
@@ -912,18 +978,25 @@ module Mkdir = structure {
 
         // ---- Step 7: TXN commit — real PXT_OP_COMMIT = 7. ----
       mkdir_one_do_commit:
-        // M3-001: freeze created_dir_records_count == newly_created_count.
-        // The count is set BEFORE the commit syscall so that a
-        // commit failure (PXT_BAD_TRANSITION or a future substrate-
-        // side error) leaves the record array in the consistent
-        // "records staged, TXN never committed" state that M3-003's
-        // undo record replay reads to unwind exactly the levels
-        // this invocation created before the abort. The single-
-        // writer discipline of created_dir_records_count matches
+        // M3-001 + M3-003: freeze created_dir_records_count AND
+        // rmdir_undo_records_count == newly_created_count on the same
+        // beat. Both counts are set BEFORE the commit syscall so that
+        // a commit failure (PXT_BAD_TRANSITION or a future substrate-
+        // side error) leaves BOTH the record array AND the undo
+        // array in the consistent "records staged, TXN never
+        // committed" state — the M3-003 undo-log walker inspects the
+        // parent_txn_id's committed bit to decide whether to replay
+        // (committed → live undo) or discard (aborted → no-op undo,
+        // nothing was persisted). Frozen together so a divergence
+        // between "levels the CDR array says were created" and
+        // "levels the undo array can remove" is unreachable by
+        // construction. The single-writer discipline matches
         // pdxfs_txn_note in kind_pdxfs_txn.pdx.
         lea r11, [rip + newly_created_count];
         mov rax, [r11];
         lea r11, [rip + created_dir_records_count];
+        mov [r11], rax;
+        lea r11, [rip + rmdir_undo_records_count];
         mov [r11], rax;
 
         // Real commit op: OPEN -> COMMITTED state transition on the

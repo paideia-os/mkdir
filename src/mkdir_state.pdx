@@ -1,8 +1,9 @@
-// src/mkdir_state.pdx — mkdir.M1-001 + M2-001 + M3-001 + M3-002
+// src/mkdir_state.pdx — mkdir.M1-001 + M2-001 + M3-001 + M3-002 + M3-003
 // MkdirState module: return-code constants, sidecar slot number constants,
 // singleton .bss slots for parsed flags, per-invocation path-component
 // bookkeeping (M2-001), the M3-001 CreatedDirRecord[] schema-emit
-// bookkeeping, the M3-002 audit-emit bookkeeping, and the reset() entry
+// bookkeeping, the M3-002 audit-emit bookkeeping, the M3-003
+// RmdirUndoRecord[] PdxFS v1 undo-log staging, and the reset() entry
 // point.
 // See design/architecture.md §2 for the module split rationale and §7 for
 // the paideia-as encoding constraints this module observes.
@@ -268,6 +269,101 @@ module MkdirState = structure {
   // M3-003 undo record replays only up to that count).
   pub let mut created_dir_records_count : u64 = uninit @align(8)
 
+  // ============================================================================
+  // M3-003: RmdirUndoRecord[] staging — PdxFS v1 undo record.
+  //
+  // Per r49-r50-plan.md §5.9 M3-003, every successful mkdir invocation
+  // writes a PdxFS v1 undo record whose replay is `rmdir <path>`. The
+  // undo-log walker replays records in reverse insertion order — so
+  // for a three-level `-p a/b/c` the removal order is c → b → a, which
+  // is the order rmdir requires (each level must be empty at its
+  // removal instant).
+  //
+  // Under `-p`, only levels this invocation actually CREATED get a
+  // record — pre-existing levels take the mkdir_one_advance_walk jump
+  // in mkdir_one before Step 6d and never reach the RUR staging beat,
+  // so `undo mkdir -p a/b/c` where `a` already existed removes only
+  // `a/b/c` and `a/b`, leaving `a` untouched. This is the correctness
+  // property the plan doc §5.9 M3-003 line calls out — "the TXN log
+  // distinguishes newly-created from pre-existing", implemented here
+  // as the shared `comp_pre_existed` bitmap gating the whole Step 6d
+  // + Step 6e + Step 6f beat.
+  //
+  // Record layout (three u64 per record, RUR_FIELDS_PER_RECORD = 3):
+  //   [+0]  path_ptr        — u8* base of the argv positional string
+  //                            (identical to the CreatedDirRecord
+  //                            path_ptr for the same level; both
+  //                            reference the same live argv byte).
+  //   [+8]  path_len        — u64 byte count naming THIS level's full
+  //                            path (comp_start_offsets[i] +
+  //                            comp_lengths[i]; identical to the
+  //                            CreatedDirRecord path_len for the same
+  //                            level).
+  //   [+16] parent_txn_id   — u64 pulled from current_txn_id at Step 5.
+  //                            Every record in one invocation shares
+  //                            the same parent_txn_id — the undo-log
+  //                            walker groups replay by parent_txn_id
+  //                            so a mid-flight abort of the original
+  //                            TXN naturally cancels the whole undo
+  //                            group (nothing was ever persisted).
+  //
+  // The `owner` field the CreatedDirRecord carries is intentionally
+  // absent from RmdirUndoRecord — rmdir does not consult owner at
+  // replay time (the invoker's user cap already gates the cap-tail
+  // owner check on the target inode). Keeping the record narrower
+  // saves 128 bytes per invocation and matches mv.M3-003's own two-
+  // path shape (src, dst — no owner) for the {src -> dst} replay.
+  //
+  // The v1 undo-log substrate (PXT_OP_UNDO_STAGE) is not yet landed —
+  // the plan's M3-003 line is the schema-level obligation and this
+  // milestone's contribution is the staging shape + the field-freeze
+  // discipline. The walker body that persists these records into the
+  // TXN's WAL undo-group arrives at mkdir.M3-substrate-003 in
+  // paideia-os. Until then the staged records live in .bss for the
+  // future substrate walker + the M3-002 audit-emit hook to co-
+  // consume from the same source of truth (a divergence between
+  // "what the audit says was created" and "what the undo can remove"
+  // would silently break `undo mkdir` reversibility, so both readers
+  // MUST read the same array).
+  //
+  // Array size: 16 records * 3 fields = 48 u64 = 384 bytes. Bounded
+  // by PATH_MAX_COMPONENTS = 16 (a single invocation can create at
+  // most 16 levels; multiple positional args each get their own
+  // mkdir_one call which reads/writes the .bss singletons in turn,
+  // and the mkdir_state_reset zeroes rmdir_undo_records_count between
+  // NOT calls — mkdir is one-shot per _start, so the count outlives
+  // the invocation for post-mortem inspection).
+  //
+  // Row-major indexing: records[record_idx * 24 + field_byte_offset].
+  // The encoder has no *24 scaled-index stride, so callers form
+  // record_idx * 24 as `(record_idx * 8) + (record_idx * 16)` — the
+  // same idiom kernel-side callers use for the 24-byte cap descriptor
+  // rows (see cap/mint.pdx L114 and gpio_io.pdx L288 justifications).
+  //
+  // Schema handle for `RmdirUndoRecord@0.1`. Same 32/32 packing as
+  // CDR_SCHEMA_HANDLE. schema_id = 0x01000006 is the sixth tool-
+  // emitted schema (per §5.10 the first five are 0x01000001..
+  // 0x01000005 = CreatedDirRecord / pkg / cp / mv / rm's happy-path
+  // schemas; the undo-record family starts here at 0x01000006).
+  pub let RUR_FIELDS_PER_RECORD : u64 = 3
+  pub let RUR_MAX_RECORDS       : u64 = 16
+  pub let RUR_SCHEMA_HANDLE     : u64 = 0x0100000600010001
+
+  // rmdir_undo_records: 16 records * 3 fields = 48 u64 = 384 bytes.
+  // Consumed by index up to `rmdir_undo_records_count`.
+  pub let mut rmdir_undo_records : [u64; 48] = uninit @align(8)
+
+  // rmdir_undo_records_count: set == newly_created_count at commit
+  // time (same beat as created_dir_records_count). Both counters are
+  // frozen BEFORE the commit syscall so a commit failure leaves the
+  // staged records + audit records + undo records in the same
+  // consistent "staged, TXN never committed" state — the undo-log
+  // walker inspects the parent_txn_id's committed bit to decide
+  // whether to replay or discard (a committed TXN's undo is live;
+  // an aborted TXN's undo is a no-op because nothing was persisted
+  // in the first place).
+  pub let mut rmdir_undo_records_count : u64 = uninit @align(8)
+
   // mkdir_state_reset() — zero the three flag slots, the exit code, and
   // the error positional index so a subsequent _start starts from a
   // known-empty MkdirState. rax=0 is the value written; xor rax,rax is
@@ -285,7 +381,7 @@ module MkdirState = structure {
   pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 + M3-002 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Twelve lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count plus the M3-002 audit_emitted_invoke gate so parse_flags_from_argv, mkdir_one, mkdir_run, the M3-001 record staging path, and the M3-002 audit-emit path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records arrays are consumed by index up to their respective counters (comp_count / created_dir_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 + M3-002 + M3-003 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Thirteen lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count plus the M3-002 audit_emitted_invoke gate plus the M3-003 rmdir_undo_records_count so parse_flags_from_argv, mkdir_one, mkdir_run, the M3-001 record staging path, the M3-002 audit-emit path, and the M3-003 undo-record staging path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records / rmdir_undo_records arrays are consumed by index up to their respective counters (comp_count / created_dir_records_count / rmdir_undo_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
         lea r11, [rip + flag_p];                    mov [r11], rax;
@@ -300,6 +396,7 @@ module MkdirState = structure {
         lea r11, [rip + current_txn_id];            mov [r11], rax;
         lea r11, [rip + created_dir_records_count]; mov [r11], rax;
         lea r11, [rip + audit_emitted_invoke];      mov [r11], rax;
+        lea r11, [rip + rmdir_undo_records_count];  mov [r11], rax;
         ret
       }
     }
