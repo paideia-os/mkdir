@@ -265,6 +265,65 @@ its cap argument — that dispatch is `mkdir.M2-substrate-003` at the
 paideia-os repo. The M2-003 branch structure is what lands here; the
 substrate wire fills the actual owner-write behind it.
 
+## 4e. `mkdir_one` M3-001 additions — real substrate + CreatedDirRecord staging
+
+M3-001 lands three coupled changes at `mkdir_one`:
+
+1. **Substrate flip for Steps 6b + 7.** Step 6b's placeholder create
+   was `sys_cap_invoke(SLOT_PARENT_FILE=1, PFF_OP_DEBUG_PRINT=6)` — a
+   KIND_PDXFS_FILE-side op on the wrong cap kind. Flipped to
+   `sys_cap_invoke(SLOT_TXN=0, PXT_OP_CREATE=9)`, the real R42-PREP-007
+   (#1629) write-side op that stubs to `PXT_STUB_OK = 0xFFFFEBFB`
+   (positive as i64 — passes the `jl` gate). Step 7's placeholder commit
+   was `sys_cap_invoke(SLOT_TXN=0, PXT_OP_QUERY_STATE=4)`, a query op
+   that never actually committed anything. Flipped to
+   `sys_cap_invoke(SLOT_TXN=0, PXT_OP_COMMIT=7)`, the real state
+   transition (OPEN → COMMITTED) landed by R42-PREP-007. Step 5 stays on
+   `PXT_OP_QUERY_ID = 0` because mkdir's four-slot sidecar does not
+   include a KIND_MEMORY mount cap to feed `sys_pdxfs_txn_open`
+   (sysno 70) — the TXN cap is pre-opened by the shell and delivered via
+   cap-transfer to `SLOT_TXN`.
+
+2. **`current_txn_id` capture at Step 5.** `PXT_OP_QUERY_ID`'s return
+   value is the pre-opened row's `txn_id`. M3-001 stashes it into
+   `MkdirState::current_txn_id` for every `CreatedDirRecord`'s
+   `parent_txn_id` field. All records in one invocation share the same
+   `parent_txn_id` because the walk runs inside one TXN scope (per
+   M2-001).
+
+3. **`CreatedDirRecord[]` staging at Step 6e.** After Step 6d (cap-tail
+   stamp succeeds), M3-001 writes one record into
+   `MkdirState::created_dir_records` at index `newly_created_count - 1`.
+   Fields (four u64 per record):
+
+   | offset | field            | source                                              |
+   |--------|------------------|-----------------------------------------------------|
+   | +0     | `path_ptr`       | `rbx` (base of full path, preserved by push)        |
+   | +8     | `path_len`       | `comp_start_offsets[walk_i] + comp_lengths[walk_i]` |
+   | +16    | `parent_txn_id`  | `current_txn_id`                                    |
+   | +24    | `owner_slot_ref` | `2` (== SLOT_USER, resolved by libpdx-cap M3-001)   |
+
+   A three-level `mkdir -p a/b/c` with no pre-existing levels stages
+   three records: `("a/b/c", 1, txn_id, 2)`, `("a/b/c", 3, txn_id, 2)`,
+   `("a/b/c", 5, txn_id, 2)` — the same `path_ptr` with growing
+   `path_len` names each level's prefix.
+
+4. **`created_dir_records_count` freeze at Step 7.** Before the commit
+   syscall, `mkdir_one` freezes
+   `created_dir_records_count = newly_created_count`. This ordering
+   ensures a commit failure (`PXT_BAD_TRANSITION` or a future substrate
+   error) leaves the record array in the consistent "records staged,
+   TXN never committed" state that `mkdir.M3-003`'s undo record replay
+   reads to unwind exactly this invocation's additions.
+
+The record schema handle is `CDR_SCHEMA_HANDLE = 0x0100000100010001`
+(`CreatedDirRecord@0.1`), declared in `caps.decl` under
+`declares_output_schemas`. `libpdx-semantic-pipe M2`'s `send_record`
+consumer walks the staged records and marshals them through the
+`KIND_IPC_ENDPOINT` at slot 3 — until that library lands, the records
+live in `.bss` for the `M3-002` audit hook and the `M3-003` undo record
+to read.
+
 ## 5. Flag semantics at M1
 
 | flag        | M1 behaviour                                             | M2 wire-up                    |

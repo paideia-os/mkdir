@@ -1,7 +1,8 @@
-// src/mkdir_state.pdx — mkdir.M1-001 + M2-001
+// src/mkdir_state.pdx — mkdir.M1-001 + M2-001 + M3-001
 // MkdirState module: return-code constants, sidecar slot number constants,
 // singleton .bss slots for parsed flags, per-invocation path-component
-// bookkeeping (M2-001), and the reset() entry point.
+// bookkeeping (M2-001), the M3-001 CreatedDirRecord[] schema-emit
+// bookkeeping, and the reset() entry point.
 // See design/architecture.md §2 for the module split rationale and §7 for
 // the paideia-as encoding constraints this module observes.
 // Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
@@ -41,9 +42,41 @@ module MkdirState = structure {
   //     using QUERY_ID and DEBUG_PRINT until the create-dir substrate
   //     lands at M2. Constants mirror
   //     src/kernel/core/cap/kind_pdxfs_{txn,file}.pdx.
+  //
+  //     M3-001 flips the two placeholders that had real substrate
+  //     counterparts: Step 6b's placeholder create moves from
+  //     `PFF_OP_DEBUG_PRINT (6)` on SLOT_PARENT_FILE (kind
+  //     KIND_PDXFS_FILE) to `PXT_OP_CREATE (9)` on SLOT_TXN (kind
+  //     KIND_PDXFS_TXN); Step 7's placeholder commit moves from
+  //     `PXT_OP_QUERY_STATE (4)` to `PXT_OP_COMMIT (7)`. Both real op
+  //     ordinals ship in the R42-PREP-007 (#1629) substrate at
+  //     `src/kernel/core/cap/kind_pdxfs_txn.pdx` L115-119.
+  //
+  //     Step 5's TXN open remains `PXT_OP_QUERY_ID (0)`: the TXN cap
+  //     at SLOT_TXN is pre-opened by the shell via cap_transfer (see
+  //     _init_caps entry 0 in src/mkdir.pdx), so mkdir does NOT mint a
+  //     fresh TXN via sys_pdxfs_txn_open (sysno 70). QUERY_ID reads
+  //     the pre-opened row's txn_id, which M3-001 captures into
+  //     `current_txn_id` for the CreatedDirRecord.parent_txn_id
+  //     field. The shell-owns-TXN pattern preserves mkdir's single-
+  //     cap-set invocation contract (four caps in caps.decl, no
+  //     additional KIND_MEMORY mint parent).
   pub let PXT_OP_QUERY_ID     : u64 = 0
   pub let PXT_OP_QUERY_STATE  : u64 = 4
   pub let PFF_OP_DEBUG_PRINT  : u64 = 6
+
+  // --- M3-001 real substrate op ordinals (R42-PREP-007 #1629).
+  //     PXT_OP_CREATE STUBs to PXT_STUB_OK (0xFFFFEBFB) which is
+  //     positive in signed i64 (top nibble is 0x0) — passes the
+  //     `cmp rax, 0; jl` gate mkdir_one uses for every syscall
+  //     return. PXT_OP_COMMIT is a REAL state transition (OPEN ->
+  //     COMMITTED); a duplicate commit returns PXT_BAD_TRANSITION
+  //     (0xFFFFEC15) which IS negative-shaped (top nibble 0xF) and
+  //     would route to mkdir_one_commit_fail. mkdir is a one-shot
+  //     process per _start invocation, so the second-commit edge is
+  //     unreachable at v1.0.
+  pub let PXT_OP_COMMIT       : u64 = 7
+  pub let PXT_OP_CREATE       : u64 = 9
 
   // --- SC+ IDs mkdir inlines directly (echoes echo_client.pdx idiom —
   //     no link dependency on syscall_shim.pdx).
@@ -115,6 +148,89 @@ module MkdirState = structure {
   //     zeroing.
   pub let mut comp_pre_existed   : [u64; 16] = uninit @align(8)
 
+  // ============================================================================
+  // M3-001: CreatedDirRecord[] schema-emit bookkeeping.
+  //
+  // Per r49-r50-plan.md §5.9 M3-001, mkdir emits a `CreatedDirRecord`
+  // per newly-created directory with fields
+  // `{path, parent_txn_id, owner:KIND_USER_ref}`. Records marshal into
+  // the semantic pipe at slot 3 through libpdx-semantic-pipe M2 (not
+  // yet landed); until that lands, M3-001 stages the record fields
+  // into `.bss` at each successful create, and libpdx-semantic-pipe's
+  // send_record consumer walks the array from index 0 up to
+  // `created_dir_records_count` (== newly_created_count at commit
+  // time). The staging shape freezes the record fields against the
+  // schema binding declared in caps.decl (`CreatedDirRecord@0.1`) so
+  // the M3-002 audit hook and the future semantic-pipe emitter read
+  // from the same source of truth.
+  //
+  // Record layout (four u64 per record, CDR_FIELDS_PER_RECORD = 4):
+  //   [+0]  path_ptr        — u8* into the argv positional string.
+  //                            Points at the BASE of the full path
+  //                            (e.g. "a/b/c"); consumers read the
+  //                            first `path_len` bytes to name the
+  //                            level (e.g. path_len=3 -> "a/b" for
+  //                            record 1 of a three-level -p create).
+  //   [+8]  path_len        — u64 byte count from path_ptr that
+  //                            names THIS level's full path. Computed
+  //                            as `comp_start_offsets[i] +
+  //                            comp_lengths[i]` at the walk site.
+  //   [+16] parent_txn_id   — u64 pulled from the txn cap at Step 5
+  //                            via PXT_OP_QUERY_ID. Every record in
+  //                            one invocation shares the same
+  //                            parent_txn_id (all creates land in
+  //                            one TXN scope per M2-001).
+  //   [+24] owner_slot_ref  — u64 cap-slot number of the invoker's
+  //                            KIND_USER cap (== SLOT_USER = 2 at
+  //                            v1.0). libpdx-cap M3-001's
+  //                            KIND_USER_ref decode helper resolves
+  //                            slot -> user_fp_lo when the record
+  //                            renders; using a slot ref (not the
+  //                            user_fp_lo directly) means mkdir does
+  //                            NOT need a second syscall to unpack
+  //                            the user cap at record-write time.
+  //
+  // The array size is 16 records because comp_count is bounded at
+  // PATH_MAX_COMPONENTS = 16 (M2-001); newly_created_count <=
+  // comp_count so record_idx (== newly_created_count - 1) is always
+  // in [0, 16). Consumed by index up to `created_dir_records_count`,
+  // so trailing entries need no zeroing at reset — same discipline
+  // as comp_start_offsets / comp_lengths / comp_pre_existed.
+  // ============================================================================
+  pub let CDR_FIELDS_PER_RECORD : u64 = 4
+  pub let CDR_MAX_RECORDS       : u64 = 16
+
+  // Schema handle for `CreatedDirRecord@0.1`. Format matches
+  // libpdx-argv's `PdxArgvParsed@0.1` handle shape (schema_id in high
+  // 32 bits, version in low 32 bits). The libpdx-semantic-pipe M2
+  // send_record helper prepends this word to every record it sends
+  // over the KIND_IPC_ENDPOINT at slot 3.
+  //   schema_id = 0x01000001  (first tool-emitted schema; pkg / cp /
+  //                             mv / rm claim 0x01000002..0x01000005
+  //                             when their M3 lands, per §5.10)
+  //   version   = 0x00010001  (major.minor packed in low 32 bits,
+  //                             matching libpdx-argv's convention;
+  //                             0x0001_0001 == v0.1 stable)
+  pub let CDR_SCHEMA_HANDLE : u64 = 0x0100000100010001
+
+  // current_txn_id: the txn_id read from SLOT_TXN via PXT_OP_QUERY_ID
+  // in mkdir_one Step 5. Populated once per invocation; consumed by
+  // every record emitted in the same invocation.
+  pub let mut current_txn_id : u64 = uninit @align(8)
+
+  // created_dir_records: 16 records * 4 fields = 64 u64 = 512 bytes.
+  // Array-of-struct layout (row-major); consumers index as
+  // `records[record_idx * CDR_FIELDS_PER_RECORD + field]`.
+  pub let mut created_dir_records : [u64; 64] = uninit @align(8)
+
+  // created_dir_records_count: how many records mkdir_one populated
+  // this invocation. Set == newly_created_count at commit time so
+  // libpdx-semantic-pipe's send_record consumer knows when to stop
+  // (== newly_created_count at commit; if commit aborts, the count
+  // stays at the pre-commit value the walk left it at, and the
+  // M3-003 undo record replays only up to that count).
+  pub let mut created_dir_records_count : u64 = uninit @align(8)
+
   // mkdir_state_reset() — zero the three flag slots, the exit code, and
   // the error positional index so a subsequent _start starts from a
   // known-empty MkdirState. rax=0 is the value written; xor rax,rax is
@@ -132,18 +248,20 @@ module MkdirState = structure {
   pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 + M2-001 + M2-002 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Nine lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters so parse_flags_from_argv, mkdir_one, and mkdir_run start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed arrays (the third added at M2-002) are consumed by index up to comp_count, so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Eleven lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count so parse_flags_from_argv, mkdir_one, mkdir_run, and the M3-001 record staging path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records arrays (the fourth added at M3-001) are consumed by index up to their respective counters (comp_count / created_dir_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
-        lea r11, [rip + flag_p];             mov [r11], rax;
-        lea r11, [rip + flag_v];             mov [r11], rax;
-        lea r11, [rip + flag_dry_run];       mov [r11], rax;
-        lea r11, [rip + exit_code];          mov [r11], rax;
-        lea r11, [rip + err_pos_index];      mov [r11], rax;
-        lea r11, [rip + mkdir_run_i];        mov [r11], rax;
-        lea r11, [rip + comp_count];         mov [r11], rax;
-        lea r11, [rip + newly_created_count];mov [r11], rax;
-        lea r11, [rip + walk_i];             mov [r11], rax;
+        lea r11, [rip + flag_p];                    mov [r11], rax;
+        lea r11, [rip + flag_v];                    mov [r11], rax;
+        lea r11, [rip + flag_dry_run];              mov [r11], rax;
+        lea r11, [rip + exit_code];                 mov [r11], rax;
+        lea r11, [rip + err_pos_index];             mov [r11], rax;
+        lea r11, [rip + mkdir_run_i];               mov [r11], rax;
+        lea r11, [rip + comp_count];                mov [r11], rax;
+        lea r11, [rip + newly_created_count];       mov [r11], rax;
+        lea r11, [rip + walk_i];                    mov [r11], rax;
+        lea r11, [rip + current_txn_id];            mov [r11], rax;
+        lea r11, [rip + created_dir_records_count]; mov [r11], rax;
         ret
       }
     }
