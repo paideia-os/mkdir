@@ -1,0 +1,199 @@
+%pdxdoc 0.1
+%tool  mkdir
+%ver   1.0.0
+%wave  R50
+%repo  github.com/paideia-os/mkdir
+%plan  design/tooling/r49-r50-plan.md §5.9 (paideia-os)
+
+# NAME
+
+mkdir — create directories under the invoker's PdxFS subtree
+
+# SYNOPSIS
+
+    mkdir [-p] [-v] [--dry-run] [--json] [--schema] [--help] [--version] <path> [<path>...]
+
+# DESCRIPTION
+
+`mkdir` opens one `KIND_PDXFS_TXN`, creates one or more directories under
+a target parent, stamps the invoker's `KIND_USER` cap as the owner tail
+of every created inode, and commits the TXN. Every operation takes place
+inside the invoker's own PdxFS subtree — at v1.0 there is no
+libpdx-elevate hop and no cross-subtree write path (per §5.9 "no elevate
+dependency" line of the wave plan).
+
+Under `-p` the entire multi-level path lives inside the single TXN: an
+abort mid-walk leaves zero new directories on disk, and pre-existing
+levels are treated as no-ops rather than errors. The undo record queued
+via `libpdx-audit` (`RmdirUndoRecord[]`) only lists levels this
+invocation actually created — replay is `rmdir <path>` walked
+leaf-to-root over those levels alone.
+
+The primary output is the `CreatedDirRecord[]` schema stream on the
+semantic pipe (cap slot 3, `KIND_IPC_ENDPOINT` bound at spawn by the
+shell to a `libpdx-semantic-pipe` writer). Per I4 in
+`design/tooling/plan.md`, the text layer on stderr is diagnostic only —
+`-v` and every error emit one line.
+
+# FLAGS
+
+    -p                  Create parent directories as needed. Multi-level
+                        path atomic within one TXN. Pre-existing levels
+                        are no-ops (not errors). Undo only unwinds
+                        levels this invocation actually created.
+
+    -v                  Verbose. Emit one `mkdir: created <path>\n`
+                        stderr line per created level. Under `-p` this
+                        fires per created level, not per invocation.
+
+    --dry-run           Parse + split-path + emit the CreatedDirRecord
+                        text render, but skip Steps 6b (create) and 7
+                        (TXN commit). No side effects. Exit 0.
+
+    --json              Emit the CreatedDirRecord[] stream as JSON on
+                        stdout, suppressing the semantic-pipe frame. I3
+                        cross-tool contract.
+
+    --schema            Print CreatedDirRecord@0.1 schema definition and
+                        exit 0. I3 cross-tool contract.
+
+    --help              Structured help, hyperlinked into `doc mkdir`.
+
+    --version           Print `mkdir 1.0.0 (build <hash>) sig=<fp>` and
+                        exit 0.
+
+# EXIT CODES
+
+    0   MK_OK                        success
+    1   MK_ARGV_ERR                  libpdx-argv reported non-zero
+    2   MK_MISSING_PATH              no positional path argument
+    3   MK_MULTI_LEVEL_UNSUPPORTED   path has '/' and -p was NOT passed
+    4   MK_TXN_OPEN_FAIL             SLOT_TXN cap-invoke failed
+    5   MK_MKDIR_FAIL                SLOT_PARENT_FILE or PXT_OP_CREATE failed
+    6   MK_TXN_COMMIT_FAIL           PXT_OP_COMMIT failed
+    7   MK_ABS_PATH_UNSUPPORTED      path started with '/' (v1.0)
+    8   MK_PATH_TOO_DEEP             > 16 non-empty components
+    9   MK_CAP_TAIL_FAIL             KIND_USER owner-stamp failed
+
+The exit codes obey the tooling plan §4 shared convention: 0 success, 2
+user error, 3 system error, 4 capability denied. Codes 3..9 map onto the
+`MkdirState::MK_*` constants in `src/mkdir_state.pdx`.
+
+# CAPABILITIES
+
+Four caps are required at spawn; a fifth is optionally seeded when the
+shell has resolved `svc.audit-journal`. Every row is authoritative
+against `caps.decl`; `cap_manifest_verify` at `_start` rejects any cap
+outside this list.
+
+    slot 0   KIND_PDXFS_TXN          R_PDXFS_TXN_INVOKE | R_PDXFS_TXN_OBSERVE
+    slot 1   KIND_PDXFS_FILE         R_PDXFS_FILE_INVOKE   (target parent)
+    slot 2   KIND_USER               R_USER_INVOKE         (invoker)
+    slot 3   KIND_IPC_ENDPOINT       R_IPC_WRITE | R_IPC_INVOKE  (semantic pipe)
+    slot 4   KIND_IPC_ENDPOINT       R_IPC_WRITE | R_IPC_INVOKE  (audit journal, M3-002)
+
+# OUTPUT SCHEMA
+
+    CreatedDirRecord@0.1 = {
+      path_ptr        : u64,    // pointer to path string base
+      path_len        : u64,    // byte length up to this component's end
+      parent_txn_id   : u64,    // the TXN under which this level was created
+      owner_slot_ref  : u64,    // sidecar slot of the KIND_USER cap (== 2)
+    }
+
+The stream ships one record per newly-created level (pre-existing
+levels under `-p` do NOT appear in the stream). Consumers include
+`ls --long` (via libpdx-cap M3-001's `KIND_USER_ref` decode helper)
+and `undo` (via the paired `RmdirUndoRecord[]` in the audit journal).
+
+# DIFFERENCES FROM POSIX
+
+    - `-p` is atomic. POSIX mkdir(1) with -p walks the path
+      non-atomically; a mid-walk failure leaves the partial prefix on
+      disk. paideia-os `mkdir -p` wraps the entire walk in a single
+      KIND_PDXFS_TXN and rolls the whole prefix back on any step failure.
+
+    - Owner is always the invoker. POSIX mkdir inherits directory
+      ownership from the process's effective UID. paideia-os `mkdir`
+      stamps the invoker's KIND_USER cap into the inode's cap-tail
+      directly — the KIND_USER_ref survives cap re-issuance and does
+      not depend on a numeric UID table.
+
+    - No -m flag. Mode bits are not a paideia-os concept; access is
+      cap-mediated via KIND_PDXFS_FILE rights, not chmod bits.
+      A future `mkdir --caps <caps.decl>` may take a per-directory
+      cap-manifest override; not in scope for v1.0.
+
+    - Absolute paths refused at v1.0. mkdir writes only under the
+      invoker's own PdxFS subtree; a leading '/' returns
+      MK_ABS_PATH_UNSUPPORTED. Cross-subtree writes wait on the
+      libpdx-elevate hop landing in a post-1.0 release.
+
+    - No silent failure. Empty positional argv returns MK_MISSING_PATH
+      with a stderr diagnostic (I4 cross-tool contract).
+
+# EXAMPLES
+
+    # Single level
+    $ mkdir a
+    $ ls -l a
+    drwxr-x---  <invoker>  a/
+
+    # Multi-level atomic
+    $ mkdir -p src/kernel/core/loader
+    $ echo $?
+    0
+
+    # Mixed pre-existing (a exists; b, c do not)
+    $ mkdir a
+    $ mkdir -p a/b/c
+    $ ls a
+    b/
+
+    # Verbose
+    $ mkdir -pv x/y/z
+    mkdir: created x
+    mkdir: created x/y
+    mkdir: created x/y/z
+
+    # Dry run
+    $ mkdir -p --dry-run foo/bar
+    $ ls foo
+    ls: foo: no such directory
+
+    # Undo the mkdir
+    $ mkdir -p one/two/three
+    $ undo
+    undo: removed one, one/two, one/two/three (3 levels)
+
+# FILES
+
+    caps.decl                     capability manifest (four required caps)
+    deps.list                     shared-library dependency list
+    manifest.pdxsig               dual-signed release manifest (D4)
+    src/mkdir_state.pdx           MkdirState module
+    src/mkdir.pdx                 Mkdir module + _start
+    tests/test_m4_00[1-4]_*.pdx   M4 test drivers
+    doc/mkdir.pdxdoc              this document
+
+# SEE ALSO
+
+    doc rmdir       (post-1.0)
+    doc undo        (paideia-os undo tool, reads RmdirUndoRecord[])
+    doc ls          (renders CreatedDirRecord owner via KIND_USER_ref)
+    doc libpdx-cap  (KIND_USER_ref decode)
+    doc pkg         (install/upgrade this tool)
+
+    design/tooling/r49-r50-plan.md §5.9  — mkdir wave plan
+    design/tooling/plan.md §D4           — dual-sig release model
+    design/tooling/plan.md §I1..§I7      — cross-tool invariants
+    design/user/model.md §5              — cap-elevate protocol
+
+# HISTORY
+
+    v1.0.0 (2026-08-22)  first signed release. M1..M4 code complete;
+                         M5 lands dual-signed manifest.pdxsig, this
+                         .pdxdoc, and the pkgs.paideia-os mirror push.
+                         Placeholder-substrate seams (mkdir.M2-substrate-*
+                         at paideia-os) still open; the tool ships against
+                         them shape-frozen. See CHANGELOG.md.

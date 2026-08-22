@@ -1,9 +1,8 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M4 (tests + smoke) — LANDED.
-M4-001 through M4-004 all landed at HEAD; M5 (1.0 signed release +
-mirror push) is next per r49-r50-plan.md §5.9.
+**Current milestone:** M5-001 (dual-signed release + .pdxdoc) — LANDED.
+M5-002 (mirror push) queued.
 
 ## Milestone rollup
 
@@ -22,6 +21,8 @@ mirror push) is next per r49-r50-plan.md §5.9.
 | M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | LANDED |
 | M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | LANDED |
 | M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | LANDED |
+| M5-001 (#14)    | dual-signed release + .pdxdoc                                          | LANDED |
+| M5-002 (#15)    | mirror push to pkgs.paideia-os                                         | QUEUED |
 
 See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
 milestone breakdown (M1-M5) and cross-repo dependencies.
@@ -29,15 +30,41 @@ milestone breakdown (M1-M5) and cross-repo dependencies.
 ## Local layout
 
 - `caps.decl` — four required caps (KIND_PDXFS_TXN, KIND_PDXFS_FILE,
-  KIND_USER, KIND_IPC_ENDPOINT); declares `CreatedDirRecord@0.1` output.
+  KIND_USER, KIND_IPC_ENDPOINT) plus the M3-002-added audit endpoint;
+  declares `CreatedDirRecord@0.1` output.
+- `deps.list` (M5-001) — semver-pinned shared-library dependencies
+  (libpdx-argv, libpdx-cap, libpdx-audit, libpdx-semantic-pipe, all
+  at 1.0.0). Fingerprint columns placeholder until T-INFRA-002 signing
+  bot lands.
+- `manifest.pdxsig` (M5-001) — dual-signed release manifest per
+  `design/tooling/plan.md` §D4 + §6.4: `[manifest]` per-file SHA-256
+  hash table + `[capabilities]` + `[schemas]` + `[deps]` sub-blocks,
+  `[author-sig]` block (ML-DSA-65 under author_pk), `[paideia-sig]`
+  block (ML-DSA-65 under paideia_root_pk). Signature blocks placeholder
+  until the signing bot pass at M5-002.
+- `CHANGELOG.md` (M5-001) — semver history; 1.0.0 entry documents the
+  M1..M5 landings, cross-repo dep pin, placeholder-substrate seams
+  still open, and v1.0 known limitations.
+- `doc/mkdir.pdxdoc` (M5-001) — man-equivalent for the `doc` tool per
+  plan.md §I7 (`doc mkdir`) + `--help` back-end via shell dispatch.
 - `design/architecture.md` — internal spec (module boundary, `_start`
   flow, `mkdir_one` sequence, sidecar cap slot map, paideia-as
-  conformance, M1 non-goals).
+  conformance).
 - `src/mkdir_state.pdx` — `MkdirState` module (return codes, slot/op
-  constants, singleton flag storage, `reset`).
-- `src/mkdir.pdx` — `Mkdir` module (`_init_caps` sidecar, `_start`
-  orchestrator, `parse_flags_from_argv`, `mkdir_one`, `mkdir_run`,
-  `emit_stderr`).
+  constants, singleton flag storage, per-invocation path decomposition,
+  CreatedDirRecord + audit + undo staging, `reset`).
+- `src/mkdir.pdx` — `Mkdir` module (`_init_caps` sidecar,
+  `_start` orchestrator, `parse_flags_from_argv`, `mkdir_one`,
+  `mkdir_run`, `mkdir_split_path`, `emit_stderr`, audit-emit helper).
 - `tests/` — M4 coreutil test drivers + `expected-*.txt` witnesses
-  (M4-001 landed at HEAD; M4-002..004 queued).
+  (M4-001..M4-004 all LANDED).
 - `.plans/` — per-milestone implementation notes.
+
+## v1.0 release pointer
+
+Tag `v1.0.0` marks the M5-001 landing commit. `manifest.pdxsig` is
+authoritative for what ships in `pkg.tar` at M5-002 mirror push — 17
+files hashed under SHA-256. The signature blocks in the manifest are
+placeholder until the paideia-signing-bot host (T-INFRA-002) is stood
+up; the signing bot replaces both blocks without editing the
+`[manifest]` body.

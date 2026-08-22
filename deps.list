@@ -1,0 +1,47 @@
+# mkdir — deps.list
+#
+# Wave: R50 coreutil
+# Doc:  design/tooling/plan.md §7 (paideia-os) for the shared-library
+#       roster; design/tooling/r49-r50-plan.md §5.9 for the mkdir-specific
+#       dependency set.
+#
+# One row per shared-library dependency. Each row is a semver pin against
+# the library's dual-signed 1.0 release. `pkg install mkdir` resolves
+# this list transitively at install time and refuses the install if any
+# row's dual-sig verification fails.
+#
+# Row format (I3-consistent with libpdx-argv, libpdx-cap):
+#   <name>@<semver> <ml-dsa-65-author-fp> <ml-dsa-65-paideia-root-fp>
+#
+# The two fingerprints let `pkg verify` short-circuit re-verification
+# when the local pkg store already holds the matching signed manifest.
+# Fingerprint format: 16 hex chars = truncated BLAKE3-256 of the
+# ML-DSA-65 public key (matches libpdx-cap M3-001 KIND_USER_ref fp).
+#
+# Placeholder-until-signing-bot: every `PLACEHOLDER_*_FP` entry is
+# replaced with the real fingerprint at the M5-002 mirror-push step
+# once the paideia-signing-bot host is stood up (T-INFRA-002 in
+# design/tooling/plan.md §10). The row structure is frozen at v1.0;
+# only the fingerprint hex changes.
+
+# --- M1..M4 dependency set ---
+
+libpdx-argv@1.0.0                  PLACEHOLDER_LPDX_ARGV_AUTHOR_FP  PLACEHOLDER_PAIDEIA_ROOT_FP
+libpdx-cap@1.0.0                   PLACEHOLDER_LPDX_CAP_AUTHOR_FP   PLACEHOLDER_PAIDEIA_ROOT_FP
+libpdx-audit@1.0.0                 PLACEHOLDER_LPDX_AUDIT_AUTHOR_FP PLACEHOLDER_PAIDEIA_ROOT_FP
+libpdx-semantic-pipe@1.0.0         PLACEHOLDER_LPDX_SPIPE_AUTHOR_FP PLACEHOLDER_PAIDEIA_ROOT_FP
+
+# --- v1.0 does NOT depend on: ---
+#
+# libpdx-elevate — mkdir writes only inside the invoker's subtree; the
+#   cross-user / cross-subtree elevate hop is out of scope for v1.0 per
+#   design/tooling/r49-r50-plan.md §5.9. Adding it is a post-1.0 minor
+#   bump.
+#
+# pdx-regex, pdx-time, pdx-help, pdx-color — no pattern, no time input,
+#   no color output at v1.0. --help lives in doc/mkdir.pdxdoc and is
+#   rendered by the `doc` tool at read time.
+#
+# pdx-tls, libpaideia-ui — no network reach, no GUI variant.
+
+# EOF

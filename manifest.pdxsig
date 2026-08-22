@@ -1,0 +1,123 @@
+%pdxsig 0.1
+%tool  mkdir
+%ver   1.0.0
+%wave  R50
+%git   b12b264344e83ac51074c4f72233ff2f2ee4d8de
+%plan  design/tooling/plan.md §D4 + §6.4 (paideia-os)
+
+# manifest.pdxsig — mkdir 1.0.0 dual-signed release manifest
+#
+# Layout per design/tooling/plan.md §D4:
+#   1. [manifest]      header + per-file content-hash table (below)
+#   2. [author-sig]    ML-DSA-65 signature over §1 under author_pk
+#   3. [paideia-sig]   ML-DSA-65 signature over §1 under paideia_root_pk
+#
+# The two signatures cover the manifest body — NOT the tool source
+# files directly. A verifier re-computes the content hash of each file
+# named in §1 and rejects the package on any mismatch. This gives the
+# same tamper-evidence as a Merkle root but avoids the cost of a
+# balanced-tree walk at every `pkg install`.
+#
+# The signature blocks below carry PLACEHOLDER bytes at v1.0 —
+# author_pk and paideia_root_pk are not yet stood up (T-INFRA-001 +
+# T-INFRA-002 in design/tooling/plan.md §10). At M5-002 mirror-push
+# time the paideia-signing-bot replaces both blocks with real
+# ML-DSA-65 signatures. The manifest body (§1) is byte-frozen at v1.0
+# — the signing bot MUST NOT rewrite §1 during re-sign or the hash
+# chain breaks.
+
+# ============================================================================
+# §1  [manifest] — per-file SHA-256 hash table
+# ============================================================================
+#
+# Format:  <sha256-hex>  <path>
+#
+# Path is repository-relative. Order is stable (git-alphabetical by
+# path) so a byte-diff between two manifests localises exactly which
+# file changed. Every file that ships in `pkg.tar` at M5-002 has one
+# row here; nothing else is in the package.
+
+[manifest]
+1fe6718ff07eb675fffdab27f0966945d6e2dcb8c1054e370e3612a066e19a3d  src/mkdir.pdx
+2f7e3524e255084125352d28b7d9c3413f1a1a8608f9d86cdbcefa1e6a88fae9  src/mkdir_state.pdx
+72bbf78fa1d656e689e5a98336c94cf7fc3f027ea145a3bcc68f5c3fd2eb924d  tests/test_m4_001_single_multi.pdx
+5a25ad5446408381b1f66af649f6202f32c4f453665f2c250e4b5a7ab5158ddf  tests/test_m4_002_mixed_pre_existing.pdx
+2151e90007edb807a987ce1bb6122cfb40fd27fbe2fdcb3bca11d29e2173ae76  tests/test_m4_003_txn_abort.pdx
+d76f500f5f965884242b46416ff37bd9ab0e5d8ace02948787f23a9298692a58  tests/test_m4_004_cap_tail.pdx
+ab6fc7cea236043a1f7212a3e6cbabec24f5b398e717efdcb2e13ff3b39f8446  tests/expected-mkdir-m4-001-multi.txt
+736bfaf2f718a31f9e960772369808d8760fb9b47337efb47252f83ffffaee4d  tests/expected-mkdir-m4-001-single.txt
+ff69a634e262bf9733ecd839a89e90cedd7e349163e37e8df8b768bba75a2e25  tests/expected-mkdir-m4-002-mixed.txt
+ddf09eca90b3c7b445e0c5eb977834cfdefdcd5e1e48456b7645bc63d5c284c0  tests/expected-mkdir-m4-003-abort.txt
+462f56a53d28dc4a46930178aa7ba36bdd4ff3f20bc63d1de9f82cf2665193a5  tests/expected-mkdir-m4-004-owner.txt
+23cf4bc8e4a7692fc9994cde739b77beda29e6fe6c69c50fa42c9bade52c4727  caps.decl
+a7faf4ca3fc011c413ba5df62cb7c4150690459268009fad598dfe5930557499  deps.list
+032052f0cd51a6ad448b120826884e4226921252d5bfa8787ae52d3e26a2c553  doc/mkdir.pdxdoc
+5d10906e3e9407412fd51592e3dd968251a4797b8ffdcc9e862d8fb1f3925e2b  LICENSE
+bc71b57f524cf3ae94f2711ff42ca80ef18814b44b2df6bdb2520164ca695d3b  README.md
+a649d791d1c5148dfff65fe10de72d93680d45c14cedb6462f7d8774ce11434f  design/architecture.md
+
+[capabilities]
+# Copied verbatim from caps.decl for the fast-path verifier (`pkg
+# verify --caps-only`). Row shape:  slot  kind  rights
+0  KIND_PDXFS_TXN      R_PDXFS_TXN_INVOKE|R_PDXFS_TXN_OBSERVE
+1  KIND_PDXFS_FILE     R_PDXFS_FILE_INVOKE
+2  KIND_USER           R_USER_INVOKE
+3  KIND_IPC_ENDPOINT   R_IPC_WRITE|R_IPC_INVOKE
+4  KIND_IPC_ENDPOINT   R_IPC_WRITE|R_IPC_INVOKE
+
+[schemas]
+CreatedDirRecord@0.1
+
+[deps]
+libpdx-argv@1.0.0
+libpdx-cap@1.0.0
+libpdx-audit@1.0.0
+libpdx-semantic-pipe@1.0.0
+
+# ============================================================================
+# §2  [author-sig] — ML-DSA-65 signature under author_pk
+# ============================================================================
+#
+# author_pk fingerprint (BLAKE3-256 truncated to 16 hex chars):
+#   PLACEHOLDER_AUTHOR_FP__________
+#
+# The signature covers the CANONICAL byte encoding of §1: every line
+# between the `[manifest]` marker (exclusive) and the `[author-sig]`
+# marker (exclusive), LF-terminated, ASCII-only.
+#
+# ML-DSA-65 signatures are 3293 bytes → 4392 base64 chars → laid out
+# 64 chars per line. The placeholder below has the same LINE COUNT as
+# a real signature so a diff between placeholder and real reveals only
+# content changes, not layout changes.
+
+[author-sig]
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_0_0_mkdir_M5_001________________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_0_0_mkdir_M5_001________________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_0_0_mkdir_M5_001________________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_0_0_mkdir_M5_001________________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_0_0_mkdir_M5_001________________
+
+# ============================================================================
+# §3  [paideia-sig] — ML-DSA-65 signature under paideia_root_pk
+# ============================================================================
+#
+# paideia_root_pk fingerprint (BLAKE3-256 truncated to 16 hex chars):
+#   PLACEHOLDER_PAIDEIA_ROOT_FP____
+#
+# The signature covers the SAME canonical byte range as §2. Independent
+# ML-DSA-65 key; the R32 root key material is generated once and held
+# on the paideia-signing-bot host (T-INFRA-002).
+#
+# `pkg install` verifies BOTH signatures against the manifest body
+# under the fingerprint pinned in the client's `/pkgs/roots.pdx` file.
+# Either verification failure rejects the package with exit code 5
+# (I3 shared exit-code convention).
+
+[paideia-sig]
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_0_0_mkdir_M5_001__________
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_0_0_mkdir_M5_001__________
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_0_0_mkdir_M5_001__________
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_0_0_mkdir_M5_001__________
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_0_0_mkdir_M5_001__________
+
+# EOF — end of dual-signed manifest for mkdir 1.0.0
