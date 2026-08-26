@@ -129,6 +129,12 @@ module Mkdir = structure {
   pub let err_too_deep_msg    : [u8; 40] = "mkdir: path too deep (max 16 levels)\n\0\0\0"
   pub let err_too_deep_len    : u64 = 37
 
+  // mkdir.ENH-004: subtree containment guard. A path component of
+  // exactly two bytes ".." is rejected in mkdir_split_path before any
+  // cap invocation — see MK_PARENT_REF_UNSUPPORTED in mkdir_state.pdx.
+  pub let err_parent_ref_msg  : [u8; 41] = "mkdir: '..' component unsupported at M2\n\0"
+  pub let err_parent_ref_len  : u64 = 40
+
   // ---- M2-003 cap-tail owner stamp diagnostic string ----
   //
   // The cap-tail stamp records the invoker's KIND_USER cap into the
@@ -418,6 +424,10 @@ module Mkdir = structure {
   //       | MK_ABS_PATH_UNSUPPORTED     (7)  — path starts with '/'
   //       | MK_PATH_TOO_DEEP            (8)  — > PATH_MAX_COMPONENTS
   //                                             non-empty levels
+  //       | MK_PARENT_REF_UNSUPPORTED   (10) — a component is exactly
+  //                                             ".." (mkdir.ENH-004
+  //                                             subtree containment
+  //                                             guard)
   //
   // Populates three MkdirState .bss slots:
   //   comp_start_offsets[i] — byte offset within `path` where
@@ -439,6 +449,15 @@ module Mkdir = structure {
   //     the caller decides whether to escalate — mkdir_one under `-p`
   //     with comp_count=0 short-circuits to MK_OK, matching POSIX
   //     `mkdir -p ""` idempotence.
+  //   - mkdir.ENH-004: a component of exactly two bytes ".." is
+  //     rejected with MK_PARENT_REF_UNSUPPORTED, checked at the same
+  //     close site as the too-deep gate (before any cap invocation —
+  //     mkdir_one calls this before Step 5's TXN open). This is the
+  //     subtree containment guard: the leading-'/' check alone does
+  //     not stop `mkdir -p ../../etc` from walking outside the
+  //     invoker's own subtree. A component that merely CONTAINS ".."
+  //     (`..foo`, `foo..`) is ordinary and NOT rejected — only an
+  //     exact two-byte "..\0"/".."+'/' match trips the guard.
   //
   // Leaf function; no calls; no push/pop parity to preserve. Uses only
   // caller-save regs (rax/rcx/rdx/r8/r10/r11).
@@ -450,13 +469,16 @@ module Mkdir = structure {
   //   r8  = comp_count (local; committed to .bss at msp_done)
   //   r10 = length of the currently-open component
   //   r11 = LEA scratch (paideia-as reserved)
+  //   rdi = path base pointer; temporarily offset by +rdx inside the
+  //         ENH-004 ".." check at each close site, always restored
+  //         (-rdx) before the check falls through or jumps away
   //
   // Label prefix `msp_` avoids every paideia-as reserved keyword.
   // ============================================================================
   pub let mkdir_split_path : (u64) -> u64 !{mem} @{} =
     fn (path: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M2-001 mkdir_split_path — leaf component splitter. Walks path bytes once: '/' closes the currently-open non-empty component (empty ones are skipped, absorbing `foo//bar` and trailing `/`); NUL closes the final component and terminates the walk. Absolute paths (first byte '/') are rejected immediately with MK_ABS_PATH_UNSUPPORTED — v1.0 constraint from r49-r50-plan.md §5.9 (invoker-subtree only until shell.M4 publishes a base-cap wire). > PATH_MAX_COMPONENTS levels → MK_PATH_TOO_DEEP (checked at every close, not just at end, so overflow surfaces at the first over-limit level). paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every `cmp reg,imm` uses ≤ 0x7F ASCII values or PATH_MAX_COMPONENTS = 16 (well under 0x7FFFFFFF); r11 scratch (only LEA temps); no test mnemonic; no push/pop parity (leaf). Label prefix msp_ avoids every paideia-as reserved keyword.",
+      justification: "mkdir.M2-001 + mkdir.ENH-004 mkdir_split_path — leaf component splitter. Walks path bytes once: '/' closes the currently-open non-empty component (empty ones are skipped, absorbing `foo//bar` and trailing `/`); NUL closes the final component and terminates the walk. Absolute paths (first byte '/') are rejected immediately with MK_ABS_PATH_UNSUPPORTED — v1.0 constraint from r49-r50-plan.md §5.9 (invoker-subtree only until shell.M4 publishes a base-cap wire). ENH-004: at each close site, a component of exactly two bytes '..' is rejected with MK_PARENT_REF_UNSUPPORTED — checked BEFORE the too-deep gate so a long `../../..` chain reports the containment error first. The two-byte check temporarily adds `rdx` (the component's start offset) into `rdi` to reach the component's first byte with base+immediate addressing (`[rdi]`, `[rdi + 1]`), then subtracts `rdx` back out before falling through to the too-deep gate or advancing — `rdi` is restored on every path out of the check, matching the same add/sub-around-a-load idiom the main byte-walk already uses for `mov_b rax, [rdi]` with a register-valued cursor. A component that merely CONTAINS '..' (`..foo`, `foo..`) is length != 2 and is not rejected. > PATH_MAX_COMPONENTS levels → MK_PATH_TOO_DEEP (checked at every close, not just at end, so overflow surfaces at the first over-limit level). paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every `cmp reg,imm` uses ≤ 0x7F ASCII values or PATH_MAX_COMPONENTS = 16 / MK_PARENT_REF_UNSUPPORTED = 10 (well under 0x7FFFFFFF); r11 scratch (only LEA temps); no test mnemonic; no push/pop parity (leaf). Label prefix msp_ avoids every paideia-as reserved keyword.",
       block: {
         // Setup: comp_count = 0, cur_start = 0, cur_len = 0, i = 0.
         xor r8, r8;                              // r8 = comp_count = 0
@@ -491,6 +513,28 @@ module Mkdir = structure {
         cmp r10, 0;
         je  msp_after_sep_advance;
 
+        // mkdir.ENH-004: reject a component of exactly two bytes ".."
+        // — subtree containment guard, checked BEFORE the too-deep
+        // gate so a long `../../..` chain reports
+        // MK_PARENT_REF_UNSUPPORTED rather than MK_PATH_TOO_DEEP.
+        cmp r10, 2;
+        jne msp_sep_not_dotdot;
+        add rdi, rdx;
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0x2E;                           // '.'
+        jne msp_sep_dotdot_restore;
+        xor rax, rax;
+        mov_b rax, [rdi + 1];
+        cmp rax, 0x2E;                           // '.'
+        jne msp_sep_dotdot_restore;
+        sub rdi, rdx;
+        jmp msp_parent_ref;
+
+      msp_sep_dotdot_restore:
+        sub rdi, rdx;
+
+      msp_sep_not_dotdot:
         cmp r8, 16;                              // PATH_MAX_COMPONENTS
         jge msp_too_deep;
 
@@ -512,6 +556,26 @@ module Mkdir = structure {
         cmp r10, 0;
         je  msp_done;
 
+        // mkdir.ENH-004: same ".." containment guard as msp_close_sep,
+        // for the trailing (NUL-terminated) component.
+        cmp r10, 2;
+        jne msp_final_not_dotdot;
+        add rdi, rdx;
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0x2E;                           // '.'
+        jne msp_final_dotdot_restore;
+        xor rax, rax;
+        mov_b rax, [rdi + 1];
+        cmp rax, 0x2E;                           // '.'
+        jne msp_final_dotdot_restore;
+        sub rdi, rdx;
+        jmp msp_parent_ref;
+
+      msp_final_dotdot_restore:
+        sub rdi, rdx;
+
+      msp_final_not_dotdot:
         cmp r8, 16;                              // PATH_MAX_COMPONENTS
         jge msp_too_deep;
 
@@ -535,6 +599,10 @@ module Mkdir = structure {
       msp_too_deep:
         mov rax, 8;                              // MK_PATH_TOO_DEEP
         ret;
+
+      msp_parent_ref:
+        mov rax, 10;                             // MK_PARENT_REF_UNSUPPORTED
+        ret;
       }
     }
 
@@ -551,6 +619,8 @@ module Mkdir = structure {
   //       | MK_TXN_COMMIT_FAIL           (6)  — sys_cap_invoke(SLOT_TXN,...) commit
   //       | MK_ABS_PATH_UNSUPPORTED      (7)  — path starts with '/' (M2-001)
   //       | MK_PATH_TOO_DEEP             (8)  — > 16 levels (M2-001)
+  //       | MK_PARENT_REF_UNSUPPORTED    (10) — a component is exactly
+  //                                             ".." (mkdir.ENH-004)
   //
   // Steps (per design/architecture.md §4 + §4a):
   //   1. Multi-level guard IFF `-p` is NOT set. Any '/' in path →
@@ -612,7 +682,7 @@ module Mkdir = structure {
   pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6b create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, flips the Step 7 commit placeholder to real PXT_OP_COMMIT (7), captures the TXN's txn_id into current_txn_id at Step 5 (via PXT_OP_QUERY_ID), populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref), and freezes created_dir_records_count == newly_created_count before the commit syscall so a commit failure leaves the record array + M3-003 undo array in the consistent 'staged, uncommitted' state. M3-003 adds one RmdirUndoRecord per newly-created level in the same Step 6f beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay), and freezes rmdir_undo_records_count == newly_created_count at the same Step 7 commit-freeze point so both readers (CDR/undo-log/audit) see one consistent snapshot per invocation. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
+      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6b create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, flips the Step 7 commit placeholder to real PXT_OP_COMMIT (7), captures the TXN's txn_id into current_txn_id at Step 5 (via PXT_OP_QUERY_ID), populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref), and freezes created_dir_records_count == newly_created_count before the commit syscall so a commit failure leaves the record array + M3-003 undo array in the consistent 'staged, uncommitted' state. M3-003 adds one RmdirUndoRecord per newly-created level in the same Step 6f beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay), and freezes rmdir_undo_records_count == newly_created_count at the same Step 7 commit-freeze point so both readers (CDR/undo-log/audit) see one consistent snapshot per invocation. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED, MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004: a component of exactly two bytes \"..\"), or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 so the walk-loop shape is unified. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
       block: {
         // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
         push rbx;
@@ -660,11 +730,14 @@ module Mkdir = structure {
         cmp rax, 0;
         je  mkdir_one_after_split;
 
-        // Split error — rax already holds MK_ABS_PATH_UNSUPPORTED (7)
-        // or MK_PATH_TOO_DEEP (8). Emit the matching diagnostic then
+        // Split error — rax already holds MK_ABS_PATH_UNSUPPORTED (7),
+        // MK_PARENT_REF_UNSUPPORTED (10, mkdir.ENH-004), or
+        // MK_PATH_TOO_DEEP (8). Emit the matching diagnostic then
         // route through the shared epilogue.
         cmp rax, 7;
         je  mkdir_one_abs_path_fail;
+        cmp rax, 10;
+        je  mkdir_one_parent_ref_fail;
         jmp mkdir_one_too_deep_fail;
 
       mkdir_one_abs_path_fail:
@@ -672,6 +745,13 @@ module Mkdir = structure {
         mov rsi, 39;                              // err_abs_path_len
         call emit_stderr;
         mov rax, 7;                               // MK_ABS_PATH_UNSUPPORTED
+        jmp mkdir_one_epilogue;
+
+      mkdir_one_parent_ref_fail:
+        lea rdi, [rip + err_parent_ref_msg];
+        mov rsi, 40;                              // err_parent_ref_len
+        call emit_stderr;
+        mov rax, 10;                              // MK_PARENT_REF_UNSUPPORTED
         jmp mkdir_one_epilogue;
 
       mkdir_one_too_deep_fail:

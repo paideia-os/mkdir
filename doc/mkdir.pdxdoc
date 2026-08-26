@@ -74,6 +74,8 @@ shell to a `libpdx-semantic-pipe` writer). Per I4 in
     7   MK_ABS_PATH_UNSUPPORTED      path started with '/' (v1.0)
     8   MK_PATH_TOO_DEEP             > 16 non-empty components
     9   MK_CAP_TAIL_FAIL             KIND_USER owner-stamp failed
+    10  MK_PARENT_REF_UNSUPPORTED    a path component is exactly ".."
+                                     (subtree containment guard, ENH-004)
 
 The exit codes obey the tooling plan §4 shared convention: 0 success, 2
 user error, 3 system error, 4 capability denied. Codes 3..9 map onto the
@@ -128,6 +130,14 @@ and `undo` (via the paired `RmdirUndoRecord[]` in the audit journal).
       invoker's own PdxFS subtree; a leading '/' returns
       MK_ABS_PATH_UNSUPPORTED. Cross-subtree writes wait on the
       libpdx-elevate hop landing in a post-1.0 release.
+
+    - Parent-reference (`..`) components refused. A path component of
+      exactly two bytes ".." returns MK_PARENT_REF_UNSUPPORTED before
+      any cap invocation (ENH-004). This is the second half of the
+      invoker-subtree guarantee above: the leading-'/' check alone does
+      not stop `mkdir -p ../../etc` from walking outside the invoker's
+      own subtree. A component that merely contains ".." (`..foo`,
+      `foo..`) is ordinary and still succeeds.
 
     - No silent failure. Empty positional argv returns MK_MISSING_PATH
       with a stderr diagnostic (I4 cross-tool contract).

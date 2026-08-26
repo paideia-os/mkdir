@@ -24,6 +24,15 @@ module MkdirState = structure {
   pub let MK_ABS_PATH_UNSUPPORTED     : u64 = 7  // path starts with '/' — M2 rejects
   pub let MK_PATH_TOO_DEEP            : u64 = 8  // > PATH_MAX_COMPONENTS levels
   pub let MK_CAP_TAIL_FAIL            : u64 = 9  // KIND_USER cap-tail stamp placeholder failed
+  pub let MK_PARENT_REF_UNSUPPORTED   : u64 = 10 // mkdir.ENH-004: a path component is
+                                                  // exactly ".." (subtree containment
+                                                  // guard). Checked in mkdir_split_path
+                                                  // before any cap invocation — a leading
+                                                  // '/' guard alone does not stop
+                                                  // `mkdir -p ../../etc` from walking
+                                                  // outside the invoker's subtree once
+                                                  // mkdir.M2-substrate-001 lands the real
+                                                  // create-dir walker body.
 
   // --- M2-001: per-invocation path decomposition bounds. Cap at 16
   //     levels: enough for every realistic paideia-os path (deepest at

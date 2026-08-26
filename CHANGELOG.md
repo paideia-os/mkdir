@@ -4,6 +4,18 @@ Semver-tagged release history. Every entry corresponds to a git tag on
 this repository and (starting at 1.0.0) a dual-signed
 `manifest.pdxsig` at the same commit.
 
+## Unreleased — Enhancement v1.x (milestone #6)
+
+Post-1.0 correctness + doc-truth fixes tracked in
+`design/enhancement-plan.md`. Landing incrementally; each entry below
+corresponds to one closed `mkdir.ENH-NNN` issue.
+
+- **ENH-004 (#19)** — subtree containment guard: `mkdir_split_path`
+  rejects any path component of exactly two bytes ".." with the new
+  `MK_PARENT_REF_UNSUPPORTED` (10) return code, checked before any cap
+  invocation. Closes the gap where the leading-'/' guard alone did not
+  stop `mkdir -p ../../etc` from walking outside the invoker's subtree.
+
 ## 1.0.0 — 2026-08-22 — first signed release
 
 Wave R50. Milestone M5 close: `mkdir` is *released* per the
@@ -82,6 +94,13 @@ lands, the bodies are edited without a signature change to `mkdir_one`.
   is out of scope for v1.0.
 - Dot components (`foo/./bar`) propagate to the placeholder create
   as level `.` — kernel-side normalisation is `mkdir.M2-substrate-001`.
+- Parent-reference (`..`) components are rejected as of the mkdir.ENH-004
+  fix: `mkdir_split_path` returns `MK_PARENT_REF_UNSUPPORTED` (10) for
+  any component of exactly two bytes "..", before any cap invocation.
+  This closes the subtree-containment gap the leading-'/' guard alone
+  did not cover (`mkdir -p ../../etc` previously split cleanly and
+  would have walked outside the invoker's subtree once
+  `mkdir.M2-substrate-001` lands the real create-dir walker body).
 - PATH_MAX_COMPONENTS = 16 (§4a of `design/architecture.md`); deeper
   paths return `MK_PATH_TOO_DEEP`. Sufficient for every realistic
   paideia-os path (deepest at R48 is 4 levels).
