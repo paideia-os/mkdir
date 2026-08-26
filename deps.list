@@ -24,14 +24,57 @@
 # design/tooling/plan.md §10). The row structure is frozen at v1.0;
 # only the fingerprint hex changes.
 
-# --- M1..M4 dependency set ---
+# --- mkdir.ENH-009 correction (post-1.0.0, milestone #6) ---
+#
+# This file previously pinned libpdx-cap, libpdx-audit, and
+# libpdx-semantic-pipe alongside libpdx-argv, on the assumption that
+# mkdir linked all four. A grep-verified audit of src/ (see
+# design/enhancement-plan.md §3.7 and the mkdir.ENH-008 investigation)
+# found exactly one cross-module symbol actually called from _start's
+# reachable graph: `reset` + `parse_argv`, both libpdx-argv. Per this
+# file's own header, `pkg install mkdir` resolves every pinned row
+# transitively and REFUSES the install if that row's dual-sig
+# verification fails — so the three dropped rows below were pure
+# supply-chain surface for zero linked benefit; a tool should not make
+# its own installability depend on a library it does not call.
+#
+# `manifest.pdxsig [deps]` still lists all four rows as of this
+# correction — that section is part of the signed manifest body,
+# frozen at v1.0 per design/tooling/plan.md §D4 ("the signing bot MUST
+# NOT rewrite §1 during re-sign or the hash chain breaks"), so
+# reconciling it is deferred to the next signed manifest revision
+# rather than hand-edited here. This file (deps.list) is not part of
+# that signed body and is safe to correct immediately.
+
+# --- Real dependency set (grep-verified) ---
 
 libpdx-argv@1.0.0                  PLACEHOLDER_LPDX_ARGV_AUTHOR_FP  PLACEHOLDER_PAIDEIA_ROOT_FP
-libpdx-cap@1.0.0                   PLACEHOLDER_LPDX_CAP_AUTHOR_FP   PLACEHOLDER_PAIDEIA_ROOT_FP
-libpdx-audit@1.0.0                 PLACEHOLDER_LPDX_AUDIT_AUTHOR_FP PLACEHOLDER_PAIDEIA_ROOT_FP
-libpdx-semantic-pipe@1.0.0         PLACEHOLDER_LPDX_SPIPE_AUTHOR_FP PLACEHOLDER_PAIDEIA_ROOT_FP
 
 # --- v1.0 does NOT depend on: ---
+#
+# libpdx-cap — mkdir declares five caps in caps.decl / _init_caps, but
+#   `cap_manifest_verify` is never called (mkdir.ENH-008 confirmed this
+#   is zero call sites repo-wide AND ecosystem-wide: even the shell's
+#   own exec path does its own inline cap narrowing rather than calling
+#   into libpdx-cap for it). Cap-delivery enforcement for mkdir is the
+#   kernel loader's InitCap validator, not a libpdx-cap userspace call.
+#   Re-add this pin only if/when mkdir grows a real libpdx-cap call
+#   site (e.g. a future self-check variant of cap_manifest_verify).
+#
+# libpdx-audit — `emit_audit_event` (src/mkdir.pdx) is a hand-rolled
+#   raw `sys_cap_invoke` against the KIND_IPC_ENDPOINT at SLOT_AUDIT_EP,
+#   not a libpdx-audit library call. Re-add this pin if/when
+#   emit_audit_event is rewritten to route through a real libpdx-audit
+#   marshalling call (its own doc comment already flags this as a
+#   likely M3-substrate-002 follow-up).
+#
+# libpdx-semantic-pipe — `send_record` is never called and cap slot 3
+#   (the semantic pipe) is never invoked; `caps.decl` and
+#   `manifest.pdxsig` both declare `CreatedDirRecord@0.1` as an output
+#   schema, but nothing in src/ marshals a record through this library.
+#   Tracked as mkdir.ENH-002 (`--json` + live slot-3 emit, milestone #6,
+#   open); re-add this pin when that lands with a real `send_record`
+#   call site.
 #
 # libpdx-elevate — mkdir writes only inside the invoker's subtree; the
 #   cross-user / cross-subtree elevate hop is out of scope for v1.0 per

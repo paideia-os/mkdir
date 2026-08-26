@@ -66,6 +66,16 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   newline). Pre-existing levels under `-p` and `--dry-run` invocations
   emit nothing, matching `doc/mkdir.pdxdoc`'s existing (previously
   false) description.
+- **ENH-009 (#24)** — reconciled `deps.list` to actual linkage: dropped
+  `libpdx-cap`, `libpdx-audit`, and `libpdx-semantic-pipe` (grep-verified
+  zero call sites — only `libpdx-argv`'s `reset`/`parse_argv` are
+  actually called), each recorded in the "v1.0 does NOT depend on"
+  block with its specific reason and re-add condition. `pkg install`
+  no longer makes mkdir's installability depend on three unused
+  dual-sig verifications. `manifest.pdxsig [deps]` still lists all
+  four — that section is part of the signed manifest body (frozen at
+  v1.0 per plan.md §D4) and is reconciled at the next signed manifest
+  revision, not hand-edited here.
 
 ## 1.0.0 — 2026-08-22 — first signed release
 
