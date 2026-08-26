@@ -15,6 +15,12 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   `MK_PARENT_REF_UNSUPPORTED` (10) return code, checked before any cap
   invocation. Closes the gap where the leading-'/' guard alone did not
   stop `mkdir -p ../../etc` from walking outside the invoker's subtree.
+- **ENH-005 (#20)** — the non-`-p` single-component path
+  (`mkdir_one_no_slash`) now populates `comp_start_offsets[0]` /
+  `comp_lengths[0]` instead of leaving them uninitialized. Previously
+  every `CreatedDirRecord` / `RmdirUndoRecord` staged by a plain
+  `mkdir a` carried `path_len == 0` (unrenderable by `ls --long`,
+  unremovable by `undo`).
 
 ## 1.0.0 — 2026-08-22 — first signed release
 
