@@ -37,12 +37,19 @@ The tool never links `pkg` or `shell` at build time. Its dependencies
 at M1 are strictly:
 
 - **libpdx-argv M1-002** for `Parser::parse_argv` + `ParsedArgs`.
-- **libpdx-cap M1-001** for `Cap` + `cap_manifest_verify` (skeleton at
-  M1; the verify becomes strict at libpdx-cap M2-001 without a signature
-  change at this end).
 
 No dependency on libpdx-audit or libpdx-semantic-pipe at M1 — those
 land at mkdir.M3.
+
+> **Correction (mkdir.ENH-008).** This section originally also listed
+> libpdx-cap M1-001 for `Cap` + `cap_manifest_verify`, with the M1
+> skeleton "becoming strict at libpdx-cap M2-001." mkdir never actually
+> calls `cap_manifest_verify` (grep-confirmed repo-wide — see
+> `design/enhancement-plan.md` §3.6); the line described aspirational
+> intent, not a real dependency. mkdir's actual cap-delivery
+> enforcement is the kernel loader's InitCap validator (§6 below),
+> which runs against `_init_caps` at image-load time regardless of
+> whether any libpdx-cap userspace call ever executes.
 
 ## 2. Module boundary
 
@@ -408,18 +415,25 @@ byte-compare chain.
 
 ## 6. Sidecar cap slot map
 
-Four rows in `_init_caps` (see `caps.decl` for the full descriptions):
+Five rows in `_init_caps` (see `caps.decl` for the full descriptions;
+`caps.decl`'s `requires:` list was missing row 4 until mkdir.ENH-008,
+even though `_init_caps` itself and `manifest.pdxsig` had listed it
+since M3-002 / M5-001):
 
 | slot | kind                 | rights                                     |
 |------|----------------------|--------------------------------------------|
 |  0   | `KIND_PDXFS_TXN`     | `R_PDXFS_TXN_INVOKE \| R_PDXFS_TXN_OBSERVE`|
 |  1   | `KIND_PDXFS_FILE`    | `R_PDXFS_FILE_INVOKE`                      |
 |  2   | `KIND_USER`          | `R_USER_INVOKE`                            |
-|  3   | `KIND_IPC_ENDPOINT`  | `R_IPC_WRITE \| R_IPC_INVOKE`              |
+|  3   | `KIND_IPC_ENDPOINT`  | `R_IPC_WRITE \| R_IPC_INVOKE` (semantic pipe) |
+|  4   | `KIND_IPC_ENDPOINT`  | `R_IPC_WRITE \| R_IPC_INVOKE` (audit journal, M3-002) |
 
-The slot map is stable across M1–M5. Additional caps (e.g. a second
-`KIND_IPC_ENDPOINT` for the audit sink at M3-002) go into slots 4+; the
-declaration order in `caps.decl` matches the sidecar row order.
+The slot map is stable across M1–M5 (four rows through M2, five from
+M3-002 on). Enforcement of this table happens at image-load time via
+the kernel loader's InitCap validator (`init_caps_validate`,
+design/loader/init-caps-sidecar.md §4 in paideia-os) reading
+`_init_caps` directly — NOT via a `cap_manifest_verify` call in
+mkdir's own `_start` (mkdir.ENH-008 correction; see §1 above).
 
 ## 7. Compliance with paideia-as encoding constraints
 

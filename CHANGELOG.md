@@ -46,6 +46,19 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   `doc/mkdir.pdxdoc` and `CHANGELOG.md`'s 1.0.0 entry: `--help` is
   (and always was) shell-dispatched to `doc mkdir`, not parsed by
   mkdir itself; the SYNOPSIS and FLAGS sections now say so plainly.
+- **ENH-008 (#23)** — `caps.decl`'s `requires:` list was missing slot 4
+  (the `KIND_IPC_ENDPOINT` audit-journal cap `emit_audit_event` invokes
+  on every invocation) even though `_init_caps` (src/mkdir.pdx) and
+  `manifest.pdxsig [capabilities]` both already listed it; added, now
+  byte-consistent across all three. Also corrected a false claim
+  repeated in `caps.decl`, `doc/mkdir.pdxdoc`, and
+  `design/architecture.md`: `cap_manifest_verify` does NOT run at
+  mkdir's `_start` (grep-confirmed: zero call sites), and no confirmed
+  mechanism anywhere in the ecosystem currently supplies the "received
+  Cap[] wire array" argument it would need for a spawned coreutil.
+  mkdir's actual cap-delivery enforcement is the kernel loader's
+  InitCap validator (`init_caps_validate`), which runs against
+  `_init_caps` at image-load time — the docs now say so.
 
 ## 1.0.0 — 2026-08-22 — first signed release
 

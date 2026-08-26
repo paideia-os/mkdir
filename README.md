@@ -92,12 +92,13 @@ From `MkdirState::MK_*` in `src/mkdir_state.pdx`; `_start` passes
 | 1 | `MK_ARGV_ERR` | `parse_argv` returned non-zero. |
 | 2 | `MK_MISSING_PATH` | `pos_count == 0`. |
 | 3 | `MK_MULTI_LEVEL_UNSUPPORTED` | Path contains `/` and `-p` was not passed. |
-| 4 | `MK_TXN_OPEN_FAIL` | `sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID)` returned negative. |
+| 4 | `MK_TXN_OPEN_FAIL` | `mkdir_run`'s `sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID)` returned negative (mkdir.ENH-006: this is a `mkdir_run` state now, not `mkdir_one`'s). |
 | 5 | `MK_MKDIR_FAIL` | Pre-existence probe or `PXT_OP_CREATE` returned negative. |
-| 6 | `MK_TXN_COMMIT_FAIL` | `PXT_OP_COMMIT` returned negative (e.g. `PXT_BAD_TRANSITION`). |
+| 6 | `MK_TXN_COMMIT_FAIL` | `mkdir_run`'s single `PXT_OP_COMMIT` returned negative (e.g. `PXT_BAD_TRANSITION`) — mkdir.ENH-006: issued once per invocation, not once per positional. |
 | 7 | `MK_ABS_PATH_UNSUPPORTED` | Path starts with `/`. |
 | 8 | `MK_PATH_TOO_DEEP` | More than 16 non-empty components. |
 | 9 | `MK_CAP_TAIL_FAIL` | `KIND_USER` owner stamp returned negative. |
+| 10 | `MK_PARENT_REF_UNSUPPORTED` | A path component is exactly `..` (mkdir.ENH-004 subtree containment guard). |
 
 Every failure path also writes a one-line diagnostic to stderr through
 `emit_stderr` (`sys_debug_puts`, SC+ ID 12) before returning.

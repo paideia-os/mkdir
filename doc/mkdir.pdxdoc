@@ -112,10 +112,23 @@ user error, 3 system error, 4 capability denied. Codes 3..9 map onto the
 
 # CAPABILITIES
 
-Four caps are required at spawn; a fifth is optionally seeded when the
-shell has resolved `svc.audit-journal`. Every row is authoritative
-against `caps.decl`; `cap_manifest_verify` at `_start` rejects any cap
-outside this list.
+Five caps are required at spawn, all seeded via the kernel loader's
+InitCap sidecar (`_init_caps` in `src/mkdir.pdx`, validated at
+load time by `init_caps_validate` — design/loader/init-caps-sidecar.md
+§4 in paideia-os). Every row below is authoritative against
+`caps.decl`'s `requires:` list (mkdir.ENH-008 closed a gap where
+`caps.decl` was missing slot 4 even though this table, `_init_caps`,
+and `manifest.pdxsig` all already listed it).
+
+**Correction (mkdir.ENH-008):** `cap_manifest_verify` is a libpdx-cap
+userspace primitive that compares a caps.decl parse against a received
+`Cap[]` wire array; mkdir's `_start` does NOT call it, and no confirmed
+call site anywhere in the ecosystem produces the "received" argument it
+would need for a spawned coreutil (the shell's own exec path performs
+its own inline cap narrowing rather than calling this function). The
+actual enforcement point for the table below is the kernel loader's
+InitCap validator, which checks slot range and known-kind membership at
+image-load time.
 
     slot 0   KIND_PDXFS_TXN          R_PDXFS_TXN_INVOKE | R_PDXFS_TXN_OBSERVE
     slot 1   KIND_PDXFS_FILE         R_PDXFS_FILE_INVOKE   (target parent)

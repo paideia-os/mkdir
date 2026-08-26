@@ -10,14 +10,31 @@
 # dependency at v1.0 (see §5.9 "no elevate dependency" line).
 #
 # Every cap listed here MUST arrive via the loader's InitCap sidecar
-# (src/kernel/core/loader/init_caps.pdx in paideia-os) or be passed
-# through a KIND_IPC_ENDPOINT cap-transfer from the shell that spawns
-# mkdir. cap_manifest_verify (libpdx-cap M2-001) runs at _start against
-# THIS FILE'S declaration and refuses any cap not named below.
+# (src/kernel/core/loader/init_caps.pdx in paideia-os): mkdir's
+# `_init_caps` array in src/mkdir.pdx is validated at image-load time
+# by `init_caps_validate` (design/loader/init-caps-sidecar.md §4 in
+# paideia-os), which mints each declared row directly into the task's
+# kernel-side cap_table before `_start` runs.
+#
+# mkdir.ENH-008 correction: earlier revisions of this file claimed
+# "cap_manifest_verify (libpdx-cap M2-001) runs at _start against THIS
+# FILE'S declaration and refuses any cap not named below." That is not
+# what happens. `cap_manifest_verify` is a libpdx-cap userspace
+# primitive (decl-vs-received Cap[] wire-array compare); mkdir's
+# `_start` never calls it, and — as of this correction — no confirmed
+# call site anywhere in the ecosystem produces the "received Cap[]
+# wire array" argument it needs for a spawned coreutil like mkdir (the
+# shell's own exec path, src/exec.pdx `exec_narrow_child_caps`,
+# performs its own inline parent/child narrowing rather than calling
+# cap_manifest_verify). The actual enforcement point for mkdir's five
+# caps is the kernel loader's InitCap validator named above, which
+# checks slot range and known-kind membership at load time — not a
+# declared-vs-received identity check against this file's text.
 #
 # M1 seeds four slots via the sidecar (see src/mkdir.pdx _init_caps
-# layout). M2 layers the -p multi-level TXN atomicity on top; the cap
-# set does not grow.
+# layout); M3-002 (see below) added a fifth for the audit-journal
+# endpoint. M2 layers the -p multi-level TXN atomicity on top; the cap
+# set does not otherwise grow.
 requires:
   # slot 0 — KIND_PDXFS_TXN. One TXN per mkdir invocation. Under -p
   # every level created lives inside this one TXN so an abort mid-create
@@ -55,6 +72,19 @@ requires:
   - kind: KIND_IPC_ENDPOINT
     rights: R_IPC_WRITE | R_IPC_INVOKE
     slot: 3
+
+  # slot 4 — KIND_IPC_ENDPOINT (audit journal, svc.audit-journal).
+  # mkdir.ENH-008: this row was missing even though _init_caps entry 4
+  # (src/mkdir.pdx) has declared it since M3-002 and manifest.pdxsig
+  # [capabilities] has listed it since M5-001 — the audit cap mkdir
+  # invokes on every single invocation (emit_audit_event, TOOL_INVOKE /
+  # TOOL_ERROR) was simply absent from this file's `requires:` list.
+  # Bound at spawn time by the shell to the registered audit-journal
+  # broker (src/kernel/core/ipc/audit_journal_broker.pdx); mkdir treats
+  # it as write-only.
+  - kind: KIND_IPC_ENDPOINT
+    rights: R_IPC_WRITE | R_IPC_INVOKE
+    slot: 4
 
 # Declared output schemas — mkdir emits CreatedDirRecord[] on the
 # semantic pipe at slot 3 (M3-001 wire-up). Per I4 in
