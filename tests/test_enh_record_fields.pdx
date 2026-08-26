@@ -1,0 +1,269 @@
+// tests/test_enh_record_fields.pdx — mkdir.ENH-012
+// TestEnhRecordFields module: record FIELD assertions (not just counts).
+//
+// Per design/enhancement-plan.md §5 ENH-012 fingerprint:
+//   (b) "mkdir a -> created_dir_records[0].path_len == 1, not 0."
+//   (d) "mkdir -p a/b/c -> per-level path_len of 1, 3, 5 against a
+//        shared path_ptr."
+//
+// Every M4-* driver asserts record COUNTS (created_dir_records_count,
+// rmdir_undo_records_count) but never a record FIELD — a grep for
+// `path_len|comp_start_offsets|comp_lengths` across tests/ before this
+// file returned one comment and zero assertions. That is exactly why
+// the mkdir.ENH-005 bug (non-`-p` records always staged path_len == 0)
+// shipped inside a green M4: `test_m4_001_single_multi.pdx`'s single
+// scenario runs the EXACT `mkdir a` shape and only ever checked
+// created_dir_records_count == 1, never the record's own content.
+//
+// Two scenarios in one module (mirrors test_m4_001's single/multi
+// split):
+//   run_test_enh_record_fields_single — `mkdir a`, asserts
+//     created_dir_records[0].path_len == 1 and
+//     rmdir_undo_records[0].path_len == 1 (both record families read
+//     the same comp_start_offsets/comp_lengths mkdir.ENH-005 fixed).
+//   run_test_enh_record_fields_multi — `mkdir -p a/b/c`, asserts the
+//     three per-level path_len values (1, 3, 5 — the cumulative
+//     prefix lengths of "a", "a/b", "a/b/c") and that all three
+//     records share ONE path_ptr (the single "a/b/c" argv string all
+//     three levels are computed against).
+//
+// Test driver convention + paideia-as conformance identical to
+// tests/test_enh_multi_positional.pdx and every M4-* driver. Labels
+// prefixed `terfs_` (test-enh-record-fields-single) and `terfm_`
+// (test-enh-record-fields-multi).
+//
+// Upstream: design/enhancement-plan.md §5 (ENH-012).
+
+module TestEnhRecordFields = structure {
+
+  // ============================================================================
+  // Witness strings.
+  // ============================================================================
+
+  pub let ok_fields_single_msg : [u8; 32] = "mkdir.ENH-012 fields single OK\n\0"
+  pub let ok_fields_single_len : u64 = 31
+
+  pub let fail_fields_single_rc_msg : [u8; 37] =
+    "mkdir.ENH-012 fields single FAIL rc\n\0"
+  pub let fail_fields_single_rc_len : u64 = 36
+
+  pub let fail_fields_single_path_len_msg : [u8; 43] =
+    "mkdir.ENH-012 fields single FAIL path_len\n\0"
+  pub let fail_fields_single_path_len_len : u64 = 42
+
+  pub let fail_fields_single_rur_len_msg : [u8; 42] =
+    "mkdir.ENH-012 fields single FAIL rur_len\n\0"
+  pub let fail_fields_single_rur_len_len : u64 = 41
+
+  pub let ok_fields_multi_msg : [u8; 31] = "mkdir.ENH-012 fields multi OK\n\0"
+  pub let ok_fields_multi_len : u64 = 30
+
+  pub let fail_fields_multi_rc_msg : [u8; 36] =
+    "mkdir.ENH-012 fields multi FAIL rc\n\0"
+  pub let fail_fields_multi_rc_len : u64 = 35
+
+  pub let fail_fields_multi_path_len_msg : [u8; 42] =
+    "mkdir.ENH-012 fields multi FAIL path_len\n\0"
+  pub let fail_fields_multi_path_len_len : u64 = 41
+
+  pub let fail_fields_multi_path_ptr_msg : [u8; 42] =
+    "mkdir.ENH-012 fields multi FAIL path_ptr\n\0"
+  pub let fail_fields_multi_path_ptr_len : u64 = 41
+
+  // ============================================================================
+  // Bootstrap argv — single scenario: `mkdir a`.
+  // ============================================================================
+
+  pub let argv_rfs_a         : [u8; 2]  = "a\0"
+  pub let mut argv_rfs_ptrs  : [u64; 1] = uninit @align(8)
+  pub let argv_rfs_argc      : u64 = 1
+
+  // ============================================================================
+  // Bootstrap argv — multi scenario: `mkdir -p a/b/c`.
+  // ============================================================================
+
+  pub let argv_rfm_p         : [u8; 3]  = "-p\0"
+  pub let argv_rfm_abc       : [u8; 6]  = "a/b/c\0"
+  pub let mut argv_rfm_ptrs  : [u64; 2] = uninit @align(8)
+  pub let argv_rfm_argc      : u64 = 2
+
+  // ============================================================================
+  // run_test_enh_record_fields_single() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  //   rax = 0 on PASS, 1 on FAIL.
+  //
+  // CreatedDirRecord path_len lives at byte +8 of record 0 (base + 8).
+  // RmdirUndoRecord layout is 3 u64 fields/record (24 bytes); its
+  // path_len also lives at byte +8 of record 0.
+  //
+  // Register plan (all caller-save; no push/pop parity):
+  //   rax = state / record field loads
+  //   r11 = LEA scratch
+  // ============================================================================
+  pub let run_test_enh_record_fields_single : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.ENH-012 run_test_enh_record_fields_single — regression test for the mkdir.ENH-005 path_len == 0 bug on the non-`-p` path. Resets MkdirState + ParsedArgs, seeds bootstrap argv `a` (one positional, no flags — the exact shape test_m4_001's single scenario already exercises, but that driver never reads a record FIELD), calls parse_argv + parse_flags_from_argv + mkdir_run. Asserts exit_code == 0, then reads created_dir_records[0].path_len (byte +8 of the 32-byte-stride CreatedDirRecord array) and rmdir_undo_records[0].path_len (byte +8 of the 24-byte-stride RmdirUndoRecord array) and asserts BOTH == 1 (strlen(\"a\")) rather than the pre-ENH-005 value of 0. Any assert-fail emits its per-check FAIL diagnostic then returns 1; all-pass emits ok_fields_single_msg then returns 0. paideia-as conformance: no `test` mnemonic; r11 LEA scratch only; every cmp reg,imm <= 1; no push/pop parity — straight-line driver with only leaf-return calls. Labels prefixed terfs_ (test-enh-record-fields-single). Cross-module calls by unqualified linker name (mkdir_state_reset / reset / parse_argv / parse_flags_from_argv / mkdir_run / emit_stderr).",
+      block: {
+        call mkdir_state_reset;
+        call reset;
+
+        lea r11, [rip + argv_rfs_a];
+        lea rcx, [rip + argv_rfs_ptrs];
+        mov [rcx + 0], r11;
+
+        lea rdi, [rip + argv_rfs_ptrs];
+        mov rsi, 1;                               // argv_rfs_argc
+        call parse_argv;
+        cmp rax, 0;
+        jne terfs_fail_rc;
+
+        call parse_flags_from_argv;
+        call mkdir_run;
+
+        // exit_code == 0.
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne terfs_fail_rc;
+
+        // created_dir_records[0].path_len == 1.
+        lea r11, [rip + created_dir_records];
+        mov rax, [r11 + 8];
+        cmp rax, 1;
+        jne terfs_fail_path_len;
+
+        // rmdir_undo_records[0].path_len == 1.
+        lea r11, [rip + rmdir_undo_records];
+        mov rax, [r11 + 8];
+        cmp rax, 1;
+        jne terfs_fail_rur_len;
+
+        lea rdi, [rip + ok_fields_single_msg];
+        mov rsi, 31;                              // ok_fields_single_len
+        call emit_stderr;
+        xor rax, rax;
+        ret;
+
+      terfs_fail_rc:
+        lea rdi, [rip + fail_fields_single_rc_msg];
+        mov rsi, 36;                              // fail_fields_single_rc_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      terfs_fail_path_len:
+        lea rdi, [rip + fail_fields_single_path_len_msg];
+        mov rsi, 42;                              // fail_fields_single_path_len_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      terfs_fail_rur_len:
+        lea rdi, [rip + fail_fields_single_rur_len_msg];
+        mov rsi, 41;                              // fail_fields_single_rur_len_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // run_test_enh_record_fields_multi() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  //   rax = 0 on PASS, 1 on FAIL.
+  //
+  // `mkdir -p a/b/c` stages three CreatedDirRecord entries against the
+  // SAME "a/b/c" argv string (one positional, three levels). Record i
+  // lives at byte offset i*32; path_ptr @+0, path_len @+8 within each.
+  //
+  // Register plan (all caller-save; no push/pop parity):
+  //   rax/rcx/rdx = record field loads compared against each other
+  //   r11 = LEA scratch
+  // ============================================================================
+  pub let run_test_enh_record_fields_multi : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.ENH-012 run_test_enh_record_fields_multi — per-level path_len + shared path_ptr regression test. Resets MkdirState + ParsedArgs, seeds bootstrap argv `-p a/b/c`, calls parse_argv + parse_flags_from_argv + mkdir_run. Asserts exit_code == 0, then reads created_dir_records at fixed byte offsets (record i at i*32; path_len @+8, path_ptr @+0) to assert record[0].path_len == 1 (\"a\"), record[1].path_len == 3 (\"a/b\"), record[2].path_len == 5 (\"a/b/c\") -- the cumulative-prefix path_len invariant design/architecture.md SS4e documents -- and record[0].path_ptr == record[1].path_ptr == record[2].path_ptr (all three levels reference the SAME argv string; only path_len differs per level, per the CreatedDirRecord field-source table). Any assert-fail emits its per-check FAIL diagnostic then returns 1; all-pass emits ok_fields_multi_msg then returns 0. paideia-as conformance: no `test` mnemonic; r11 LEA scratch only; every cmp reg,imm <= 5; no push/pop parity. Labels prefixed terfm_ (test-enh-record-fields-multi). Cross-module calls by unqualified linker name (mkdir_state_reset / reset / parse_argv / parse_flags_from_argv / mkdir_run / emit_stderr).",
+      block: {
+        call mkdir_state_reset;
+        call reset;
+
+        lea rcx, [rip + argv_rfm_ptrs];
+        lea r11, [rip + argv_rfm_p];    mov [rcx + 0], r11;
+        lea r11, [rip + argv_rfm_abc];  mov [rcx + 8], r11;
+
+        lea rdi, [rip + argv_rfm_ptrs];
+        mov rsi, 2;                               // argv_rfm_argc
+        call parse_argv;
+        cmp rax, 0;
+        jne terfm_fail_rc;
+
+        call parse_flags_from_argv;
+        call mkdir_run;
+
+        // exit_code == 0.
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne terfm_fail_rc;
+
+        lea r11, [rip + created_dir_records];
+
+        // record[0].path_len == 1.
+        mov rax, [r11 + 8];
+        cmp rax, 1;
+        jne terfm_fail_path_len;
+
+        // record[1].path_len == 3.
+        mov rax, [r11 + 40];
+        cmp rax, 3;
+        jne terfm_fail_path_len;
+
+        // record[2].path_len == 5.
+        mov rax, [r11 + 72];
+        cmp rax, 5;
+        jne terfm_fail_path_len;
+
+        // record[0].path_ptr == record[1].path_ptr.
+        mov rax, [r11 + 0];
+        mov rcx, [r11 + 32];
+        cmp rax, rcx;
+        jne terfm_fail_path_ptr;
+
+        // record[0].path_ptr == record[2].path_ptr.
+        mov rdx, [r11 + 64];
+        cmp rax, rdx;
+        jne terfm_fail_path_ptr;
+
+        lea rdi, [rip + ok_fields_multi_msg];
+        mov rsi, 30;                              // ok_fields_multi_len
+        call emit_stderr;
+        xor rax, rax;
+        ret;
+
+      terfm_fail_rc:
+        lea rdi, [rip + fail_fields_multi_rc_msg];
+        mov rsi, 35;                              // fail_fields_multi_rc_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      terfm_fail_path_len:
+        lea rdi, [rip + fail_fields_multi_path_len_msg];
+        mov rsi, 41;                              // fail_fields_multi_path_len_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      terfm_fail_path_ptr:
+        lea rdi, [rip + fail_fields_multi_path_ptr_msg];
+        mov rsi, 41;                              // fail_fields_multi_path_ptr_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+      }
+    }
+}

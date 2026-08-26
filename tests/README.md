@@ -16,6 +16,32 @@ files that the paideia-os smoke matrix greps for.
 | M4-002 (#11)| `test_m4_002_mixed_pre_existing.pdx`               | `expected-mkdir-m4-002-mixed.txt`                               | LANDED |
 | M4-003 (#12)| `test_m4_003_txn_abort.pdx`                        | `expected-mkdir-m4-003-abort.txt`                               | LANDED |
 | M4-004 (#13)| `test_m4_004_cap_tail.pdx`                         | `expected-mkdir-m4-004-owner.txt`                               | LANDED |
+| ENH-012 (#27)| `test_enh_multi_positional.pdx`, `test_enh_record_fields.pdx`, `test_enh_path_guards.pdx` | `expected-mkdir-enh-multi-positional.txt`, `expected-mkdir-enh-fields-single.txt`, `expected-mkdir-enh-fields-multi.txt`, `expected-mkdir-enh-guards.txt` | LANDED |
+
+## ENH-012 — the gap the M4 matrix left open
+
+Every M4-* driver above invokes `mkdir_run` with exactly ONE positional
+(`argc` of 1, or 2 for `-p` plus one path), and asserts record COUNTS
+(`created_dir_records_count`, `rmdir_undo_records_count`) but never a
+record FIELD. That gap is exactly why the mkdir.ENH-004 (`..`
+containment escape), mkdir.ENH-005 (`path_len == 0` on the non-`-p`
+path), and mkdir.ENH-006 (TXN double-commit + record clobber across
+positionals) defects all shipped inside a green M4 matrix. `mkdir.ENH-012`
+adds the three drivers a green M4 was missing:
+
+- `test_enh_multi_positional.pdx` — `mkdir a b c` (three positionals,
+  the first invocation shape in this repo's matrix with more than
+  one). Asserts one shared TXN (`parent_txn_id` equal across all three
+  `CreatedDirRecord` entries) and per-positional `path_len` fields —
+  the mkdir.ENH-006 regression test.
+- `test_enh_record_fields.pdx` — two scenarios: `mkdir a` (asserts
+  `created_dir_records[0].path_len == 1`, not 0 — the mkdir.ENH-005
+  regression test) and `mkdir -p a/b/c` (asserts the per-level
+  cumulative `path_len` values 1/3/5 against one shared `path_ptr`).
+- `test_enh_path_guards.pdx` — `mkdir -p ../x` and
+  `mkdir -p a/../../x`, both asserting `MK_PARENT_REF_UNSUPPORTED`
+  (10) and `newly_created_count == 0` — the mkdir.ENH-004 regression
+  test.
 
 ## Test-driver convention (introduced at M4-001)
 

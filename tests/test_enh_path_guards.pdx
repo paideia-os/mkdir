@@ -1,0 +1,195 @@
+// tests/test_enh_path_guards.pdx — mkdir.ENH-012
+// TestEnhPathGuards module: '..' subtree-containment guard regression test.
+//
+// Per design/enhancement-plan.md §5 ENH-012 fingerprint:
+//   (c) "mkdir -p ../x -> the '..' rejection code, no cap invocation."
+//
+// mkdir.ENH-004's own fingerprint named two shapes: `mkdir -p ../x`
+// (a leading `..` component) and `mkdir -p a/../../x` (a `..`
+// component after a normal one). Both must return the new
+// MK_PARENT_REF_UNSUPPORTED (10) return code. This driver exercises
+// both in one module (Path A / Path B), mirroring test_m4_002 and
+// test_m4_003's two-path convention.
+//
+// "No cap invocation" is asserted indirectly: mkdir_split_path runs
+// entirely before mkdir_run's TXN open (src/mkdir.pdx Step 5 in
+// mkdir_run — see design/architecture.md SS4f), so a rejected split
+// means newly_created_count never advances past its reset-time value
+// of 0. This driver asserts exactly that alongside the return code.
+//
+// Test driver convention + paideia-as conformance identical to every
+// other ENH-012 / M4-* driver. Labels prefixed `tepg_` (test-enh-
+// path-guards).
+//
+// Upstream: design/enhancement-plan.md §5 (ENH-012), issue #19
+// (mkdir.ENH-004).
+
+module TestEnhPathGuards = structure {
+
+  // ============================================================================
+  // Witness strings.
+  // ============================================================================
+
+  pub let ok_guards_msg : [u8; 25] = "mkdir.ENH-012 guards OK\n\0"
+  pub let ok_guards_len : u64 = 24
+
+  pub let fail_guards_a_rc_msg : [u8; 32] = "mkdir.ENH-012 guards FAIL A rc\n\0"
+  pub let fail_guards_a_rc_len : u64 = 31
+
+  pub let fail_guards_a_created_msg : [u8; 37] =
+    "mkdir.ENH-012 guards FAIL A created\n\0"
+  pub let fail_guards_a_created_len : u64 = 36
+
+  pub let fail_guards_b_rc_msg : [u8; 32] = "mkdir.ENH-012 guards FAIL B rc\n\0"
+  pub let fail_guards_b_rc_len : u64 = 31
+
+  pub let fail_guards_b_created_msg : [u8; 37] =
+    "mkdir.ENH-012 guards FAIL B created\n\0"
+  pub let fail_guards_b_created_len : u64 = 36
+
+  // ============================================================================
+  // Bootstrap argv — Path A: `mkdir -p ../x` (leading `..` component).
+  // ============================================================================
+
+  pub let argv_pg_a_p        : [u8; 3] = "-p\0"
+  pub let argv_pg_a_path     : [u8; 5] = "../x\0"
+  pub let mut argv_pg_a_ptrs : [u64; 2] = uninit @align(8)
+  pub let argv_pg_a_argc     : u64 = 2
+
+  // ============================================================================
+  // Bootstrap argv — Path B: `mkdir -p a/../../x` (`..` after a normal
+  // component, and two levels of parent-reference in a row).
+  // ============================================================================
+
+  pub let argv_pg_b_p        : [u8; 3] = "-p\0"
+  pub let argv_pg_b_path     : [u8; 10] = "a/../../x\0"
+  pub let mut argv_pg_b_ptrs : [u64; 2] = uninit @align(8)
+  pub let argv_pg_b_argc     : u64 = 2
+
+  // ============================================================================
+  // run_test_enh_path_guards() -> u64
+  //
+  // Signature: () -> u64 !{mem, sysreg} @{cap}
+  //   rax = 0 on PASS, 1 on FAIL.
+  //
+  // Path A: `mkdir -p ../x`. Asserts exit_code == 10
+  // (MK_PARENT_REF_UNSUPPORTED) and newly_created_count == 0 (nothing
+  // was created before the split rejected the path).
+  //
+  // Path B: `mkdir -p a/../../x`. Same two assertions, over a path
+  // whose first component ("a") is ordinary and whose second and third
+  // components are both exactly "..".
+  //
+  // Register plan (all caller-save; no push/pop parity):
+  //   rax = state loads / call return
+  //   rdi/rsi = call args (SysV)
+  //   r11 = LEA scratch
+  // ============================================================================
+  pub let run_test_enh_path_guards : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mkdir.ENH-012 run_test_enh_path_guards — regression test for the mkdir.ENH-004 subtree-containment guard. Path A resets MkdirState + ParsedArgs, seeds bootstrap argv `-p ../x`, invokes parse_argv + parse_flags_from_argv + mkdir_run, and asserts exit_code == 10 (MK_PARENT_REF_UNSUPPORTED) AND newly_created_count == 0 (mkdir_split_path rejects the leading '..' component before mkdir_run's TXN open / before mkdir_one's create walk ever runs, so nothing advances the counter). Path B repeats with `-p a/../../x` (an ordinary first component followed by two '..' components in a row) and asserts the same two invariants. Both paths must pass for ok_guards_msg to emit; per-check FAIL diagnostics prefixed A / B so a regression in either shape localises. paideia-as conformance: no `test` mnemonic; r11 LEA scratch only; every cmp reg,imm <= 10; no push/pop parity — straight-line driver with only leaf-return calls. Labels prefixed tepg_ (test-enh-path-guards). Cross-module calls by unqualified linker name (mkdir_state_reset / reset / parse_argv / parse_flags_from_argv / mkdir_run / emit_stderr).",
+      block: {
+        // ==========================================================
+        // Path A — `mkdir -p ../x`.
+        // ==========================================================
+
+        call mkdir_state_reset;
+        call reset;
+
+        lea rcx, [rip + argv_pg_a_ptrs];
+        lea r11, [rip + argv_pg_a_p];     mov [rcx + 0], r11;
+        lea r11, [rip + argv_pg_a_path];  mov [rcx + 8], r11;
+
+        lea rdi, [rip + argv_pg_a_ptrs];
+        mov rsi, 2;                               // argv_pg_a_argc
+        call parse_argv;
+        cmp rax, 0;
+        jne tepg_fail_a_rc;
+
+        call parse_flags_from_argv;
+        call mkdir_run;
+
+        // exit_code == 10 (MK_PARENT_REF_UNSUPPORTED).
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 10;
+        jne tepg_fail_a_rc;
+
+        // newly_created_count == 0 (rejected before any create).
+        lea r11, [rip + newly_created_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tepg_fail_a_created;
+
+        // ==========================================================
+        // Path B — `mkdir -p a/../../x`.
+        // ==========================================================
+
+        call mkdir_state_reset;
+        call reset;
+
+        lea rcx, [rip + argv_pg_b_ptrs];
+        lea r11, [rip + argv_pg_b_p];     mov [rcx + 0], r11;
+        lea r11, [rip + argv_pg_b_path];  mov [rcx + 8], r11;
+
+        lea rdi, [rip + argv_pg_b_ptrs];
+        mov rsi, 2;                               // argv_pg_b_argc
+        call parse_argv;
+        cmp rax, 0;
+        jne tepg_fail_b_rc;
+
+        call parse_flags_from_argv;
+        call mkdir_run;
+
+        // exit_code == 10 (MK_PARENT_REF_UNSUPPORTED).
+        lea r11, [rip + exit_code];
+        mov rax, [r11];
+        cmp rax, 10;
+        jne tepg_fail_b_rc;
+
+        // newly_created_count == 0.
+        lea r11, [rip + newly_created_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tepg_fail_b_created;
+
+        // ==========================================================
+        // Both paths OK.
+        // ==========================================================
+        lea rdi, [rip + ok_guards_msg];
+        mov rsi, 24;                              // ok_guards_len
+        call emit_stderr;
+        xor rax, rax;
+        ret;
+
+      tepg_fail_a_rc:
+        lea rdi, [rip + fail_guards_a_rc_msg];
+        mov rsi, 31;                              // fail_guards_a_rc_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      tepg_fail_a_created:
+        lea rdi, [rip + fail_guards_a_created_msg];
+        mov rsi, 36;                              // fail_guards_a_created_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      tepg_fail_b_rc:
+        lea rdi, [rip + fail_guards_b_rc_msg];
+        mov rsi, 31;                              // fail_guards_b_rc_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+
+      tepg_fail_b_created:
+        lea rdi, [rip + fail_guards_b_created_msg];
+        mov rsi, 36;                              // fail_guards_b_created_len
+        call emit_stderr;
+        mov rax, 1;
+        ret;
+      }
+    }
+}

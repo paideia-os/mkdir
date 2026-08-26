@@ -76,6 +76,18 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   four — that section is part of the signed manifest body (frozen at
   v1.0 per plan.md §D4) and is reconciled at the next signed manifest
   revision, not hand-edited here.
+- **ENH-012 (#27)** — extended the test matrix with the three shapes
+  the M4 matrix never exercised: `test_enh_multi_positional.pdx`
+  (`mkdir a b c` — one shared TXN + per-positional record fields, the
+  mkdir.ENH-006 regression test), `test_enh_record_fields.pdx`
+  (`mkdir a` asserting `created_dir_records[0].path_len == 1` not 0 —
+  mkdir.ENH-005 — plus `mkdir -p a/b/c` asserting per-level `path_len`
+  1/3/5 against one shared `path_ptr`), and `test_enh_path_guards.pdx`
+  (`mkdir -p ../x` and `mkdir -p a/../../x`, both asserting
+  `MK_PARENT_REF_UNSUPPORTED` — mkdir.ENH-004). Every prior M4 driver
+  asserted record COUNTS only, never a record FIELD, and used exactly
+  one positional — that gap is why all three defects shipped inside a
+  green M4.
 
 ## 1.0.0 — 2026-08-22 — first signed release
 
