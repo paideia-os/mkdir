@@ -176,6 +176,21 @@ module Mkdir = structure {
     "mkdir 1.0.0 (build unknown) sig=placeholder\n\0"
   pub let version_len : u64 = 44
 
+  // ---- mkdir.ENH-011 -v per-level emission ----
+  //
+  // Two static pieces bracket the DYNAMIC path substring (path_ptr,
+  // path_len — the same cumulative-prefix pair Step 6e/6f already
+  // compute for CreatedDirRecord/RmdirUndoRecord): the constant prefix
+  // "mkdir: created " and a trailing newline. Three emit_stderr calls
+  // per created level rather than one, since there is no in-tree
+  // strcat/sprintf helper to compose a single buffer from a static
+  // prefix + a dynamic-length argv substring + a static suffix.
+  pub let verbose_created_msg : [u8; 16] = "mkdir: created \0"
+  pub let verbose_created_len : u64 = 15
+
+  pub let verbose_newline_msg : [u8; 2] = "\n\0"
+  pub let verbose_newline_len : u64 = 1
+
   // ============================================================================
   // Bootstrap argv (mkdir.M1-002 self-test)
   //
@@ -713,7 +728,9 @@ module Mkdir = structure {
   //          comp_start_offsets[0] / comp_lengths[0] (mkdir.ENH-005)
   //          so the walk-loop shape AND the Step 6e/6f path_len
   //          computation are both unified with the `-p` split path.
-  //   3. -v diagnostic. DEFERRED at M2-001 (see M3-001).
+  //   3. -v diagnostic. Numbered placeholder only — mkdir.ENH-011
+  //      implements the actual emit at Step 6g (per created level,
+  //      inside the walk), since path_len isn't known until then.
   //   4. --dry-run short-circuit. Returns MK_OK AFTER the split has
   //      validated the path — so `mkdir -p --dry-run /abs/path`
   //      still surfaces MK_ABS_PATH_UNSUPPORTED, matching POSIX
@@ -734,6 +751,14 @@ module Mkdir = structure {
   //            positional), so record indices append across
   //            positionals instead of clobbering index 0.
   //        6c. Cap-tail owner write — DEFERRED to mkdir.M2-003.
+  //        6g. mkdir.ENH-011: IFF flag_v == 1, emit
+  //            `mkdir: created <cumulative-prefix>\n` via three
+  //            emit_stderr calls (static prefix, path_ptr/path_len,
+  //            static newline). Reached only by levels that were
+  //            actually created this call — the Step 6a
+  //            pre-existence-hit path jumps straight to
+  //            mkdir_one_advance_walk, skipping 6b-6g entirely, so
+  //            pre-existing levels under -p emit nothing.
   //        (Pre-existing dir handling — DEFERRED to mkdir.M2-002.
   //         At M2-001 every component in the walk is treated as
   //         newly-created; the M2-002 branch adds an existence
@@ -763,7 +788,7 @@ module Mkdir = structure {
   pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 + mkdir.ENH-006 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6a create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref); M3-003 adds one RmdirUndoRecord per newly-created level in the same beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay). mkdir.ENH-006 removes the TXN open (formerly Step 5) and the TXN commit + CDR/RUR count freeze (formerly Step 7) from this function entirely: mkdir_one is called ONCE PER POSITIONAL by mkdir_run, but a TXN is scoped to the WHOLE invocation, so mkdir_run now opens ONE shared TXN before its positional loop (stashing current_txn_id once, read here unchanged at Step 6e/6f) and performs the freeze + single commit once after every positional returns MK_OK. This function also no longer zeroes newly_created_count at Step 6 entry — it is now an invocation-wide running total that mkdir_run resets exactly once, so record indices (newly_created_count - 1) append across positionals (`mkdir a b c` stages 3 CDR/RUR entries at indices 0..2) instead of every positional past the first clobbering index 0 and hitting MK_TXN_COMMIT_FAIL against an already-COMMITTED row. walk_i IS still reset per call — it is this call's LOCAL index into comp_start_offsets/comp_lengths/comp_pre_existed, freshly repopulated by mkdir_split_path (or the no-slash branch) on every call. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED, MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004: a component of exactly two bytes \"..\"), or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 AND populate comp_start_offsets[0] = 0 / comp_lengths[0] = strlen(path) (mkdir.ENH-005 — reusing rcx, which already points at path's NUL terminator from the Step 1 scan) so the walk-loop shape AND the path_len computation at Step 6e/6f are both unified with the `-p` split path. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) elided — see mkdir_run. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) elided — see mkdir_run; the walk falls through to mkdir_one_ok when walk_i reaches comp_count. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
+      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 + mkdir.ENH-006 + mkdir.ENH-011 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6a create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref); M3-003 adds one RmdirUndoRecord per newly-created level in the same beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay). mkdir.ENH-006 removes the TXN open (formerly Step 5) and the TXN commit + CDR/RUR count freeze (formerly Step 7) from this function entirely: mkdir_one is called ONCE PER POSITIONAL by mkdir_run, but a TXN is scoped to the WHOLE invocation, so mkdir_run now opens ONE shared TXN before its positional loop (stashing current_txn_id once, read here unchanged at Step 6e/6f) and performs the freeze + single commit once after every positional returns MK_OK. This function also no longer zeroes newly_created_count at Step 6 entry — it is now an invocation-wide running total that mkdir_run resets exactly once, so record indices (newly_created_count - 1) append across positionals (`mkdir a b c` stages 3 CDR/RUR entries at indices 0..2) instead of every positional past the first clobbering index 0 and hitting MK_TXN_COMMIT_FAIL against an already-COMMITTED row. walk_i IS still reset per call — it is this call's LOCAL index into comp_start_offsets/comp_lengths/comp_pre_existed, freshly repopulated by mkdir_split_path (or the no-slash branch) on every call. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED, MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004: a component of exactly two bytes \"..\"), or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 AND populate comp_start_offsets[0] = 0 / comp_lengths[0] = strlen(path) (mkdir.ENH-005 — reusing rcx, which already points at path's NUL terminator from the Step 1 scan) so the walk-loop shape AND the path_len computation at Step 6e/6f are both unified with the `-p` split path. (3) -v is a numbered placeholder only — the actual emit is at Step 6g below. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) elided — see mkdir_run. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (6g) mkdir.ENH-011: IFF flag_v == 1, three emit_stderr calls (static \"mkdir: created \" prefix, then rbx/path_len — the same cumulative-prefix pair Step 6e/6f compute, recomputed here since it is not left live in a register — then a static newline); reached only by actually-created levels (the Step 6a exists-hit jumps straight to mkdir_one_advance_walk, past this beat). (7) elided — see mkdir_run; the walk falls through to mkdir_one_ok when walk_i reaches comp_count. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
       block: {
         // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
         push rbx;
@@ -871,7 +896,11 @@ module Mkdir = structure {
         cmp rax, 0;
         je  mkdir_one_ok;
 
-        // ---- Step 3: -v emission deferred (M3-001). ----
+        // ---- Step 3: -v emission. mkdir.ENH-011 moved the actual
+        // emit to Step 6g (per created level, inside the walk below —
+        // path_len isn't known until then), so there is nothing to do
+        // at this Step-3 beat itself; kept as a numbered placeholder
+        // so the step list here stays 1:1 with design/architecture.md. ----
 
         // ---- Step 4: --dry-run short-circuit AFTER split validation. ----
         lea r11, [rip + flag_dry_run];
@@ -1147,6 +1176,39 @@ module Mkdir = structure {
         lea r11, [rip + current_txn_id];
         mov rax, [r11];
         mov [r10 + 16], rax;                     // parent_txn_id
+
+        // ---- Step 6g (mkdir.ENH-011): -v per-level emission. ----
+        // Only levels that reach this point were actually created this
+        // call (Step 6a's pre-existence-hit jumps straight to
+        // mkdir_one_advance_walk below, skipping this beat entirely —
+        // so pre-existing levels under -p emit nothing, matching the
+        // fingerprint). path_len is recomputed rather than reused from
+        // a live register (the RUR staging above did not leave it live
+        // in any GPR after the parent_txn_id store).
+        lea r11, [rip + flag_v];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mkdir_one_advance_walk;
+
+        lea rdi, [rip + verbose_created_msg];
+        mov rsi, 15;                              // verbose_created_len
+        call emit_stderr;
+
+        lea r11, [rip + walk_i];
+        mov rdx, [r11];                           // walk_i
+        lea r11, [rip + comp_start_offsets];
+        mov rax, [r11 + rdx*8];
+        lea r11, [rip + comp_lengths];
+        mov r9, [r11 + rdx*8];
+        add rax, r9;                              // path_len (cumulative prefix)
+
+        mov rdi, rbx;                             // path base (unchanged since prologue)
+        mov rsi, rax;                             // path_len
+        call emit_stderr;
+
+        lea rdi, [rip + verbose_newline_msg];
+        mov rsi, 1;                                // verbose_newline_len
+        call emit_stderr;
 
       mkdir_one_advance_walk:
         // Advance walk_i.

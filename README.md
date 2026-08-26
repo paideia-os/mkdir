@@ -78,7 +78,7 @@ recognised by the v1.0 recogniser.
 | Flag | State slot | Effect |
 |---|---|---|
 | `-p` | `flag_p` | Create parent directories. Lifts the multi-level `/` guard and routes the path through `mkdir_split_path`; every level lives in one TXN scope; pre-existing levels are no-ops, not errors. |
-| `-v` | `flag_v` | Parsed and stored, but **emits nothing at v1.0** — the verbose emission in `mkdir_one` Step 3 is still deferred. |
+| `-v` | `flag_v` | Emits `mkdir: created <path>\n` per created level (mkdir.ENH-011, Step 6g) — `<path>` is the same cumulative-prefix `path_len` the `CreatedDirRecord`/`RmdirUndoRecord` staging computes. Pre-existing levels under `-p` and `--dry-run` invocations emit nothing. |
 | `--dry-run` | `flag_dry_run` | Short-circuit to `MK_OK` *after* the path split has validated the path, before the TXN open. `mkdir -p --dry-run /abs` still returns `MK_ABS_PATH_UNSUPPORTED`. |
 
 ## Exit codes
@@ -161,6 +161,13 @@ seeds five (`_init_caps_count = 5`), the fifth added at M3-002:
     $ mkdir a b c
     $ echo $?
     0
+
+    # Verbose (mkdir.ENH-011): one line per created level, using the
+    # same cumulative-prefix path_len the record staging computes.
+    $ mkdir -pv x/y/z
+    mkdir: created x
+    mkdir: created x/y
+    mkdir: created x/y/z
 
 ## Audit records
 

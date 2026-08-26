@@ -119,13 +119,16 @@ The M1 body:
    lands the multi-level TXN. The M1 code path is intentionally
    permissive of the flag on the argv and strict on the path, so an M2
    patch does not have to rewrite the CLI grammar to enable it.
-2. **-v diagnostic** (if `flag_v == 1`). DEFERRED at M1-003: the
-   verbose line lands with the `CreatedDirRecord` text-render at
-   `mkdir.M3-001`. Emitting the path here at M1 needs a `strlen`
-   helper `sys_debug_puts` demands a byte-count; the M3 semantic-pipe
-   send_record carries a typed record so `strlen` is not needed on the
-   `-v` path once M3 lands. `flag_v` is stored at M1-002 and read at
-   M3-001; M1-003 does not read it.
+2. **-v diagnostic** (if `flag_v == 1`). DEFERRED at M1-003 — this was
+   the original plan text, predicting the verbose line would land with
+   the `CreatedDirRecord` text-render at `mkdir.M3-001`. **It did not**:
+   M3-001 shipped without it (Step 3 in `mkdir_one` stayed a no-op
+   comment), and it actually landed at `mkdir.ENH-011` — not as a
+   text-render of the schema record, but as three plain `emit_stderr`
+   calls per created level (§4e / Step 6g), reusing the same
+   `path_ptr` + cumulative-prefix `path_len` pair the `CreatedDirRecord`
+   staging already computes. `flag_v` is stored at M1-002 and read at
+   `mkdir_one` Step 6g.
 3. **--dry-run short-circuit** (if `flag_dry_run == 1`). Return `MK_OK`
    without touching either cap. This branch exists at M1 so downstream
    tests can exercise the argv path in isolation from the still-being-
@@ -399,8 +402,12 @@ per-path validation does not weaken the containment guarantee.
 |             | guard when `flag_p == 1` and routes the path through     | is M2-002; cap-tail stamp is  |
 |             | `mkdir_split_path`. Walk iterates over `comp_count`      | M2-003.                       |
 |             | components in a single TXN scope.                        |                               |
-| `-v`        | Detected + stored. `mkdir_one` emits a stderr line per   | Format upgraded to `CreatedDirRecord` |
-|             | created directory.                                       | text-render at M3-001.        |
+| `-v`        | LANDED at mkdir.ENH-011. `mkdir_one` Step 6g emits       | Corrected: this table          |
+|             | `mkdir: created <path>` per created level (not per       | previously said "emitted a     |
+|             | pre-existing level, not on `--dry-run`).                 | stderr line" at M1 — it did    |
+|             |                                                           | not; the flag was detected +   |
+|             |                                                           | stored but Step 3 was a no-op  |
+|             |                                                           | comment until ENH-011.         |
 | `--dry-run` | Detected + stored. `mkdir_one` returns `MK_OK` before    | Unchanged; extended at M4-004 |
 |             | touching either cap.                                     | cap-tail correctness test.    |
 | positional  | `ParsedArgs::pos_ptrs[0..pos_count]`. Every positional   | Unchanged.                    |

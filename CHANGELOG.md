@@ -59,6 +59,13 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   mkdir's actual cap-delivery enforcement is the kernel loader's
   InitCap validator (`init_caps_validate`), which runs against
   `_init_caps` at image-load time — the docs now say so.
+- **ENH-011 (#26)** — implemented `-v`: `mkdir_one` Step 6g now emits
+  `mkdir: created <path>` per created level via three `emit_stderr`
+  calls (static prefix, the same cumulative-prefix `path_ptr`/`path_len`
+  the `CreatedDirRecord`/`RmdirUndoRecord` staging computes, static
+  newline). Pre-existing levels under `-p` and `--dry-run` invocations
+  emit nothing, matching `doc/mkdir.pdxdoc`'s existing (previously
+  false) description.
 
 ## 1.0.0 — 2026-08-22 — first signed release
 
