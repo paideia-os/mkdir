@@ -72,15 +72,18 @@ module MkdirState = structure {
   //     ordinals ship in the R42-PREP-007 (#1629) substrate at
   //     `src/kernel/core/cap/kind_pdxfs_txn.pdx` L115-119.
   //
-  //     Step 5's TXN open remains `PXT_OP_QUERY_ID (0)`: the TXN cap
-  //     at SLOT_TXN is pre-opened by the shell via cap_transfer (see
+  //     The TXN open remains `PXT_OP_QUERY_ID (0)`: the TXN cap at
+  //     SLOT_TXN is pre-opened by the shell via cap_transfer (see
   //     _init_caps entry 0 in src/mkdir.pdx), so mkdir does NOT mint a
   //     fresh TXN via sys_pdxfs_txn_open (sysno 70). QUERY_ID reads
-  //     the pre-opened row's txn_id, which M3-001 captures into
-  //     `current_txn_id` for the CreatedDirRecord.parent_txn_id
-  //     field. The shell-owns-TXN pattern preserves mkdir's single-
-  //     cap-set invocation contract (four caps in caps.decl, no
-  //     additional KIND_MEMORY mint parent).
+  //     the pre-opened row's txn_id, captured into `current_txn_id`
+  //     for every CreatedDirRecord.parent_txn_id field. As of
+  //     mkdir.ENH-006 this open (and the matching commit) happens
+  //     ONCE per invocation in `mkdir_run`, not once per positional in
+  //     `mkdir_one` — see mkdir_run's doc comment in src/mkdir.pdx.
+  //     The shell-owns-TXN pattern preserves mkdir's single-cap-set
+  //     invocation contract (four caps in caps.decl, no additional
+  //     KIND_MEMORY mint parent).
   pub let PXT_OP_QUERY_ID     : u64 = 0
   pub let PXT_OP_QUERY_STATE  : u64 = 4
   pub let PFF_OP_DEBUG_PRINT  : u64 = 6
@@ -92,9 +95,17 @@ module MkdirState = structure {
   //     return. PXT_OP_COMMIT is a REAL state transition (OPEN ->
   //     COMMITTED); a duplicate commit returns PXT_BAD_TRANSITION
   //     (0xFFFFEC15) which IS negative-shaped (top nibble 0xF) and
-  //     would route to mkdir_one_commit_fail. mkdir is a one-shot
-  //     process per _start invocation, so the second-commit edge is
-  //     unreachable at v1.0.
+  //     would route to mkdir_run_commit_fail (src/mkdir.pdx). mkdir is
+  //     a one-shot process per _start invocation AND (as of
+  //     mkdir.ENH-006) issues exactly one PXT_OP_COMMIT per
+  //     invocation regardless of how many positionals it walks — the
+  //     TXN open/commit pair lives in `mkdir_run`, not `mkdir_one`, so
+  //     the duplicate-commit edge described here is unreachable by
+  //     construction, not merely by the one-shot-process argument that
+  //     used to be the only thing preventing it. See mkdir_run's doc
+  //     comment in src/mkdir.pdx for the ENH-006 fix (`mkdir a b c`
+  //     previously issued one commit per positional and the second
+  //     one always hit this exact PXT_BAD_TRANSITION path).
   pub let PXT_OP_COMMIT       : u64 = 7
   pub let PXT_OP_CREATE       : u64 = 9
 

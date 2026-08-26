@@ -96,6 +96,13 @@ rax = MK_OK on success or one of MK_TXN_OPEN_FAIL / MK_MKDIR_FAIL /
       MK_TXN_COMMIT_FAIL / MK_MULTI_LEVEL_UNSUPPORTED
 ```
 
+> **Superseded by §4f (`mkdir.ENH-006`).** The signature above and
+> Steps 4/7 below describe the M1 baseline, where `mkdir_one` itself
+> opened and committed the TXN. As of `mkdir.ENH-006`, TXN open/commit
+> live in `mkdir_run` instead (§4f) — `mkdir_one` no longer returns
+> `MK_TXN_OPEN_FAIL` or `MK_TXN_COMMIT_FAIL`; those are `mkdir_run`
+> return states now. Steps 1-3 and 6 below are still current.
+
 The M1 body:
 
 1. **Multi-level guard.** Walk `path` looking for `'/'` (0x2F). Any hit
@@ -323,6 +330,59 @@ consumer walks the staged records and marshals them through the
 `KIND_IPC_ENDPOINT` at slot 3 — until that library lands, the records
 live in `.bss` for the `M3-002` audit hook and the `M3-003` undo record
 to read.
+
+## 4f. `mkdir.ENH-006` — TXN lifecycle hoisted from `mkdir_one` to `mkdir_run`
+
+The public synopsis (`README.md`, `doc/mkdir.pdxdoc`, this document's
+§1) has always advertised `mkdir [-p] [-v] [--dry-run] <path> [<path>...]`,
+and `mkdir_run` has always walked every positional. But through M3-003,
+§4's Steps 4 (open) and 7 (commit) lived inside `mkdir_one`, which is
+called ONCE PER POSITIONAL — so a TXN meant to span the whole
+invocation was instead being opened and committed once per path:
+
+- **Double commit.** Positional 2's Step 7 issued `PXT_OP_COMMIT`
+  against the SAME pre-opened `SLOT_TXN` row that positional 1 had
+  already transitioned to `COMMITTED`, hitting `PXT_BAD_TRANSITION`
+  (negative) and failing `MK_TXN_COMMIT_FAIL`.
+- **Record clobber.** Step 6 zeroed `newly_created_count` at the top of
+  every `mkdir_one` call, and `CreatedDirRecord` / `RmdirUndoRecord`
+  indices are `newly_created_count - 1` — so positional 2's records
+  overwrote positional 1's at index 0, and positional 1's undo record
+  was lost even before the double-commit failure surfaced.
+
+`mkdir.ENH-006` fixes both by relocating the TXN open (§4 Step 4) and
+the commit + count-freeze (§4 Step 7) out of `mkdir_one` and into
+`mkdir_run`, which now:
+
+1. Resets `newly_created_count` to 0 exactly ONCE, before the
+   positional loop (not inside `mkdir_one` per call).
+2. IF `flag_dry_run == 0`: opens ONE shared TXN
+   (`sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID)`) and stashes
+   `current_txn_id` once, before the loop. IF `flag_dry_run == 1`:
+   skips this — every `mkdir_one` call short-circuits at its own Step 3
+   before touching a cap, so there is nothing to open.
+3. Calls `mkdir_one(path)` once per positional exactly as before; each
+   call now performs ONLY Steps 1-3 + 6 (the create walk) and reads the
+   already-populated `current_txn_id` — it neither opens nor commits.
+   `newly_created_count` is a running total across every call in the
+   invocation, so record indices append (`mkdir a b c` stages CDR/RUR
+   entries at indices 0..2) instead of colliding at index 0.
+4. On the first non-`MK_OK` return, records `exit_code` + `err_pos_index`
+   and returns WITHOUT freezing the CDR/RUR counts or committing — the
+   shared TXN is left uncommitted, so nothing this invocation staged is
+   persisted (the same "staged, never committed" state §4e's Step 7
+   already guaranteed on a single-positional failure, now guaranteed
+   invocation-wide).
+5. If every positional returns `MK_OK` and `flag_dry_run == 0`: freezes
+   `created_dir_records_count` / `rmdir_undo_records_count` ==
+   `newly_created_count` and issues exactly ONE
+   `sys_cap_invoke(SLOT_TXN, PXT_OP_COMMIT)` for the whole invocation.
+
+`mkdir_split_path`'s `mkdir.ENH-004` `..`-rejection guard (§4a) still
+runs before any op that consumes the path being validated (Step 6's
+probe/create/stamp) — the TXN-open call that now precedes it takes no
+path argument and cannot navigate anywhere, so hoisting it ahead of
+per-path validation does not weaken the containment guarantee.
 
 ## 5. Flag semantics at M1
 

@@ -21,6 +21,18 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   every `CreatedDirRecord` / `RmdirUndoRecord` staged by a plain
   `mkdir a` carried `path_len == 0` (unrenderable by `ls --long`,
   unremovable by `undo`).
+- **ENH-006 (#21)** — hoisted TXN open + commit out of `mkdir_one`
+  (called once per positional) into `mkdir_run` (called once per
+  invocation), fixing two bugs in `mkdir a b c`: every positional past
+  the first used to issue its own `PXT_OP_COMMIT` against the
+  already-COMMITTED shared TXN row and fail `MK_TXN_COMMIT_FAIL`
+  (double commit), and `newly_created_count` was reset to 0 at the top
+  of every `mkdir_one` call, so each positional's `CreatedDirRecord` /
+  `RmdirUndoRecord` overwrote the previous one at index 0 (record
+  clobber). `mkdir_run` now opens one TXN, calls `mkdir_one` per
+  positional (records now append via a running `newly_created_count`),
+  and issues one commit only after every positional succeeds; a
+  failure anywhere leaves the shared TXN uncommitted.
 
 ## 1.0.0 — 2026-08-22 — first signed release
 

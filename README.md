@@ -26,17 +26,22 @@ Install:
 The `TOOL_INVOKE` record is emitted *before* any argv work, so a tool
 cannot suppress its own audit trail (D3 audit-first).
 
-`mkdir_run` walks `pos_ptrs[0..pos_count]` and calls `mkdir_one` per
-path, **fail-fast**: the first non-zero return is recorded in
-`exit_code` plus `err_pos_index` and the walk stops. `mkdir_one` opens
-the TXN scope once (`PXT_OP_QUERY_ID` on slot 0 — the TXN cap is
-pre-opened by the spawning shell, mkdir never mints one), then walks
-path components. Per component it probes for pre-existence
-(`PFF_OP_QUERY_INODE` on slot 1), creates (`PXT_OP_CREATE` = 9 on
-slot 0), stamps the owner (`USER_OP_QUERY_FP0` on slot 2), and stages
-one `CreatedDirRecord` + one `RmdirUndoRecord`. Both record counts are
-frozen to `newly_created_count` *before* the `PXT_OP_COMMIT` (= 7)
-syscall, so a commit failure leaves records and undo log in a
+`mkdir_run` owns the TXN scope for the **whole invocation** (mkdir.ENH-006):
+it opens the TXN once (`PXT_OP_QUERY_ID` on slot 0 — the TXN cap is
+pre-opened by the spawning shell, mkdir never mints one) before walking
+`pos_ptrs[0..pos_count]`, then calls `mkdir_one` per path,
+**fail-fast**: the first non-zero return is recorded in `exit_code`
+plus `err_pos_index` and the walk stops *without* committing, so
+nothing any positional staged is persisted. `mkdir_one` no longer opens
+or commits a TXN itself — it only walks path components. Per component
+it probes for pre-existence (`PFF_OP_QUERY_INODE` on slot 1), creates
+(`PXT_OP_CREATE` = 9 on slot 0), stamps the owner (`USER_OP_QUERY_FP0`
+on slot 2), and stages one `CreatedDirRecord` + one `RmdirUndoRecord`
+at an index in a running, invocation-wide `newly_created_count` (so
+`mkdir a b c` stages three of each, not one overwritten three times).
+Once every positional returns `MK_OK`, `mkdir_run` freezes both record
+counts to `newly_created_count` *before* the single `PXT_OP_COMMIT`
+(= 7) syscall, so a commit failure leaves records and undo log in a
 consistent "staged, never committed" state. Pre-existing levels skip
 create, do not advance `newly_created_count`, and get no records — so
 undo of `mkdir -p a/b/c` where `a` existed removes only `a/b/c` and
@@ -148,6 +153,13 @@ seeds five (`_init_caps_count = 5`), the fifth added at M3-002:
     mkdir: absolute path unsupported at M2
     $ echo $?                                     # MK_ABS_PATH_UNSUPPORTED
     7
+
+    # Multi-positional: one shared TXN across every operand
+    # (mkdir.ENH-006). Three CreatedDirRecord + three RmdirUndoRecord
+    # entries (indices 0..2, one per operand), one PXT_OP_COMMIT.
+    $ mkdir a b c
+    $ echo $?
+    0
 
 ## Audit records
 

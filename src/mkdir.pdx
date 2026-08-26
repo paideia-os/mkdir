@@ -451,13 +451,19 @@ module Mkdir = structure {
   //     `mkdir -p ""` idempotence.
   //   - mkdir.ENH-004: a component of exactly two bytes ".." is
   //     rejected with MK_PARENT_REF_UNSUPPORTED, checked at the same
-  //     close site as the too-deep gate (before any cap invocation —
-  //     mkdir_one calls this before Step 5's TXN open). This is the
-  //     subtree containment guard: the leading-'/' check alone does
-  //     not stop `mkdir -p ../../etc` from walking outside the
-  //     invoker's own subtree. A component that merely CONTAINS ".."
-  //     (`..foo`, `foo..`) is ordinary and NOT rejected — only an
-  //     exact two-byte "..\0"/".."+'/' match trips the guard.
+  //     close site as the too-deep gate — before any op that touches
+  //     THIS path (mkdir_one calls this before Step 6's per-component
+  //     probe/create/stamp). This is the subtree containment guard:
+  //     the leading-'/' check alone does not stop `mkdir -p ../../etc`
+  //     from walking outside the invoker's own subtree. A component
+  //     that merely CONTAINS ".." (`..foo`, `foo..`) is ordinary and
+  //     NOT rejected — only an exact two-byte "..\0"/".."+'/' match
+  //     trips the guard. (mkdir.ENH-006 hoists the invocation-wide TXN
+  //     open into mkdir_run, ahead of this per-path validation — that
+  //     open takes no path argument and cannot navigate anywhere, so
+  //     it does not weaken the containment guarantee; it is Step 6's
+  //     per-component ops, which DO carry this path, that this check
+  //     still gates.)
   //
   // Leaf function; no calls; no push/pop parity to preserve. Uses only
   // caller-save regs (rax/rcx/rdx/r8/r10/r11).
@@ -607,22 +613,35 @@ module Mkdir = structure {
     }
 
   // ============================================================================
-  // mkdir_one(path) -> rc                            (mkdir.M1-003 + M2-001)
+  // mkdir_one(path) -> rc            (mkdir.M1-003 + M2-001 + mkdir.ENH-006)
   //
   // Signature: mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap}
   //   rdi = path — NUL-terminated string (a live pointer into argv or a
   //                positional slot in ParsedArgs::pos_ptrs)
   //   rax = MK_OK                        (0)
   //       | MK_MULTI_LEVEL_UNSUPPORTED   (3)  — path contains '/', no -p
-  //       | MK_TXN_OPEN_FAIL             (4)  — sys_cap_invoke(SLOT_TXN,...)
   //       | MK_MKDIR_FAIL                (5)  — sys_cap_invoke(SLOT_PARENT_FILE,...)
-  //       | MK_TXN_COMMIT_FAIL           (6)  — sys_cap_invoke(SLOT_TXN,...) commit
   //       | MK_ABS_PATH_UNSUPPORTED      (7)  — path starts with '/' (M2-001)
   //       | MK_PATH_TOO_DEEP             (8)  — > 16 levels (M2-001)
+  //       | MK_CAP_TAIL_FAIL             (9)  — sys_cap_invoke(SLOT_USER,...)
   //       | MK_PARENT_REF_UNSUPPORTED    (10) — a component is exactly
   //                                             ".." (mkdir.ENH-004)
   //
-  // Steps (per design/architecture.md §4 + §4a):
+  // mkdir.ENH-006: mkdir_one no longer opens or commits the TXN — it
+  // is called once PER POSITIONAL by mkdir_run, but a TXN is scoped to
+  // the WHOLE invocation (`mkdir a b c` must be one atomic multi-path
+  // create). mkdir_run now opens ONE shared TXN before its positional
+  // loop (stashing `current_txn_id` once) and issues ONE commit after
+  // every positional has returned MK_OK — MK_TXN_OPEN_FAIL (4) and
+  // MK_TXN_COMMIT_FAIL (6) are therefore mkdir_run return states now,
+  // not mkdir_one ones (see mkdir_run's doc comment below). Before this
+  // fix, every positional past the first re-opened the TXN's QUERY_ID
+  // (mostly harmless) then hit the already-COMMITTED row at its OWN
+  // commit and failed MK_TXN_COMMIT_FAIL, while `newly_created_count`
+  // — reset per positional — clobbered every prior positional's staged
+  // records at index 0.
+  //
+  // Steps (per design/architecture.md §4 + §4a + §4f):
   //   1. Multi-level guard IFF `-p` is NOT set. Any '/' in path →
   //      MK_MULTI_LEVEL_UNSUPPORTED (POSIX-canonical mkdir behaviour).
   //      Under `-p`, this guard is bypassed and mkdir_split_path
@@ -630,20 +649,21 @@ module Mkdir = structure {
   //   2. Path decomposition:
   //        - Under `-p`: call mkdir_split_path(path). Populates
   //          MkdirState::{comp_start_offsets, comp_lengths, comp_count}.
-  //          Errors surface as MK_ABS_PATH_UNSUPPORTED or
+  //          Errors surface as MK_ABS_PATH_UNSUPPORTED,
+  //          MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004), or
   //          MK_PATH_TOO_DEEP. comp_count == 0 (empty path) →
   //          short-circuit to MK_OK (POSIX-idempotent).
-  //        - Without `-p`: manually set comp_count = 1 so the
-  //          walk-loop shape is unified.
+  //        - Without `-p`: manually set comp_count = 1 and populate
+  //          comp_start_offsets[0] / comp_lengths[0] (mkdir.ENH-005)
+  //          so the walk-loop shape AND the Step 6e/6f path_len
+  //          computation are both unified with the `-p` split path.
   //   3. -v diagnostic. DEFERRED at M2-001 (see M3-001).
   //   4. --dry-run short-circuit. Returns MK_OK AFTER the split has
   //      validated the path — so `mkdir -p --dry-run /abs/path`
   //      still surfaces MK_ABS_PATH_UNSUPPORTED, matching POSIX
   //      dry-run semantics (validate, do not execute).
-  //   5. TXN open — placeholder sys_cap_invoke(SLOT_TXN=0,
-  //      PXT_OP_QUERY_ID=0). Real "open TXN" op is
-  //      mkdir.M2-substrate-001 in paideia-os. Negative rax →
-  //      MK_TXN_OPEN_FAIL.
+  //   5. (Hoisted to mkdir_run — mkdir.ENH-006. `current_txn_id` is
+  //      already populated by the time this function reads it.)
   //   6. Per-component walk (walk_i in .bss counter, survives the
   //      placeholder syscalls' caller-save clobber without a push):
   //        6a. Create dir — placeholder sys_cap_invoke(SLOT_PARENT_FILE,
@@ -653,15 +673,20 @@ module Mkdir = structure {
   //            future kernel-side abort op rolls back every prior
   //            create in the same scope; at M2 the placeholders are
   //            no-ops so nothing survives to roll back).
-  //        6b. newly_created_count += 1.
+  //        6b. newly_created_count += 1 — an INVOCATION-WIDE running
+  //            total (mkdir.ENH-006: reset once by mkdir_run, NOT per
+  //            positional), so record indices append across
+  //            positionals instead of clobbering index 0.
   //        6c. Cap-tail owner write — DEFERRED to mkdir.M2-003.
   //        (Pre-existing dir handling — DEFERRED to mkdir.M2-002.
   //         At M2-001 every component in the walk is treated as
   //         newly-created; the M2-002 branch adds an existence
   //         probe that skips create + does NOT advance
   //         newly_created_count on hit.)
-  //   7. TXN commit — placeholder sys_cap_invoke(SLOT_TXN,
-  //      PXT_OP_QUERY_STATE). Negative rax → MK_TXN_COMMIT_FAIL.
+  //   7. (Hoisted to mkdir_run — mkdir.ENH-006. mkdir_one falls
+  //      through to MK_OK when walk_i reaches comp_count; the
+  //      CDR/RUR count freeze and the single TXN commit happen once,
+  //      after the whole positional loop completes.)
   //
   // Register plan (SysV push/pop parity preserved):
   //   push rbx        — one push aligns rsp for nested `call`s. rbx
@@ -682,7 +707,7 @@ module Mkdir = structure {
   pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (path: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a single-TXN scope around a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6b create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, flips the Step 7 commit placeholder to real PXT_OP_COMMIT (7), captures the TXN's txn_id into current_txn_id at Step 5 (via PXT_OP_QUERY_ID), populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref), and freezes created_dir_records_count == newly_created_count before the commit syscall so a commit failure leaves the record array + M3-003 undo array in the consistent 'staged, uncommitted' state. M3-003 adds one RmdirUndoRecord per newly-created level in the same Step 6f beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay), and freezes rmdir_undo_records_count == newly_created_count at the same Step 7 commit-freeze point so both readers (CDR/undo-log/audit) see one consistent snapshot per invocation. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED, MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004: a component of exactly two bytes \"..\"), or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 AND populate comp_start_offsets[0] = 0 / comp_lengths[0] = strlen(path) (mkdir.ENH-005 — reusing rcx, which already points at path's NUL terminator from the Step 1 scan) so the walk-loop shape AND the path_len computation at Step 6e/6f are both unified with the `-p` split path. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_ID) exercises the KIND_PDXFS_TXN dispatch — real open-TXN op is mkdir.M2-substrate-001. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) Placeholder sys_cap_invoke(SLOT_TXN, PXT_OP_QUERY_STATE) exercises the commit path — real commit op is mkdir.M2-substrate-001. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
+      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 + mkdir.ENH-006 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6a create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref); M3-003 adds one RmdirUndoRecord per newly-created level in the same beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay). mkdir.ENH-006 removes the TXN open (formerly Step 5) and the TXN commit + CDR/RUR count freeze (formerly Step 7) from this function entirely: mkdir_one is called ONCE PER POSITIONAL by mkdir_run, but a TXN is scoped to the WHOLE invocation, so mkdir_run now opens ONE shared TXN before its positional loop (stashing current_txn_id once, read here unchanged at Step 6e/6f) and performs the freeze + single commit once after every positional returns MK_OK. This function also no longer zeroes newly_created_count at Step 6 entry — it is now an invocation-wide running total that mkdir_run resets exactly once, so record indices (newly_created_count - 1) append across positionals (`mkdir a b c` stages 3 CDR/RUR entries at indices 0..2) instead of every positional past the first clobbering index 0 and hitting MK_TXN_COMMIT_FAIL against an already-COMMITTED row. walk_i IS still reset per call — it is this call's LOCAL index into comp_start_offsets/comp_lengths/comp_pre_existed, freshly repopulated by mkdir_split_path (or the no-slash branch) on every call. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED, MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004: a component of exactly two bytes \"..\"), or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 AND populate comp_start_offsets[0] = 0 / comp_lengths[0] = strlen(path) (mkdir.ENH-005 — reusing rcx, which already points at path's NUL terminator from the Step 1 scan) so the walk-loop shape AND the path_len computation at Step 6e/6f are both unified with the `-p` split path. (3) -v emission still deferred to M3-001. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) elided — see mkdir_run. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (7) elided — see mkdir_run; the walk falls through to mkdir_one_ok when walk_i reaches comp_count. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
       block: {
         // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
         push rbx;
@@ -798,34 +823,30 @@ module Mkdir = structure {
         cmp rax, 0;
         jne mkdir_one_ok;
 
-        // ---- Step 5: TXN "open" via PXT_OP_QUERY_ID.
-        // The TXN cap at SLOT_TXN is pre-opened by the shell at spawn
-        // time (see _init_caps entry 0 above); mkdir does NOT mint a
-        // fresh TXN via sys_pdxfs_txn_open (sysno 70) at v1.0 because
-        // the tool has no KIND_MEMORY mount cap in its four-slot
-        // sidecar. PXT_OP_QUERY_ID reads the pre-opened row's txn_id
-        // so M3-001's CreatedDirRecord.parent_txn_id has a real value
-        // to record (all records in one invocation share the same
-        // parent_txn_id — the walk runs inside one TXN scope per
-        // M2-001). Negative rax -> MK_TXN_OPEN_FAIL. ----
-        xor rdi, rdi;                             // SLOT_TXN = 0
-        xor rsi, rsi;                             // PXT_OP_QUERY_ID = 0
-        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_one_txn_open_fail;
-
-        // M3-001: stash the txn_id for the CreatedDirRecord fields.
-        lea r11, [rip + current_txn_id];
-        mov [r11], rax;
+        // ---- Step 5 (TXN open) hoisted to mkdir_run — mkdir.ENH-006.
+        // mkdir_one is called once PER POSITIONAL, but a TXN is
+        // invocation-scoped: opening it here (as M1-003..M3-003 did)
+        // meant every positional past the first hit an
+        // already-COMMITTED row at the OLD Step 7 and failed
+        // MK_TXN_COMMIT_FAIL, and current_txn_id/newly_created_count
+        // got re-zeroed per positional, clobbering every prior
+        // positional's staged records at index 0. mkdir_run now opens
+        // ONE shared TXN before the positional loop and stashes
+        // current_txn_id once; mkdir_one reads that already-populated
+        // value (Step 6e/6f below) instead of re-deriving it. ----
 
         // ---- Step 6: per-component walk. walk_i in .bss counter. ----
+        // walk_i is reset here (unlike newly_created_count) because it
+        // is THIS CALL's local index into comp_start_offsets /
+        // comp_lengths / comp_pre_existed, which mkdir_split_path (or
+        // the no-slash branch) repopulates fresh on every mkdir_one
+        // call. newly_created_count is NOT reset here — mkdir.ENH-006
+        // makes it an invocation-wide running total (reset once by
+        // mkdir_run before the positional loop) so record indices
+        // (`newly_created_count - 1` at Step 6e/6f) append across
+        // positionals instead of clobbering index 0 on every call.
         xor rax, rax;
         lea r11, [rip + walk_i];
-        mov [r11], rax;
-
-        xor rax, rax;
-        lea r11, [rip + newly_created_count];
         mov [r11], rax;
 
       mkdir_one_walk_head:
@@ -836,7 +857,7 @@ module Mkdir = structure {
         mov rcx, [r11];
 
         cmp rax, rcx;
-        jge mkdir_one_do_commit;
+        jge mkdir_one_ok;
 
         // Step 6a: pre-existence probe (M2-002 placeholder).
         // Real per-component existence check on KIND_PDXFS_FILE is
@@ -1079,54 +1100,17 @@ module Mkdir = structure {
         mov [r11], rax;
         jmp mkdir_one_walk_head;
 
-        // ---- Step 7: TXN commit — real PXT_OP_COMMIT = 7. ----
-      mkdir_one_do_commit:
-        // M3-001 + M3-003: freeze created_dir_records_count AND
-        // rmdir_undo_records_count == newly_created_count on the same
-        // beat. Both counts are set BEFORE the commit syscall so that
-        // a commit failure (PXT_BAD_TRANSITION or a future substrate-
-        // side error) leaves BOTH the record array AND the undo
-        // array in the consistent "records staged, TXN never
-        // committed" state — the M3-003 undo-log walker inspects the
-        // parent_txn_id's committed bit to decide whether to replay
-        // (committed → live undo) or discard (aborted → no-op undo,
-        // nothing was persisted). Frozen together so a divergence
-        // between "levels the CDR array says were created" and
-        // "levels the undo array can remove" is unreachable by
-        // construction. The single-writer discipline matches
-        // pdxfs_txn_note in kind_pdxfs_txn.pdx.
-        lea r11, [rip + newly_created_count];
-        mov rax, [r11];
-        lea r11, [rip + created_dir_records_count];
-        mov [r11], rax;
-        lea r11, [rip + rmdir_undo_records_count];
-        mov [r11], rax;
-
-        // Real commit op: OPEN -> COMMITTED state transition on the
-        // TXN row (R42-PREP-007 #1629 at kind_pdxfs_txn.pdx L115 +
-        // L667..L721 pdxfs_txn_row_transition). Success returns
-        // PXT_OK = 0 (positive); duplicate commit or commit-after-
-        // abort returns PXT_BAD_TRANSITION = 0xFFFFEC15 (negative
-        // as i64, top nibble 0xF) — routes to
-        // mkdir_one_commit_fail. mkdir is a one-shot process, so
-        // the duplicate-commit edge is unreachable per invocation
-        // at v1.0.
-        xor rdi, rdi;                             // SLOT_TXN = 0
-        mov rsi, 7;                               // PXT_OP_COMMIT = 7
-        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_one_commit_fail;
+        // ---- mkdir.ENH-006: TXN commit hoisted to mkdir_run. ----
+        // The walk loop above falls straight through to
+        // mkdir_one_ok when walk_i reaches comp_count (see the
+        // `jge mkdir_one_ok` at mkdir_one_walk_head) — mkdir_one no
+        // longer commits. mkdir_run freezes created_dir_records_count
+        // / rmdir_undo_records_count == newly_created_count and
+        // issues the single PXT_OP_COMMIT ONCE, after every positional
+        // in the invocation has returned MK_OK from this function.
 
       mkdir_one_ok:
         xor rax, rax;                             // MK_OK
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_txn_open_fail:
-        lea rdi, [rip + err_txn_open_msg];
-        mov rsi, 23;                              // err_txn_open_len
-        call emit_stderr;
-        mov rax, 4;                               // MK_TXN_OPEN_FAIL
         jmp mkdir_one_epilogue;
 
       mkdir_one_mkdir_fail:
@@ -1134,13 +1118,6 @@ module Mkdir = structure {
         mov rsi, 21;                              // err_mkdir_len
         call emit_stderr;
         mov rax, 5;                               // MK_MKDIR_FAIL
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_commit_fail:
-        lea rdi, [rip + err_commit_msg];
-        mov rsi, 25;                              // err_commit_len
-        call emit_stderr;
-        mov rax, 6;                               // MK_TXN_COMMIT_FAIL
         jmp mkdir_one_epilogue;
 
       mkdir_one_cap_tail_fail:
@@ -1158,13 +1135,35 @@ module Mkdir = structure {
 
   // ============================================================================
   // mkdir_run() — walk pos_ptrs[0..pos_count], call mkdir_one on each.
+  //                                              (mkdir.M1-003 + mkdir.ENH-006)
   //
   // Signature: mkdir_run : () -> () !{mem, sysreg} @{cap}
   //
+  // mkdir.ENH-006: mkdir_run now owns the TXN lifecycle for the WHOLE
+  // invocation — it opens ONE shared TXN before the positional loop
+  // and issues ONE commit after every positional has returned MK_OK.
+  // Before this fix, `mkdir_one` opened + committed its own TXN on
+  // every call, so `mkdir a b c` re-opened an already-open row for `b`
+  // and `c` (mostly harmless — QUERY_ID is a read) and then hit the
+  // already-COMMITTED row at `b`'s own commit, failing
+  // MK_TXN_COMMIT_FAIL; `newly_created_count` was also reset to 0 at
+  // the top of every `mkdir_one` call, so `b`'s records overwrote
+  // `a`'s at index 0 and `a`'s undo record was lost. Both bugs are
+  // instances of the same root cause: TXN + record bookkeeping are
+  // invocation-scoped, but were being managed at positional scope.
+  //
+  // --dry-run (a single flag shared by every positional — there is no
+  // per-positional dry-run) never opens or commits the TXN: every
+  // `mkdir_one` call short-circuits at its own Step 4 before touching
+  // any cap, so opening a TXN just to never use it would be a needless
+  // cap-invoke against the "no side effects" dry-run contract.
+  //
   // On the first non-MK_OK return from mkdir_one, records the code in
   // MkdirState::exit_code and the offending index in
-  // MkdirState::err_pos_index and stops the walk (fail-fast — no
-  // partial "some created, some not" state at M1).
+  // MkdirState::err_pos_index and stops the walk WITHOUT committing
+  // (fail-fast — no partial "some created, some not" state, and the
+  // shared TXN is left uncommitted so nothing this invocation staged
+  // is persisted).
   //
   // Uses MkdirState::mkdir_run_i as loop-counter storage so the counter
   // survives mkdir_one calls without a callee-save push. Safe at M1
@@ -1172,19 +1171,54 @@ module Mkdir = structure {
   //
   // Register plan (leaf-ish; no callee-save needed thanks to the .bss
   // loop counter):
-  //   rax = index / mkdir_one return
+  //   rax = index / mkdir_one return / syscall return
   //   rcx = pos_count (bound)
-  //   rdi = pos_ptrs[i] (arg to mkdir_one)
+  //   rdi/rsi = pos_ptrs[i] (arg to mkdir_one) / syscall args / emit_stderr args
   //   r11 = LEA scratch
   // ============================================================================
   pub let mkdir_run : () -> () !{mem, sysreg} @{cap} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 mkdir_run — positional walk. Iterates MkdirState::mkdir_run_i over 0..ParsedArgs::pos_count; each iteration loads pos_ptrs[i] and calls mkdir_one. On first non-MK_OK return records MkdirState::exit_code + err_pos_index and returns (fail-fast — no partial completion at M1). Loop counter lives in .bss so it survives mkdir_one's clobber of every caller-save reg — same trick dispatch.pdx's echo_builtin uses for its echo_idx slot (see paideia-os src/user/dispatch.pdx L165 justification). paideia-as conformance: r11 scratch (LEA); every cmp reg,imm ≤ 0x7FFFFFFF; no `test` mnemonic; leaf-with-nested-calls but no callee-save state so no push/pop parity needed. Labels prefixed mkdir_run_.",
+      justification: "mkdir.M1-003 + mkdir.ENH-006 mkdir_run — positional walk with invocation-scoped TXN lifecycle. Resets mkdir_run_i and newly_created_count to 0 (the LATTER exactly once per invocation now, not per positional — mkdir.ENH-006 removed mkdir_one's own reset so record indices append across positionals). IF flag_dry_run == 1, skips straight to the positional loop (no TXN open — every mkdir_one call will short-circuit at its own Step 4 before any cap invocation, so there is nothing to open). ELSE opens ONE shared TXN via sys_cap_invoke(SLOT_TXN=0, PXT_OP_QUERY_ID=0) and stashes its txn_id into current_txn_id ONCE (negative rax -> MK_TXN_OPEN_FAIL, exit_code set directly here since there is no mkdir_one call wrapping this open to propagate a return value through). Then iterates MkdirState::mkdir_run_i over 0..ParsedArgs::pos_count; each iteration loads pos_ptrs[i] and calls mkdir_one, which now performs ONLY the per-component create walk (Steps 1-4 + 6) and reads the already-populated current_txn_id — it neither opens nor commits the TXN. On first non-MK_OK return records MkdirState::exit_code + err_pos_index and returns immediately WITHOUT freezing CDR/RUR counts or committing (fail-fast; the shared TXN is left uncommitted, matching the pre-ENH-006 per-positional behaviour of never reaching the commit beat on failure). When the loop completes with every positional MK_OK: IF flag_dry_run == 1, return immediately (nothing was ever opened, so there is nothing to freeze or commit). ELSE freeze created_dir_records_count AND rmdir_undo_records_count == newly_created_count (the SAME twin-freeze invariant M3-001/M3-003 established, now applied once for the whole invocation instead of once per positional) and issue exactly ONE sys_cap_invoke(SLOT_TXN=0, PXT_OP_COMMIT=7) — negative rax -> MK_TXN_COMMIT_FAIL, exit_code set directly. Loop counter lives in .bss so it survives mkdir_one's clobber of every caller-save reg — same trick dispatch.pdx's echo_builtin uses for its echo_idx slot (see paideia-os src/user/dispatch.pdx L165 justification). paideia-as conformance: r11 scratch (LEA); every cmp reg,imm ≤ 0x7FFFFFFF (SC+ IDs 4/7 well under); no `test` mnemonic; leaf-with-nested-calls but no callee-save state so no push/pop parity needed (mirrors _start's own no-push convention for its direct emit_stderr/syscall sequences). Labels prefixed mkdir_run_.",
       block: {
         // Initialize i = 0.
         xor rax, rax;
         lea r11, [rip + mkdir_run_i];
+        mov [r11], rax;
+
+        // mkdir.ENH-006: newly_created_count is now an INVOCATION-WIDE
+        // running total (record indices are `newly_created_count - 1`
+        // inside mkdir_one). Reset it exactly ONCE here, before any
+        // positional walk, instead of inside mkdir_one per call —
+        // otherwise positional 2+ would clobber positional 1's records
+        // at index 0.
+        xor rax, rax;
+        lea r11, [rip + newly_created_count];
+        mov [r11], rax;
+
+        // --dry-run: no TXN needed. Every mkdir_one call short-circuits
+        // before touching a cap, so skip straight to the walk.
+        lea r11, [rip + flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mkdir_run_loop_head;
+
+        // Open ONE shared TXN for the whole invocation. The TXN cap at
+        // SLOT_TXN is pre-opened by the shell at spawn time (see
+        // _init_caps entry 0 above); mkdir does NOT mint a fresh TXN
+        // via sys_pdxfs_txn_open (sysno 70) at v1.0 because the tool
+        // has no KIND_MEMORY mount cap in its sidecar. PXT_OP_QUERY_ID
+        // reads the pre-opened row's txn_id so every CreatedDirRecord
+        // across every positional shares the same parent_txn_id.
+        // Negative rax -> MK_TXN_OPEN_FAIL.
+        xor rdi, rdi;                             // SLOT_TXN = 0
+        xor rsi, rsi;                             // PXT_OP_QUERY_ID = 0
+        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_run_txn_open_fail;
+
+        lea r11, [rip + current_txn_id];
         mov [r11], rax;
 
       mkdir_run_loop_head:
@@ -1195,7 +1229,7 @@ module Mkdir = structure {
         mov rcx, [r11];
 
         cmp rax, rcx;
-        jge mkdir_run_done;
+        jge mkdir_run_all_ok;
 
         // rdi = pos_ptrs[i]
         lea r11, [rip + pos_ptrs];
@@ -1206,7 +1240,9 @@ module Mkdir = structure {
         cmp rax, 0;
         je  mkdir_run_advance;
 
-        // Non-OK: record + stop.
+        // Non-OK: record + stop, WITHOUT freezing CDR/RUR counts or
+        // committing — the shared TXN stays uncommitted so nothing
+        // this invocation staged is persisted.
         lea r11, [rip + exit_code];
         mov [r11], rax;
 
@@ -1223,7 +1259,58 @@ module Mkdir = structure {
         mov [r11], rax;
         jmp mkdir_run_loop_head;
 
+      mkdir_run_all_ok:
+        // Every positional returned MK_OK. --dry-run never opened a
+        // TXN (see above), so there is nothing to freeze or commit.
+        lea r11, [rip + flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne mkdir_run_done;
+
+        // mkdir.ENH-006: freeze created_dir_records_count AND
+        // rmdir_undo_records_count == newly_created_count ONCE for the
+        // whole invocation, before the single commit syscall — same
+        // "staged, never committed on failure" consistency invariant
+        // M3-001/M3-003 established per positional, now invocation-wide.
+        lea r11, [rip + newly_created_count];
+        mov rax, [r11];
+        lea r11, [rip + created_dir_records_count];
+        mov [r11], rax;
+        lea r11, [rip + rmdir_undo_records_count];
+        mov [r11], rax;
+
+        // Real commit op: OPEN -> COMMITTED (R42-PREP-007 #1629 at
+        // kind_pdxfs_txn.pdx L115 + L667..L721). Issued EXACTLY ONCE
+        // per invocation — this is the mkdir.ENH-006 fix for the
+        // double-commit bug (every positional past the first used to
+        // issue its own commit against the same pre-opened row and hit
+        // PXT_BAD_TRANSITION = 0xFFFFEC15, negative as i64).
+        xor rdi, rdi;                             // SLOT_TXN = 0
+        mov rsi, 7;                                // PXT_OP_COMMIT = 7
+        mov rax, 4;                                // SC+ ID 4 = sys_cap_invoke
+        syscall;
+        cmp rax, 0;
+        jl  mkdir_run_commit_fail;
+
       mkdir_run_done:
+        ret;
+
+      mkdir_run_txn_open_fail:
+        lea rdi, [rip + err_txn_open_msg];
+        mov rsi, 23;                               // err_txn_open_len
+        call emit_stderr;
+        mov rax, 4;                                // MK_TXN_OPEN_FAIL
+        lea r11, [rip + exit_code];
+        mov [r11], rax;
+        ret;
+
+      mkdir_run_commit_fail:
+        lea rdi, [rip + err_commit_msg];
+        mov rsi, 25;                               // err_commit_len
+        call emit_stderr;
+        mov rax, 6;                                // MK_TXN_COMMIT_FAIL
+        lea r11, [rip + exit_code];
+        mov [r11], rax;
         ret;
       }
     }

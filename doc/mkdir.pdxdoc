@@ -29,6 +29,14 @@ via `libpdx-audit` (`RmdirUndoRecord[]`) only lists levels this
 invocation actually created — replay is `rmdir <path>` walked
 leaf-to-root over those levels alone.
 
+The TXN is scoped to the WHOLE invocation, not to one `<path>` operand:
+`mkdir a b c` opens one TXN, creates all three (recording one
+`CreatedDirRecord` and one `RmdirUndoRecord` per level across every
+operand), and commits once. If any operand fails, the shared TXN is
+never committed, so nothing any operand staged is persisted — the same
+atomicity guarantee `-p` gives one multi-level path extends to every
+positional in the argv list.
+
 The primary output is the `CreatedDirRecord[]` schema stream on the
 semantic pipe (cap slot 3, `KIND_IPC_ENDPOINT` bound at spawn by the
 shell to a `libpdx-semantic-pipe` writer). Per I4 in
