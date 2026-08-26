@@ -33,6 +33,19 @@ corresponds to one closed `mkdir.ENH-NNN` issue.
   positional (records now append via a running `newly_created_count`),
   and issues one commit only after every positional succeeds; a
   failure anywhere leaves the shared TXN uncommitted.
+- **ENH-001 (#16)** — implemented `--schema`: `parse_flags_from_argv`
+  recognises the `schema` long flag; `_start` emits the
+  `CreatedDirRecord@0.1` field list and exits 0 before the
+  missing-operand check and before any TXN cap invocation (so
+  `mkdir --schema` with no path operand succeeds).
+- **ENH-003 (#18)** — implemented `--version`: emits
+  `mkdir 1.0.0 (build unknown) sig=placeholder` and exits 0, same
+  before-missing-operand / no-cap-invocation placement as `--schema`.
+  `build`/`sig` are static placeholders — no build-time hash/signature
+  substitution mechanism exists in this tree yet. Also corrected
+  `doc/mkdir.pdxdoc` and `CHANGELOG.md`'s 1.0.0 entry: `--help` is
+  (and always was) shell-dispatched to `doc mkdir`, not parsed by
+  mkdir itself; the SYNOPSIS and FLAGS sections now say so plainly.
 
 ## 1.0.0 — 2026-08-22 — first signed release
 
@@ -93,6 +106,15 @@ lands, the bodies are edited without a signature change to `mkdir_one`.
 - `mkdir --help` → shell dispatches to `doc mkdir` which renders
   `doc/mkdir.pdxdoc`.
 - `mkdir --schema` → emits `CreatedDirRecord@0.1` on stdout and exits 0.
+
+  **Correction (added post-tag, see Unreleased above):** none of
+  `--version`, `--schema`, or `--json` were actually implemented in
+  `src/` at this tag — `parse_flags_from_argv` recognised only `p`,
+  `v`, `dry-run`. This section recorded the plan-of-record at release
+  time, not verified working code; `--help` was (and remains) correctly
+  shell-dispatched. `--schema` and `--version` were implemented for
+  real at mkdir.ENH-001 / mkdir.ENH-003 (Unreleased); `--json` remains
+  open as mkdir.ENH-002.
 
 ### Signing pipeline status
 

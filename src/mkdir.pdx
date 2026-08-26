@@ -152,6 +152,30 @@ module Mkdir = structure {
   pub let err_cap_tail_msg    : [u8; 32] = "mkdir: cap-tail stamp failed\n\0\0\0"
   pub let err_cap_tail_len    : u64 = 29
 
+  // ---- mkdir.ENH-001 --schema static emit ----
+  //
+  // mkdir already declares `CreatedDirRecord@0.1` under
+  // `declares_output_schemas` in caps.decl and carries the frozen
+  // handle CDR_SCHEMA_HANDLE = 0x0100000100010001 — `--schema` prints
+  // the field list a consumer needs to decode a staged record without
+  // running the tool. Checked in _start BEFORE the missing-operand
+  // check, so `mkdir --schema` (no path operand) exits 0 rather than
+  // MK_MISSING_PATH.
+  pub let schema_msg : [u8; 96] =
+    "CreatedDirRecord@0.1 { path_ptr: u64, path_len: u64, parent_txn_id: u64, owner_slot_ref: u64 }\n\0"
+  pub let schema_len : u64 = 95
+
+  // ---- mkdir.ENH-003 --version static emit ----
+  //
+  // `build`/`sig` are placeholders — same convention deps.list and
+  // manifest.pdxsig use for values the T-INFRA-002 signing-bot host
+  // fills in later; there is no build-time hash/signature substitution
+  // mechanism in this tree today. Checked in _start BEFORE the
+  // missing-operand check, same as --schema.
+  pub let version_msg : [u8; 45] =
+    "mkdir 1.0.0 (build unknown) sig=placeholder\n\0"
+  pub let version_len : u64 = 44
+
   // ============================================================================
   // Bootstrap argv (mkdir.M1-002 self-test)
   //
@@ -317,11 +341,12 @@ module Mkdir = structure {
   // parse_flags_from_argv()
   //
   // Walk ParsedArgs::flag_names[0..flag_count] and for each entry
-  // byte-compare against the three well-known names (`p`, `v`,
-  // `dry-run`). On a match, write 1 into the corresponding MkdirState
-  // slot (`flag_p`, `flag_v`, `flag_dry_run`). Unknown flags at M1-002
-  // are silently ignored — the 9-flag standard-vocabulary rejection
-  // path lands at libpdx-argv.M2-002.
+  // byte-compare against the five well-known names (`p`, `v`,
+  // `dry-run`, `schema` [mkdir.ENH-001], `version` [mkdir.ENH-003]). On
+  // a match, write 1 into the corresponding MkdirState slot (`flag_p`,
+  // `flag_v`, `flag_dry_run`, `flag_schema`, `flag_version`). Unknown
+  // flags at M1-002 are silently ignored — the 9-flag standard-
+  // vocabulary rejection path lands at libpdx-argv.M2-002.
   //
   // Called AFTER Parser::parse_argv has populated ParsedArgs; must be
   // called BEFORE mkdir_run so mkdir_one sees the correct flag state.
@@ -337,7 +362,7 @@ module Mkdir = structure {
   pub let parse_flags_from_argv : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-002 parse_flags_from_argv. Walks ParsedArgs::flag_names[0..flag_count] and byte-matches each name against `p` / `v` / `dry-run` (the three flags mkdir recognizes at M1). Sets MkdirState::flag_p / flag_v / flag_dry_run to 1 on match. Unknown flags silently ignored — libpdx-argv.M2-002 lands the 9-flag standard-vocabulary rejection path; until then the recognizer is permissive so an over-argument does not sink the whole invocation. paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every cmp reg,imm is a single-byte ASCII value ≤ 0x7A; r11 is scratch (LEA); no push/pop parity (leaf); no test mnemonic. Label prefix `mkdir_pff_` avoids every paideia-as reserved keyword.",
+      justification: "mkdir.M1-002 + mkdir.ENH-001 + mkdir.ENH-003 parse_flags_from_argv. Walks ParsedArgs::flag_names[0..flag_count] and byte-matches each name against `p` / `v` / `dry-run` / `schema` / `version` (the five flags mkdir recognizes). Sets MkdirState::flag_p / flag_v / flag_dry_run / flag_schema / flag_version to 1 on match. The try-chain order is p -> v -> dry-run -> schema -> version -> advance; each successful match falls through into the next candidate's compare unless it explicitly jumps to mkdir_pff_advance after storing its flag (dry-run and schema do; version does not need to since mkdir_pff_advance is its very next label). Unknown flags silently ignored — libpdx-argv.M2-002 lands the 9-flag standard-vocabulary rejection path; until then the recognizer is permissive so an over-argument does not sink the whole invocation. paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every cmp reg,imm is a single-byte ASCII value ≤ 0x7A; r11 is scratch (LEA); no push/pop parity (leaf); no test mnemonic. Label prefix `mkdir_pff_` avoids every paideia-as reserved keyword.",
       block: {
         // Load flag_count once — the loop bound.
         lea r11, [rip + flag_count];
@@ -393,17 +418,48 @@ module Mkdir = structure {
         // ---- Try long flag `dry-run`: byte-compare 7 chars + NUL ----
         // Inline byte-by-byte compare matching libpdx-argv's own
         // pdx-schema compare pattern (parser.pdx L151..L161).
-        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x64; jne mkdir_pff_advance;  // 'd'
-        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x72; jne mkdir_pff_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x79; jne mkdir_pff_advance;  // 'y'
-        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x2D; jne mkdir_pff_advance;  // '-'
-        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x72; jne mkdir_pff_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x75; jne mkdir_pff_advance;  // 'u'
+        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x64; jne mkdir_pff_try_schema;  // 'd'
+        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x72; jne mkdir_pff_try_schema;  // 'r'
+        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x79; jne mkdir_pff_try_schema;  // 'y'
+        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x2D; jne mkdir_pff_try_schema;  // '-'
+        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x72; jne mkdir_pff_try_schema;  // 'r'
+        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x75; jne mkdir_pff_try_schema;  // 'u'
+        xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0x6E; jne mkdir_pff_try_schema;  // 'n'
+        xor rax, rax; mov_b rax, [rcx + 7]; cmp rax, 0;    jne mkdir_pff_try_schema;  // NUL
+
+        mov rax, 1;
+        lea r11, [rip + flag_dry_run];
+        mov [r11], rax;
+        jmp mkdir_pff_advance;
+
+      mkdir_pff_try_schema:
+        // ---- Try long flag `schema` (mkdir.ENH-001): 6 chars + NUL ----
+        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x73; jne mkdir_pff_try_version;  // 's'
+        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x63; jne mkdir_pff_try_version;  // 'c'
+        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x68; jne mkdir_pff_try_version;  // 'h'
+        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x65; jne mkdir_pff_try_version;  // 'e'
+        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x6D; jne mkdir_pff_try_version;  // 'm'
+        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x61; jne mkdir_pff_try_version;  // 'a'
+        xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0;    jne mkdir_pff_try_version;  // NUL
+
+        mov rax, 1;
+        lea r11, [rip + flag_schema];
+        mov [r11], rax;
+        jmp mkdir_pff_advance;
+
+      mkdir_pff_try_version:
+        // ---- Try long flag `version` (mkdir.ENH-003): 7 chars + NUL ----
+        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x76; jne mkdir_pff_advance;  // 'v'
+        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x65; jne mkdir_pff_advance;  // 'e'
+        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x72; jne mkdir_pff_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x73; jne mkdir_pff_advance;  // 's'
+        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x69; jne mkdir_pff_advance;  // 'i'
+        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x6F; jne mkdir_pff_advance;  // 'o'
         xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0x6E; jne mkdir_pff_advance;  // 'n'
         xor rax, rax; mov_b rax, [rcx + 7]; cmp rax, 0;    jne mkdir_pff_advance;  // NUL
 
         mov rax, 1;
-        lea r11, [rip + flag_dry_run];
+        lea r11, [rip + flag_version];
         mov [r11], rax;
 
       mkdir_pff_advance:
@@ -1330,6 +1386,11 @@ module Mkdir = structure {
   //           M3-002 emit_audit_event(UEJ_KIND_TOOL_ERROR=131),
   //           sys_exit(MK_ARGV_ERR).
   //   Step 5  parse_flags_from_argv() — populate MkdirState::flag_*.
+  //   Step 5a mkdir.ENH-001: IFF flag_schema == 1, emit schema_msg,
+  //           sys_exit(MK_OK). Checked before Step 6 — no path operand
+  //           required, no cap invocation.
+  //   Step 5b mkdir.ENH-003: IFF flag_version == 1, emit version_msg,
+  //           sys_exit(MK_OK). Same rationale as Step 5a.
   //   Step 6  Check ParsedArgs::pos_count. If zero → emit err_no_operand_msg,
   //           M3-002 emit_audit_event(UEJ_KIND_TOOL_ERROR),
   //           sys_exit(MK_MISSING_PATH).
@@ -1356,7 +1417,7 @@ module Mkdir = structure {
   pub let _start : () -> () !{mem, sysreg} @{sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched},
-      justification: "mkdir.M1-003 + M2-001 + M3-002 _start orchestrator. Full argv + create + audit surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + M3-002 TOOL_INVOKE audit emit (with audit_emitted_invoke gate raised on the same beat) + argv_bootstrap build + parse_argv + argv-error diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + parse_flags_from_argv + missing-operand diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + mkdir_run + M3-002 conditional TOOL_ERROR emit when exit_code != 0 + sys_exit(exit_code). Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: UEJ_KIND_TOOL_ERROR = 131 and sys_exit ID 60). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `mkdir_run`, `mkdir_one`, `mkdir_split_path`, `emit_stderr`, `emit_audit_event` → local). Bootstrap argv array is built via four lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp). D3 audit-first invariant: the TOOL_INVOKE emit at Step 2 precedes every argv-parse or user-visible action, and every non-zero exit path (argv-parse fail, missing operand, mkdir_run partial) is paired with a TOOL_ERROR emit before its sys_exit — a tool that can suppress its own audit trail is the exact attack the D3 upgrade forecloses. All audit-emit returns are IGNORED (the sink must never be able to sink the tool op). M2 smoke witness: bootstrap argv `-p -v --dry-run a/b/c` → INVOKE emit → parse OK → flags {p=1, v=1, dry_run=1} → pos_count=1 → mkdir_run calls mkdir_one(\"a/b/c\") which under flag_p=1 calls mkdir_split_path (comp_count=3 for a, b, c) then short-circuits on --dry-run and returns MK_OK → exit_code=0 → NO TOOL_ERROR emit → exit(0). This exercises the M2-001 mkdir_split_path end-to-end (three components split correctly, non-empty each, no absolute-path or too-deep trigger) plus the M3-002 audit-emit-only-on-error branch while the placeholder cap invocations wait on mkdir.M2-substrate-001 in paideia-os.",
+      justification: "mkdir.M1-003 + M2-001 + M3-002 + mkdir.ENH-001 + mkdir.ENH-003 _start orchestrator. Full argv + create + audit surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + M3-002 TOOL_INVOKE audit emit (with audit_emitted_invoke gate raised on the same beat) + argv_bootstrap build + parse_argv + argv-error diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + parse_flags_from_argv + ENH-001 --schema static emit (sys_exit(MK_OK) immediately, no TOOL_ERROR — this is a success exit) + ENH-003 --version static emit (same shape) + missing-operand diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + mkdir_run + M3-002 conditional TOOL_ERROR emit when exit_code != 0 + sys_exit(exit_code). Both --schema and --version are checked BEFORE the missing-operand check and BEFORE any TXN cap invocation (mkdir_run has not been called yet), so `mkdir --schema` / `mkdir --version` succeed with no path operand and no cap-invoke. Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: UEJ_KIND_TOOL_ERROR = 131 and sys_exit ID 60). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `mkdir_run`, `mkdir_one`, `mkdir_split_path`, `emit_stderr`, `emit_audit_event` → local). Bootstrap argv array is built via four lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp). D3 audit-first invariant: the TOOL_INVOKE emit at Step 2 precedes every argv-parse or user-visible action, and every non-zero exit path (argv-parse fail, missing operand, mkdir_run partial) is paired with a TOOL_ERROR emit before its sys_exit — a tool that can suppress its own audit trail is the exact attack the D3 upgrade forecloses. All audit-emit returns are IGNORED (the sink must never be able to sink the tool op). M2 smoke witness: bootstrap argv `-p -v --dry-run a/b/c` → INVOKE emit → parse OK → flags {p=1, v=1, dry_run=1} → pos_count=1 → mkdir_run calls mkdir_one(\"a/b/c\") which under flag_p=1 calls mkdir_split_path (comp_count=3 for a, b, c) then short-circuits on --dry-run and returns MK_OK → exit_code=0 → NO TOOL_ERROR emit → exit(0). This exercises the M2-001 mkdir_split_path end-to-end (three components split correctly, non-empty each, no absolute-path or too-deep trigger) plus the M3-002 audit-emit-only-on-error branch while the placeholder cap invocations wait on mkdir.M2-substrate-001 in paideia-os.",
       block: {
         // ---- Step 0: ring3 proof-of-life marker. ----
         lea rdi, [rip + ring3_msg];
@@ -1419,6 +1480,43 @@ module Mkdir = structure {
         // ---- Step 5: parse_flags_from_argv. Leaf call. ----
         call parse_flags_from_argv;
 
+        // ---- mkdir.ENH-001: --schema static emit. Checked BEFORE the
+        // missing-operand check so `mkdir --schema` (no path operand)
+        // exits 0 rather than MK_MISSING_PATH — the fingerprint this
+        // flag exists to serve is "ask the tool what it emits without
+        // running it," which by definition takes no path. No TXN cap
+        // invocation on this path.
+        lea r11, [rip + flag_schema];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mkdir_after_schema_check;
+
+        lea rdi, [rip + schema_msg];
+        mov rsi, 95;                              // schema_len
+        call emit_stderr;
+
+        xor rdi, rdi;                              // MK_OK
+        mov rax, 60;                               // SC+ ID 60 = sys_exit
+        syscall;
+
+      mkdir_after_schema_check:
+        // ---- mkdir.ENH-003: --version static emit. Same rationale as
+        // --schema above: checked before the missing-operand check, no
+        // cap invocation.
+        lea r11, [rip + flag_version];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mkdir_after_version_check;
+
+        lea rdi, [rip + version_msg];
+        mov rsi, 44;                              // version_len
+        call emit_stderr;
+
+        xor rdi, rdi;                              // MK_OK
+        mov rax, 60;                               // SC+ ID 60 = sys_exit
+        syscall;
+
+      mkdir_after_version_check:
         // ---- Step 6: missing-operand check. pos_count from libpdx-argv. ----
         lea r11, [rip + pos_count];
         mov rax, [r11];

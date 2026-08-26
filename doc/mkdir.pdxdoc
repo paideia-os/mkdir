@@ -13,6 +13,12 @@ mkdir — create directories under the invoker's PdxFS subtree
 
     mkdir [-p] [-v] [--dry-run] [--json] [--schema] [--help] [--version] <path> [<path>...]
 
+`--help` is listed for discoverability only — mkdir itself never parses
+it. The shell intercepts `--help` before exec and dispatches to `doc
+mkdir` (this document); `parse_flags_from_argv` has no recogniser for
+it and never will (see the FLAGS entry below). Every other flag shown
+here IS parsed by mkdir's own `parse_flags_from_argv`.
+
 # DESCRIPTION
 
 `mkdir` opens one `KIND_PDXFS_TXN`, creates one or more directories under
@@ -58,17 +64,32 @@ shell to a `libpdx-semantic-pipe` writer). Per I4 in
                         text render, but skip Steps 6b (create) and 7
                         (TXN commit). No side effects. Exit 0.
 
-    --json              Emit the CreatedDirRecord[] stream as JSON on
-                        stdout, suppressing the semantic-pipe frame. I3
-                        cross-tool contract.
+    --json              NOT YET IMPLEMENTED (tracked as mkdir.ENH-002,
+                        milestone #6). Design intent: emit the
+                        CreatedDirRecord[] stream as JSON on stdout,
+                        suppressing the semantic-pipe frame — I3
+                        cross-tool contract. `parse_flags_from_argv`
+                        has no recogniser for `json` yet; passing
+                        `--json` today is silently ignored (like any
+                        other unrecognised flag at v1.0).
 
     --schema            Print CreatedDirRecord@0.1 schema definition and
                         exit 0. I3 cross-tool contract.
 
-    --help              Structured help, hyperlinked into `doc mkdir`.
+    --help              NOT parsed by mkdir. The shell intercepts
+                        --help before exec and dispatches to
+                        `doc mkdir`, which renders this document —
+                        mkdir's own parse_flags_from_argv has no
+                        recogniser for --help and is not meant to grow
+                        one (14 tools should not each inline a help
+                        renderer).
 
-    --version           Print `mkdir 1.0.0 (build <hash>) sig=<fp>` and
-                        exit 0.
+    --version           Print `mkdir 1.0.0 (build unknown) sig=placeholder`
+                        and exit 0. `build`/`sig` are static placeholders
+                        (mkdir.ENH-003) — there is no build-time hash or
+                        signature substitution mechanism in this tree;
+                        the real values arrive when the T-INFRA-002
+                        signing-bot pass wires one up.
 
 # EXIT CODES
 

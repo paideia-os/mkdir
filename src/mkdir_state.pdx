@@ -148,6 +148,8 @@ module MkdirState = structure {
   pub let mut flag_p          : u64 = uninit @align(8)  // 1 iff -p seen
   pub let mut flag_v          : u64 = uninit @align(8)  // 1 iff -v seen
   pub let mut flag_dry_run    : u64 = uninit @align(8)  // 1 iff --dry-run seen
+  pub let mut flag_schema     : u64 = uninit @align(8)  // 1 iff --schema seen (mkdir.ENH-001)
+  pub let mut flag_version    : u64 = uninit @align(8)  // 1 iff --version seen (mkdir.ENH-003)
   pub let mut exit_code       : u64 = uninit @align(8)  // sys_exit arg
   pub let mut err_pos_index   : u64 = uninit @align(8)  // pos_ptrs[i] that failed
   pub let mut mkdir_run_i     : u64 = uninit @align(8)  // mkdir_run loop counter
@@ -384,9 +386,10 @@ module MkdirState = structure {
   // in the first place).
   pub let mut rmdir_undo_records_count : u64 = uninit @align(8)
 
-  // mkdir_state_reset() — zero the three flag slots, the exit code, and
-  // the error positional index so a subsequent _start starts from a
-  // known-empty MkdirState. rax=0 is the value written; xor rax,rax is
+  // mkdir_state_reset() — zero the five flag slots (p / v / dry_run /
+  // schema / version), the exit code, and the error positional index
+  // so a subsequent _start starts from a known-empty MkdirState.
+  // rax=0 is the value written; xor rax,rax is
   // one byte cheaper than mov rax,0 and produces the same result. r11
   // is scratch (paideia-as conformance). Leaf function — no callee-save
   // touched.
@@ -401,12 +404,14 @@ module MkdirState = structure {
   pub let mkdir_state_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 + M3-002 + M3-003 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Thirteen lea+mov stores zero the singleton flag/exit/err/loop-counter slots plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count plus the M3-002 audit_emitted_invoke gate plus the M3-003 rmdir_undo_records_count so parse_flags_from_argv, mkdir_one, mkdir_run, the M3-001 record staging path, the M3-002 audit-emit path, and the M3-003 undo-record staging path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records / rmdir_undo_records arrays are consumed by index up to their respective counters (comp_count / created_dir_records_count / rmdir_undo_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
+      justification: "mkdir.M1-001 + M2-001 + M2-002 + M3-001 + M3-002 + M3-003 + mkdir.ENH-001 + mkdir.ENH-003 MkdirState mkdir_state_reset. Renamed at M1-002 to dodge the libpdx-argv `reset` collision (paideia-as flat linker-name convention). Fifteen lea+mov stores zero the singleton flag/exit/err/loop-counter slots (including the ENH-001 flag_schema and ENH-003 flag_version singletons) plus the M2-001 comp_count / newly_created_count / walk_i counters plus the M3-001 current_txn_id and created_dir_records_count plus the M3-002 audit_emitted_invoke gate plus the M3-003 rmdir_undo_records_count so parse_flags_from_argv, mkdir_one, mkdir_run, the M3-001 record staging path, the M3-002 audit-emit path, and the M3-003 undo-record staging path start from a known baseline. The comp_start_offsets / comp_lengths / comp_pre_existed / created_dir_records / rmdir_undo_records arrays are consumed by index up to their respective counters (comp_count / created_dir_records_count / rmdir_undo_records_count), so their trailing entries are unreachable and do not need zeroing — same consume-by-index discipline as ParsedArgs::reset in libpdx-argv/src/parsed_args.pdx. Leaf function; r11 scratch per paideia-as reserved-scratch rule; no push/pop parity to preserve; no cmp / no test mnemonic.",
       block: {
         xor rax, rax;
         lea r11, [rip + flag_p];                    mov [r11], rax;
         lea r11, [rip + flag_v];                    mov [r11], rax;
         lea r11, [rip + flag_dry_run];              mov [r11], rax;
+        lea r11, [rip + flag_schema];                mov [r11], rax;
+        lea r11, [rip + flag_version];               mov [r11], rax;
         lea r11, [rip + exit_code];                 mov [r11], rax;
         lea r11, [rip + err_pos_index];             mov [r11], rax;
         lea r11, [rip + mkdir_run_i];               mov [r11], rax;
