@@ -1,8 +1,24 @@
 # mkdir — status
 
 **Wave:** R50 coreutil
-**Current milestone:** M5 — CLOSED. Tag `v1.0.0` at HEAD.
+**Current milestone:** M5 — CLOSED. Tag `v1.0.0` at HEAD (M1..M5 milestone
+rollup below is the frozen v1.0.0 snapshot).
 mkdir is *released* per the `r49-r50-plan.md` §5.9 rubric.
+
+**Milestone #6 — Enhancement v1.x:** IN PROGRESS post-1.0.0. See
+`design/enhancement-plan.md` for the grep-verified defect list and
+`CHANGELOG.md`'s "Unreleased" section for landed fixes. 9 of 12 issues
+closed: the `..` subtree-containment escape (ENH-004), the non-`-p`
+`path_len == 0` bug (ENH-005), the TXN double-commit / record-clobber
+bug across multiple positionals (ENH-006), `--schema` / `--version`
+(ENH-001 / ENH-003), the false `cap_manifest_verify`-runs-at-`_start`
+claim + missing caps.decl slot 4 (ENH-008), `deps.list` reconciliation
+(ENH-009), `-v` per-level emission (ENH-011), and an extended test
+matrix asserting record FIELDS across multiple positionals (ENH-012).
+Open: `--json` + live semantic-pipe emit (ENH-002 — no confirmed
+`send_record` call site exists anywhere in the ecosystem yet, see that
+issue), and two issues with kernel/shell-side companions not yet
+landed (ENH-007 real argv-in-sidecar; ENH-010 kernel `sys_getcwd` wire).
 
 ## Milestone rollup
 
