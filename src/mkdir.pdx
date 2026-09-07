@@ -1,1635 +1,246 @@
-// src/mkdir.pdx — mkdir.M1-001 + M1-002 + M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-002 + M3-003
-// Mkdir module: _init_caps sidecar declaration + _start orchestrator +
-// argv wire-up + flag walk + mkdir_one create sequence + mkdir_run
-// positional walk. M1-001 landed the scaffold shape (ring3 marker +
-// sys_exit(0)); M1-002 lands the argv surface (Parser::parse_argv,
-// well-known flag walk over `-p / -v / --dry-run`, missing-operand
-// rejection); M1-003 lands the single-level create sequence (multi-
-// level guard, --dry-run short-circuit, and the placeholder TXN-open →
-// create-dir → TXN-commit chain that waits on the M2 substrate);
-// M2-001 lifts the multi-level guard when `-p` is present, adds a
-// leaf `mkdir_split_path` component splitter, and wraps a single-TXN
-// scope around a per-component walk that tracks
-// `MkdirState::newly_created_count` for the M3-003 undo record; M2-002
-// adds a per-component pre-existence probe (placeholder until
-// mkdir.M2-substrate-002) so `-p` treats pre-existing levels as
-// no-ops rather than errors and does NOT queue them for undo; M2-003
-// stamps the invoker's KIND_USER cap (SLOT_USER) as the owner tail
-// on every newly-created inode (placeholder until
-// mkdir.M2-substrate-003), so the M3-001 CreatedDirRecord's
-// `owner:KIND_USER_ref` field renders correctly.
+// src/mkdir.pdx -- mkdir v1.1-A (real body extraction)
 //
-// See design/architecture.md §2 (module boundary), §3 (_start shape),
-// §4 (mkdir_one create sequence), §4a (mkdir_split_path — M2-001),
-// §5 (flag semantics table), and §6 (sidecar cap slot map).
-// Upstream: design/tooling/r49-r50-plan.md §5.9 (paideia-os).
+// v1.1-A retires the M1..M5 STUB scaffold and wires the real
+// `sys_mkdir` syscall (sysno 79, per paideia-os
+// design/user/syscall-table.md row 79) as the tool's create primitive.
+//
+// -----------------------------------------------------------------------------
+// v1.1-A behavioural contract
+// -----------------------------------------------------------------------------
+//
+//   mkdir <PATH> [<PATH>...]
+//
+// - argv is read directly from the frozen execve ABI: rdi = argc,
+//   rsi = argv (u64*), where argv[0] is the program name. See
+//   paideia-os design/user/execve-abi.md.
+// - Each positional PATH argv[1..argc] is passed to sys_mkdir with
+//   mode 0755 (0x1ED) and a path_len_hint of 255 -- the walker-cap
+//   convention documented in paideia-os design/user/syscall-table.md
+//   §"Walker length hint semantics" (the kernel copies up to
+//   min(hint, 255) bytes from user VA until it sees NUL; callers pass
+//   255 or any bound larger than the actual path).
+// - No -p (parents), no -m (custom mode): v1.1-A is intentionally the
+//   minimum viable body. Multi-level paths that need parent creation
+//   are the caller's obligation until v1.2-A relands the -p walker on
+//   top of the real substrate.
+// - Exit contract: 0 on all-success; on the first sys_mkdir that
+//   returns non-zero the tool exits with that value (a negative errno
+//   per the paideia-os -errno sentinel convention, which sys_exit
+//   accepts verbatim as its status word). No further positionals are
+//   attempted after the first failure.
+// - argc < 2 (no positional) is a hard error: emits `mkdir: missing
+//   operand\n` and exits 2 (retained for continuity with the M5-era
+//   MK_MISSING_PATH code).
+//
+// -----------------------------------------------------------------------------
+// What v1.1-A retires from M1..M5
+// -----------------------------------------------------------------------------
+//
+// The v1.0.0 tag shipped a shape-only scaffold that dispatched every
+// step through placeholder `sys_cap_invoke` ops on four cap slots
+// (KIND_PDXFS_TXN / KIND_PDXFS_FILE / KIND_USER / KIND_IPC_ENDPOINT).
+// No directory was ever created on disk -- PXT_OP_CREATE stubbed to
+// PXT_STUB_OK, the "commit" was a state-transition on a placeholder
+// TXN, and argv was a static bootstrap array (`-p -v --dry-run
+// a/b/c`) so the tool could not read what a user typed. Every one of
+// those seams is retired at v1.1-A:
+//
+//   - `_init_caps` sidecar removed entirely -- the tool takes no caps
+//     at exec, since sys_mkdir is a plain @{fs} syscall and does not
+//     go through the cap subsystem.
+//   - `parse_flags_from_argv`, `mkdir_split_path`, `mkdir_one`,
+//     `mkdir_run` deleted -- v1.1-A is one straight-line loop in
+//     `_start` with no per-path helper.
+//   - `mkdir_state.pdx` deleted -- v1.1-A carries no state across
+//     iterations, so MkdirState's `.bss` singletons, per-component
+//     bookkeeping arrays, and CreatedDirRecord[] / RmdirUndoRecord[]
+//     staging are all unnecessary.
+//   - libpdx-argv dependency dropped -- argv is read directly from
+//     rdi/rsi per the execve ABI, matching the pattern
+//     paideia-os/src/user/mkdir.pdx (the in-kernel /bin/mkdir) uses.
+//   - libpdx-cap, libpdx-audit, libpdx-semantic-pipe dependencies
+//     dropped (grep-verified never linked in the M1..M5 scaffold
+//     either; enhancement-plan §3.7 already listed these three as
+//     stale pins).
+//   - `caps.decl` narrowed to zero required caps.
+//   - `-p`, `-v`, `--dry-run`, `--schema`, `--version` flags removed:
+//     v1.1-A recognises no flags. `--help` remains shell-dispatched to
+//     `doc mkdir` (mkdir never saw the flag under M5 either).
+//   - CreatedDirRecord@0.1 and RmdirUndoRecord@0.1 schema emit removed
+//     -- with no state to stage and no consumer in the ecosystem, the
+//     record shape returns as a live emit when a follow-up wave lands
+//     the semantic-pipe consumer.
+//   - Audit-journal emit removed -- audit is D3 obligation but the
+//     hand-rolled sys_cap_invoke shape was never a real libpdx-audit
+//     call. A follow-up wave rebuilds it on the real library.
+//
+// -----------------------------------------------------------------------------
+// SC+ IDs used
+// -----------------------------------------------------------------------------
+//
+// Inlined directly at call sites -- no syscall_shim link dependency,
+// mirroring paideia-os/src/user/mkdir.pdx and its sibling /bin
+// tools (true.pdx / cat.pdx / rm.pdx / mv.pdx / cp.pdx).
+//
+//   12 = sys_debug_puts(buf, count) -- stderr diagnostic emit
+//   60 = sys_exit(status)           -- never returns
+//   79 = sys_mkdir(path_va, path_len_hint, mode) -- R56.M3-004 (#1793)
+//        kernel body at src/kernel/core/syscall/sys_mkdir.pdx. rax = 0
+//        on success, negative errno on failure (see paideia-os
+//        design/user/syscall-table.md and sys_mkdir.pdx §Failure
+//        taxonomy: -EFAULT / -ENOENT / -ENOTDIR / -EIO / etc.).
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// - rbx = argc (SysV callee-save; syscall preserves it -- amd64
+//   fast-syscall only clobbers rcx/r11).
+// - r12 = argv base pointer (SysV callee-save).
+// - r13 = current positional index (starts at 1 to skip argv[0]).
+// - r14 = saved -errno across the failure-diagnostic sys_debug_puts
+//   call (so we can pass the original -errno through to sys_exit).
+// - rdi/rsi/rdx/rax carry syscall args at each site.
+// - No prologue push: entry rsp % 16 == 0 per the PVH loader
+//   contract, and every terminal path ends in sys_exit (never
+//   returns), so there is no callee-save state to preserve for a
+//   caller that does not exist.
+// - @no_frame attribute reflects the never-return shape.
+//
+// -----------------------------------------------------------------------------
+// Encoder-gap discipline (paideia-as feedback_pdx_encoder_pitfalls)
+// -----------------------------------------------------------------------------
+//
+// - No `add reg, [mem]` / `sub reg, [mem]` anywhere.
+// - All `cmp reg, imm` immediates fit in imm16 (max seen: 0x1ED = 493).
+// - No `test` mnemonic; zero-checks use `cmp rax, 0`.
+// - r11 reserved as LEA scratch (not used here -- straight-line body
+//   has no LEA-into-scratch pattern).
+// - Reserved-label discipline: every label is prefixed `mkdir_` to
+//   dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`,
+//   `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`).
 
 module Mkdir = structure {
 
-  // ============================================================================
-  // _init_caps sidecar — FIVE entries (M3-002 added the audit endpoint).
-  // Layout per design/loader/init-caps-sidecar.md §2 (paideia-os) and
-  // src/kernel/core/loader/init_caps.pdx (R20b.M4).
+  // Diagnostic strings -- NUL-terminated for future strlen consumers;
+  // wire length excludes the trailing NUL. ASCII "--" in place of an
+  // em-dash keeps every line 7-bit ASCII (mirrors paideia-os user
+  // tools' fingerprint-string convention).
+
+  pub let err_no_operand_msg : [u8; 24] = "mkdir: missing operand\n\0"
+  pub let err_no_operand_len : u64 = 23
+
+  pub let err_mkdir_fail_msg : [u8; 20] = "mkdir: create failed\n\0"
+  pub let err_mkdir_fail_len : u64 = 19
+
+  // -----------------------------------------------------------------------
+  // _start -- user program entry point. Never returns.
   //
-  // Word packing per entry (16 bytes each):
-  //   word0 = (rights << 32) | (kind << 16) | slot
-  //   word1 = target_ptr  (kind-specific; 0 at M1 — populated by the
-  //           loader from the shell's cap_transfer at spawn time)
+  // Signature per execve ABI (paideia-os design/user/execve-abi.md):
+  //   rdi = argc (u64)
+  //   rsi = argv (u64*) -- argv[0] is program name
   //
-  // Entry 0: slot=0, kind=KIND_PDXFS_TXN(0x196), rights=INVOKE|OBSERVE
-  //   INVOKE=0x008, OBSERVE=0x400 → 0x408.
-  // Entry 1: slot=1, kind=KIND_PDXFS_FILE(0x195), rights=INVOKE(0x008)
-  // Entry 2: slot=2, kind=KIND_USER(0x190), rights=INVOKE(0x008)
-  // Entry 3: slot=3, kind=KIND_IPC_ENDPOINT(0x005), rights=WRITE|INVOKE
-  //   WRITE=0x002, INVOKE=0x008 → 0x00A.
-  // Entry 4: slot=4, kind=KIND_IPC_ENDPOINT(0x005), rights=WRITE|INVOKE
-  //   Same as entry 3; bound to svc.audit-journal by the shell at
-  //   spawn time (M3-002). Kept separate from slot 3 (semantic pipe)
-  //   so a future revoke of the schema pipe does not also revoke
-  //   audit — audit is an independent audit-first (D3) commitment.
+  // Effects/caps:
+  //   mem     -- reads err_* rodata; dereferences argv[i] pointers.
+  //   sysreg  -- every SYSCALL clobbers rcx (RIP) / r11 (rflags).
+  //   fs      -- sys_mkdir surface.
+  //   sched   -- sys_exit terminates the task.
   //
-  // target_ptr at M1 is 0 for every row — the shell fills it via
-  // sys_cap_transfer before the exec landing. Matches echo_client's
-  // sidecar shape at R31.M2-1590 (endpoint_ids were baked in there
-  // because the loader claimed both endpoints by id; here the parent
-  // shell owns the resolution).
-  // ============================================================================
-
-  pub let _init_caps_count : u64 = 5
-
-  pub let _init_caps : [u64; 10] = [
-    // Entry 0 — KIND_PDXFS_TXN at slot 0.
-    0x0000040801960000,
-    0x0000000000000000,
-    // Entry 1 — KIND_PDXFS_FILE at slot 1.
-    0x0000000801950001,
-    0x0000000000000000,
-    // Entry 2 — KIND_USER at slot 2.
-    0x0000000801900002,
-    0x0000000000000000,
-    // Entry 3 — KIND_IPC_ENDPOINT at slot 3 (semantic pipe).
-    0x0000000A00050003,
-    0x0000000000000000,
-    // Entry 4 — KIND_IPC_ENDPOINT at slot 4 (svc.audit-journal). M3-002.
-    0x0000000A00050004,
-    0x0000000000000000
-  ]
-
-  // ============================================================================
-  // Static stderr / diagnostic strings.
-  //
-  // sys_debug_puts (SC+ ID 12) is the M1 stderr proxy; M3-001 replaces
-  // every call site with a schema-tagged send_record over the
-  // KIND_IPC_ENDPOINT at slot 3.
-  //
-  // Each string is NUL-terminated so a future emit_stderr overload that
-  // takes a NUL-terminated pointer can share the byte storage; the
-  // paired *_len constants are what M1 passes to sys_debug_puts today.
-  // ============================================================================
-
-  pub let ring3_msg           : [u8; 20] = "mkdir: M1 ring3 ok\n\0"
-  pub let ring3_len           : u64 = 19
-
-  pub let err_argv_msg        : [u8; 26] = "mkdir: argv parse error\n\0\0"
-  pub let err_argv_len        : u64 = 24
-
-  pub let err_no_operand_msg  : [u8; 24] = "mkdir: missing operand\n\0"
-  pub let err_no_operand_len  : u64 = 23
-
-  // ---- M1-003 mkdir_one diagnostic strings ----
-  //
-  // err_multi_msg still fires when a path contains '/' WITHOUT the -p
-  // flag (POSIX-canonical mkdir behaviour, preserved at M2). Under -p,
-  // multi-level paths route through mkdir_split_path (M2-001).
-  pub let err_multi_msg       : [u8; 40] = "mkdir: multi-level path needs M2 (-p)\n\0\0"
-  pub let err_multi_len       : u64 = 38
-
-  pub let err_txn_open_msg    : [u8; 24] = "mkdir: TXN open failed\n\0"
-  pub let err_txn_open_len    : u64 = 23
-
-  pub let err_mkdir_msg       : [u8; 22] = "mkdir: create failed\n\0"
-  pub let err_mkdir_len       : u64 = 21
-
-  pub let err_commit_msg      : [u8; 26] = "mkdir: TXN commit failed\n\0"
-  pub let err_commit_len      : u64 = 25
-
-  // ---- M2-001 mkdir_split_path diagnostic strings ----
-  //
-  // Absolute paths are rejected at v1.0 per r49-r50-plan.md §5.9
-  // ("directories only created in the invoker's own subtree at v1.0").
-  // Absolute-path support waits on shell.M4 publishing a base-cap
-  // convention that lets mkdir walk to the anchor via a scoped cap.
-  //
-  // Path-too-deep is a hard bound at PATH_MAX_COMPONENTS = 16; any
-  // deeper is refused rather than silently truncated so the caller
-  // sees the depth-mismatch at exec time.
-  pub let err_abs_path_msg    : [u8; 40] = "mkdir: absolute path unsupported at M2\n\0"
-  pub let err_abs_path_len    : u64 = 39
-
-  pub let err_too_deep_msg    : [u8; 40] = "mkdir: path too deep (max 16 levels)\n\0\0\0"
-  pub let err_too_deep_len    : u64 = 37
-
-  // mkdir.ENH-004: subtree containment guard. A path component of
-  // exactly two bytes ".." is rejected in mkdir_split_path before any
-  // cap invocation — see MK_PARENT_REF_UNSUPPORTED in mkdir_state.pdx.
-  pub let err_parent_ref_msg  : [u8; 41] = "mkdir: '..' component unsupported at M2\n\0"
-  pub let err_parent_ref_len  : u64 = 40
-
-  // ---- M2-003 cap-tail owner stamp diagnostic string ----
-  //
-  // The cap-tail stamp records the invoker's KIND_USER cap into the
-  // newly-created inode's owner slot. Failure here fires when
-  // sys_cap_invoke through SLOT_USER returns negative — usually
-  // because slot 2 was mis-seeded by the loader / shell. M2-003
-  // treats stamp failure as a hard error: the directory was created
-  // but its owner slot is unset, which would show up as
-  // `ls --long <dir>` rendering an anonymous owner — a D3/D4
-  // violation. Rolling back via TXN abort is left to
-  // mkdir.M2-substrate-001 (the placeholder stamp cannot fail at M2,
-  // since it uses a QUERY op that already passed the cap-invoke
-  // gate; the return-negative path guards against a future substrate
-  // wire that DOES fail conditionally).
-  pub let err_cap_tail_msg    : [u8; 32] = "mkdir: cap-tail stamp failed\n\0\0\0"
-  pub let err_cap_tail_len    : u64 = 29
-
-  // ---- mkdir.ENH-001 --schema static emit ----
-  //
-  // mkdir already declares `CreatedDirRecord@0.1` under
-  // `declares_output_schemas` in caps.decl and carries the frozen
-  // handle CDR_SCHEMA_HANDLE = 0x0100000100010001 — `--schema` prints
-  // the field list a consumer needs to decode a staged record without
-  // running the tool. Checked in _start BEFORE the missing-operand
-  // check, so `mkdir --schema` (no path operand) exits 0 rather than
-  // MK_MISSING_PATH.
-  pub let schema_msg : [u8; 96] =
-    "CreatedDirRecord@0.1 { path_ptr: u64, path_len: u64, parent_txn_id: u64, owner_slot_ref: u64 }\n\0"
-  pub let schema_len : u64 = 95
-
-  // ---- mkdir.ENH-003 --version static emit ----
-  //
-  // `build`/`sig` are placeholders — same convention deps.list and
-  // manifest.pdxsig use for values the T-INFRA-002 signing-bot host
-  // fills in later; there is no build-time hash/signature substitution
-  // mechanism in this tree today. Checked in _start BEFORE the
-  // missing-operand check, same as --schema.
-  pub let version_msg : [u8; 45] =
-    "mkdir 1.0.0 (build unknown) sig=placeholder\n\0"
-  pub let version_len : u64 = 44
-
-  // ---- mkdir.ENH-011 -v per-level emission ----
-  //
-  // Two static pieces bracket the DYNAMIC path substring (path_ptr,
-  // path_len — the same cumulative-prefix pair Step 6e/6f already
-  // compute for CreatedDirRecord/RmdirUndoRecord): the constant prefix
-  // "mkdir: created " and a trailing newline. Three emit_stderr calls
-  // per created level rather than one, since there is no in-tree
-  // strcat/sprintf helper to compose a single buffer from a static
-  // prefix + a dynamic-length argv substring + a static suffix.
-  pub let verbose_created_msg : [u8; 16] = "mkdir: created \0"
-  pub let verbose_created_len : u64 = 15
-
-  pub let verbose_newline_msg : [u8; 2] = "\n\0"
-  pub let verbose_newline_len : u64 = 1
-
-  // ============================================================================
-  // Bootstrap argv (mkdir.M1-002 self-test)
-  //
-  // Real argv arrives via the shell at mkdir.M2 once shell.M4 publishes
-  // the argv-in-sidecar wire. Until then _start builds a static argv
-  // that exercises the parse path end to end — one short flag (-v),
-  // one long flag (--dry-run), and one positional (a). The three
-  // flag/positional strings live in .rodata; the argv pointer array
-  // (`argv_bootstrap_ptrs`) is built at _start entry via three lea+mov
-  // stores. Parser::parse_argv walks the pointer array and does NOT
-  // mutate the strings themselves at the shapes M1-002 exercises (no
-  // `--foo=bar` form appears here), so the strings staying .rodata is
-  // safe.
-  //
-  // Bootstrap invocation shape (M2-001, four args, matches
-  // `mkdir -p -v --dry-run a/b/c`):
-  //   argv[0] = "-p"          → short flag, sets MkdirState::flag_p
-  //   argv[1] = "-v"          → short flag, sets MkdirState::flag_v
-  //   argv[2] = "--dry-run"   → long flag, sets MkdirState::flag_dry_run
-  //   argv[3] = "a/b/c"       → positional, becomes pos_ptrs[0]
-  // Design rationale for the M2 argv change: the M1 bootstrap was
-  // `-v --dry-run a` — enough to prove the flag walk and the
-  // single-level create path. M2 lands the `-p` split, so the smoke
-  // needs a multi-level positional to actually run mkdir_split_path.
-  // `--dry-run` still short-circuits `mkdir_one` before the placeholder
-  // cap invocations — but AFTER the split has validated the path — so
-  // the M2 exit-0 witness proves the whole split path parses cleanly
-  // (three components: "a", "b", "c") without depending on the
-  // still-being-built kernel-side create-dir op.
-  // ============================================================================
-
-  pub let argv_flag_p         : [u8; 3]  = "-p\0"
-  pub let argv_flag_v         : [u8; 3]  = "-v\0"
-  pub let argv_flag_dry_run   : [u8; 10] = "--dry-run\0"
-  pub let argv_positional_abc : [u8; 6]  = "a/b/c\0"
-
-  pub let mut argv_bootstrap_ptrs : [u64; 4] = uninit @align(8)
-  pub let argv_bootstrap_argc     : u64 = 4
-
-  // ============================================================================
-  // Well-known flag names — byte-exact compare table for
-  // parse_flags_from_argv. Every entry is NUL-terminated; the compare
-  // walks each byte in order and rejects on the first mismatch.
-  //
-  // libpdx-argv predates any strcmp helper (see the inline pdx-schema
-  // byte compare in libpdx-argv/src/parser.pdx L151..L161). We repeat
-  // the pattern here rather than pull in a strcmp dependency; when
-  // libpdx-argv.M2 factors `well_known_flag_id(name) → i64`, every
-  // consumer switches to it and this table disappears.
-  //
-  // Short-flag names are one letter (parse_argv stores just the letter,
-  // not the leading '-', at flag_names[k] after skipping the hyphen).
-  // Long-flag names are the post-`--` string (parse_argv stores that
-  // pointer at flag_names[k] with the leading `--` already stripped).
-  // ============================================================================
-
-  pub let flag_p_name         : [u8; 2]  = "p\0"
-  pub let flag_v_name         : [u8; 2]  = "v\0"
-  pub let flag_dry_run_name   : [u8; 8]  = "dry-run\0"
-
-  // ============================================================================
-  // emit_stderr(buf, len)
-  //
-  // Signature: emit_stderr : (u64, u64) -> u64 !{mem, sysreg} @{}
-  //   rdi = buf pointer (u8*)
-  //   rsi = byte count
-  //   rax = sys_debug_puts return (echoed count on success)
-  //
-  // Thin wrapper around sys_debug_puts (SC+ ID 12). Kept as its own
-  // symbol so mkdir.M3-001's rewrite is a one-line body swap (from
-  // sys_debug_puts to a semantic-pipe send_record) at exactly one call
-  // site rather than every diagnostic site. Same idiom libpdx-cap uses
-  // for cap_manifest_verify — freeze the signature at M1, evolve the
-  // body across milestones.
-  //
-  // Register plan (leaf, all caller-save; no push/pop parity):
-  //   rax = SC+ ID / syscall return
-  //   rdi = buf (untouched — passed straight through)
-  //   rsi = len (untouched — passed straight through)
-  // ============================================================================
-  pub let emit_stderr : (u64, u64) -> u64 !{mem, sysreg} @{} =
-    fn (buf: u64) (len: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "mkdir.M1-002 emit_stderr — thin sys_debug_puts wrapper. SC+ ID 12 loaded into rax; rdi/rsi come straight from the SysV caller (arity 2 < 4, no arg shuffle). Kept as its own symbol so mkdir.M3-001 can swap sys_debug_puts for a semantic-pipe send_record at exactly one call site rather than every diagnostic emit. Leaf function; no callee-save touched; no push/pop parity to preserve; no cmp; no test mnemonic.",
-      block: {
-        mov rax, 12;                              // SC+ ID 12 = sys_debug_puts
-        syscall;
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // emit_audit_event(event_kind) — M3-002 audit-journal emit.
-  //
-  // Signature: emit_audit_event : (u64) -> u64 !{mem, sysreg} @{cap}
-  //   rdi = event_kind — one of UEJ_KIND_TOOL_INVOKE (130) /
-  //         UEJ_KIND_TOOL_ERROR (131) / UEJ_KIND_TOOL_CREATE_DIR (a
-  //         mkdir-local synthetic kind used per-created level).
-  //   rax = sys_cap_invoke return (any value; callers IGNORE the
-  //         return per the plan-doc §4.9 audit-first / D3
-  //         non-degrading rule — a full audit journal MUST NOT
-  //         sink the mkdir op, otherwise a tool that CAN suppress
-  //         its own audit trail exists).
-  //
-  // Sends via KIND_IPC_ENDPOINT dispatch on SLOT_AUDIT_EP (4). The
-  // op_arg packs op_code = IPC_OP_SEND (3) in bits [7:0] and
-  // event_kind in bits [63:8]; the kernel-side KindIpc handler at
-  // src/kernel/core/cap/kind_ipc.pdx L48 decodes op_code = SEND and
-  // enqueues the payload byte (== event_kind here) onto the global
-  // channel. The svc.audit-journal daemon body — the real consumer
-  // that will decode event_kind, marshal the payload into a
-  // /system/audit/user-events/*.pdxevent record, and durably persist
-  // it — has not landed yet (design/tooling/r49-r50-plan.md §5.0
-  // R49-PREP-006). Until then the send lands in the R12 IPC MVP's
-  // global SPSC channel, exercising the dispatch path and the
-  // rights gate (WRITE | INVOKE required, matches our
-  // R_IPC_WRITE|R_IPC_INVOKE = 0x0A cap).
-  //
-  // The M3-substrate-002 follow-up at paideia-os will replace this
-  // one-syscall shape with the libpdx-audit-M2 marshalling call
-  // that builds a full UejRecord (event_kind + actor_fp_lo +
-  // subject_fp_lo + body0..2 + tick_ns) and calls sys_ipc_send with
-  // a header + payload buffer — same signature (u64 event_kind ->
-  // u64) so no call-site rewrite here.
-  //
-  // Register plan (leaf; SysV-clean):
-  //   rax = SC+ ID / syscall return
-  //   rdi = SLOT_AUDIT_EP (overwrites incoming event_kind)
-  //   rsi = op_arg = (event_kind << 8) | IPC_OP_SEND
-  //   r10 = event_kind (preserved across the rdi overwrite)
-  //   r11 = shift scratch
-  //
-  // Effects / capabilities:
-  //   mem     — kind_ipc handler transitively writes ipc queues.
-  //   sysreg  — SYSCALL.
-  //   @{cap}  — sys_cap_invoke is cap-gated.
-  // ============================================================================
-  pub let emit_audit_event : (u64) -> u64 !{mem, sysreg} @{cap} =
-    fn (event_kind: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M3-002 emit_audit_event — audit-journal emit shim. Packs event_kind into op_arg[63:8] and IPC_OP_SEND (3) into op_arg[7:0], then invokes SLOT_AUDIT_EP (4) via sys_cap_invoke. Kernel-side KindIpc handler at src/kernel/core/cap/kind_ipc.pdx L48 decodes op_code=SEND, checks the WRITE|INVOKE (0x0A) rights we hold, and enqueues the payload byte onto the R12 IPC MVP global channel. The svc.audit-journal daemon body (design/tooling/r49-r50-plan.md §5.0 R49-PREP-006) will later replace the R12 global channel with a per-broker sink that decodes event_kind and durably persists a /system/audit/user-events/*.pdxevent record. Caller ignores the return per D3 non-degrading rule — a full audit journal must not sink the tool op. Leaf function; SysV-clean (no push/pop); r11 scratch used only for the shl of event_kind before the OR; no test mnemonic. Labels prefixed mkdir_aud_.",
-      block: {
-        // r10 = event_kind (preserve before overwriting rdi with slot).
-        mov r10, rdi;
-
-        // rsi = (event_kind << 8) | IPC_OP_SEND (3).
-        mov rsi, r10;
-        shl rsi, 8;
-        mov r11, 3;                               // IPC_OP_SEND
-        or  rsi, r11;
-
-        // rdi = SLOT_AUDIT_EP (4).
-        mov rdi, 4;
-
-        // sys_cap_invoke.
-        mov rax, 4;                               // SC+ ID 4
-        syscall;
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // parse_flags_from_argv()
-  //
-  // Walk ParsedArgs::flag_names[0..flag_count] and for each entry
-  // byte-compare against the five well-known names (`p`, `v`,
-  // `dry-run`, `schema` [mkdir.ENH-001], `version` [mkdir.ENH-003]). On
-  // a match, write 1 into the corresponding MkdirState slot (`flag_p`,
-  // `flag_v`, `flag_dry_run`, `flag_schema`, `flag_version`). Unknown
-  // flags at M1-002 are silently ignored — the 9-flag standard-
-  // vocabulary rejection path lands at libpdx-argv.M2-002.
-  //
-  // Called AFTER Parser::parse_argv has populated ParsedArgs; must be
-  // called BEFORE mkdir_run so mkdir_one sees the correct flag state.
-  //
-  // Register plan (leaf, all caller-save):
-  //   rax = byte load scratch (always preceded by xor rax, rax per #1248)
-  //   rcx = flag_names[k] name pointer
-  //   r8  = k (loop counter over flag_count)
-  //   r9  = flag_count (loaded once at head)
-  //   r10 = byte offset into the current name during the byte compare
-  //   r11 = LEA scratch (paideia-as reserved)
-  // ============================================================================
-  pub let parse_flags_from_argv : () -> () !{mem} @{} =
+  // @no_frame because every terminal path ends in sys_exit (never
+  // returns), matching every /bin coreutil in the paideia-os user tree.
+  // -----------------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
     fn () -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "mkdir.M1-002 + mkdir.ENH-001 + mkdir.ENH-003 parse_flags_from_argv. Walks ParsedArgs::flag_names[0..flag_count] and byte-matches each name against `p` / `v` / `dry-run` / `schema` / `version` (the five flags mkdir recognizes). Sets MkdirState::flag_p / flag_v / flag_dry_run / flag_schema / flag_version to 1 on match. The try-chain order is p -> v -> dry-run -> schema -> version -> advance; each successful match falls through into the next candidate's compare unless it explicitly jumps to mkdir_pff_advance after storing its flag (dry-run and schema do; version does not need to since mkdir_pff_advance is its very next label). Unknown flags silently ignored — libpdx-argv.M2-002 lands the 9-flag standard-vocabulary rejection path; until then the recognizer is permissive so an over-argument does not sink the whole invocation. paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every cmp reg,imm is a single-byte ASCII value ≤ 0x7A; r11 is scratch (LEA); no push/pop parity (leaf); no test mnemonic. Label prefix `mkdir_pff_` avoids every paideia-as reserved keyword.",
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "mkdir v1.1-A _start: real sys_mkdir extraction from the M1..M5 STUB. Reads argc (rdi) and argv (rsi) per the frozen execve ABI (paideia-os design/user/execve-abi.md, matching src/user/mkdir.pdx and every /bin sibling). argc < 2 -> emit `mkdir: missing operand\\n` via sys_debug_puts (SC+ ID 12), sys_exit(2). Otherwise walk argv[1..argc]: for each positional, load argv[i] into rdi and call sys_mkdir (SC+ ID 79, R56.M3-004 kernel body at src/kernel/core/syscall/sys_mkdir.pdx) with rsi = 255 (walker-cap hint per design/user/syscall-table.md §Walker length hint semantics) and rdx = 0x1ED (mode 0755, matching rootfs_seed.pdx's /home mkdir at src/user/rootfs_seed.pdx L213). rax == 0 -> advance to next positional. rax != 0 -> failure branch: preserve -errno in r14 across a diagnostic sys_debug_puts of `mkdir: create failed\\n`, then sys_exit(r14) -- the -errno is passed through verbatim to sys_exit's status word per the v1.1-A contract (`0 on success, -errno on first failure`). Loop-index invariant: r13 starts at 1 (skip argv[0] = program name) and increments by 1 on each success; loop exits when r13 == rbx (argc). All-success path: sys_exit(0). Register plan: rbx = argc, r12 = argv base, r13 = i, r14 = saved -errno (all SysV callee-save; amd64 fast-syscall preserves them, so no push/pop needed across the sys_mkdir loop iterations). rdi/rsi/rdx/rax are the SysV syscall arg registers. @no_frame because every terminal path ends in sys_exit; entry rsp%16==0 per the PVH loader contract. Encoder-gap discipline: no `add reg, [mem]` / `sub reg, [mem]` anywhere; `mov rdi, [r12 + r13*8]` uses base+index*scale addressing which the encoder supports directly (mirrors src/user/mkdir.pdx's `mov rbx, [rsi + 8]` for a single-index load). Every cmp uses an immediate <= 0x1ED (mode) or a register (argc bound), all fitting imm16 with no sign-extension hazard. No `test` mnemonic. Labels prefixed `mkdir_` to dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`).",
       block: {
-        // Load flag_count once — the loop bound.
-        lea r11, [rip + flag_count];
-        mov r9, [r11];
-
-        // r8 = k = 0
-        xor r8, r8;
-
-      mkdir_pff_loop_head:
-        cmp r8, r9;
-        jge mkdir_pff_done;
-
-        // rcx = flag_names[k]
-        lea r11, [rip + flag_names];
-        mov rcx, [r11 + r8*8];
-
-        // ---- Try short flag `p`: name is [rcx] == 'p' && [rcx+1] == NUL ----
-        xor rax, rax;
-        mov_b rax, [rcx];
-        cmp rax, 0x70;                            // 'p'
-        jne mkdir_pff_try_v;
-
-        xor rax, rax;
-        mov_b rax, [rcx + 1];
-        cmp rax, 0;
-        jne mkdir_pff_try_dry_run;                // 'p...' with more bytes — not our -p
-
-        mov rax, 1;
-        lea r11, [rip + flag_p];
-        mov [r11], rax;
-        jmp mkdir_pff_advance;
-
-      mkdir_pff_try_v:
-        // ---- Try short flag `v`: name is [rcx] == 'v' && [rcx+1] == NUL ----
-        // rax already holds byte0 from the failed `p` compare, so we
-        // reload rather than assume — cheaper to reload than to branch.
-        xor rax, rax;
-        mov_b rax, [rcx];
-        cmp rax, 0x76;                            // 'v'
-        jne mkdir_pff_try_dry_run;
-
-        xor rax, rax;
-        mov_b rax, [rcx + 1];
-        cmp rax, 0;
-        jne mkdir_pff_try_dry_run;
-
-        mov rax, 1;
-        lea r11, [rip + flag_v];
-        mov [r11], rax;
-        jmp mkdir_pff_advance;
-
-      mkdir_pff_try_dry_run:
-        // ---- Try long flag `dry-run`: byte-compare 7 chars + NUL ----
-        // Inline byte-by-byte compare matching libpdx-argv's own
-        // pdx-schema compare pattern (parser.pdx L151..L161).
-        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x64; jne mkdir_pff_try_schema;  // 'd'
-        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x72; jne mkdir_pff_try_schema;  // 'r'
-        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x79; jne mkdir_pff_try_schema;  // 'y'
-        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x2D; jne mkdir_pff_try_schema;  // '-'
-        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x72; jne mkdir_pff_try_schema;  // 'r'
-        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x75; jne mkdir_pff_try_schema;  // 'u'
-        xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0x6E; jne mkdir_pff_try_schema;  // 'n'
-        xor rax, rax; mov_b rax, [rcx + 7]; cmp rax, 0;    jne mkdir_pff_try_schema;  // NUL
-
-        mov rax, 1;
-        lea r11, [rip + flag_dry_run];
-        mov [r11], rax;
-        jmp mkdir_pff_advance;
-
-      mkdir_pff_try_schema:
-        // ---- Try long flag `schema` (mkdir.ENH-001): 6 chars + NUL ----
-        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x73; jne mkdir_pff_try_version;  // 's'
-        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x63; jne mkdir_pff_try_version;  // 'c'
-        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x68; jne mkdir_pff_try_version;  // 'h'
-        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x65; jne mkdir_pff_try_version;  // 'e'
-        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x6D; jne mkdir_pff_try_version;  // 'm'
-        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x61; jne mkdir_pff_try_version;  // 'a'
-        xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0;    jne mkdir_pff_try_version;  // NUL
-
-        mov rax, 1;
-        lea r11, [rip + flag_schema];
-        mov [r11], rax;
-        jmp mkdir_pff_advance;
-
-      mkdir_pff_try_version:
-        // ---- Try long flag `version` (mkdir.ENH-003): 7 chars + NUL ----
-        xor rax, rax; mov_b rax, [rcx + 0]; cmp rax, 0x76; jne mkdir_pff_advance;  // 'v'
-        xor rax, rax; mov_b rax, [rcx + 1]; cmp rax, 0x65; jne mkdir_pff_advance;  // 'e'
-        xor rax, rax; mov_b rax, [rcx + 2]; cmp rax, 0x72; jne mkdir_pff_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rcx + 3]; cmp rax, 0x73; jne mkdir_pff_advance;  // 's'
-        xor rax, rax; mov_b rax, [rcx + 4]; cmp rax, 0x69; jne mkdir_pff_advance;  // 'i'
-        xor rax, rax; mov_b rax, [rcx + 5]; cmp rax, 0x6F; jne mkdir_pff_advance;  // 'o'
-        xor rax, rax; mov_b rax, [rcx + 6]; cmp rax, 0x6E; jne mkdir_pff_advance;  // 'n'
-        xor rax, rax; mov_b rax, [rcx + 7]; cmp rax, 0;    jne mkdir_pff_advance;  // NUL
-
-        mov rax, 1;
-        lea r11, [rip + flag_version];
-        mov [r11], rax;
-
-      mkdir_pff_advance:
-        add r8, 1;
-        jmp mkdir_pff_loop_head;
-
-      mkdir_pff_done:
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // mkdir_split_path(path) -> rc                              (mkdir.M2-001)
-  //
-  // Signature: mkdir_split_path : (u64) -> u64 !{mem} @{}
-  //   rdi = path — NUL-terminated string
-  //   rax = MK_OK                       (0)  — comp_count populated
-  //       | MK_ABS_PATH_UNSUPPORTED     (7)  — path starts with '/'
-  //       | MK_PATH_TOO_DEEP            (8)  — > PATH_MAX_COMPONENTS
-  //                                             non-empty levels
-  //       | MK_PARENT_REF_UNSUPPORTED   (10) — a component is exactly
-  //                                             ".." (mkdir.ENH-004
-  //                                             subtree containment
-  //                                             guard)
-  //
-  // Populates three MkdirState .bss slots:
-  //   comp_start_offsets[i] — byte offset within `path` where
-  //                           component i begins.
-  //   comp_lengths[i]       — byte length of component i
-  //                           (excludes trailing '/' or NUL).
-  //   comp_count            — number of non-empty components (0..16).
-  //
-  // Semantics:
-  //   - Absolute paths (`/foo`) rejected immediately at the first byte
-  //     (v1.0 constraint per r49-r50-plan.md §5.9).
-  //   - Empty components are silently skipped: `foo//bar` → 2 comps
-  //     (`foo`, `bar`); `foo/` → 1 comp (`foo`); `foo/./bar` is NOT
-  //     normalised at M2 — dot components propagate as levels named
-  //     `.` and hit the placeholder create as-is (M2-substrate follow-
-  //     up owns dot-elimination since the real kernel-side create-dir
-  //     op is the correct site for the semantic check).
-  //   - An empty path (first byte NUL) returns MK_OK with comp_count=0;
-  //     the caller decides whether to escalate — mkdir_one under `-p`
-  //     with comp_count=0 short-circuits to MK_OK, matching POSIX
-  //     `mkdir -p ""` idempotence.
-  //   - mkdir.ENH-004: a component of exactly two bytes ".." is
-  //     rejected with MK_PARENT_REF_UNSUPPORTED, checked at the same
-  //     close site as the too-deep gate — before any op that touches
-  //     THIS path (mkdir_one calls this before Step 6's per-component
-  //     probe/create/stamp). This is the subtree containment guard:
-  //     the leading-'/' check alone does not stop `mkdir -p ../../etc`
-  //     from walking outside the invoker's own subtree. A component
-  //     that merely CONTAINS ".." (`..foo`, `foo..`) is ordinary and
-  //     NOT rejected — only an exact two-byte "..\0"/".."+'/' match
-  //     trips the guard. (mkdir.ENH-006 hoists the invocation-wide TXN
-  //     open into mkdir_run, ahead of this per-path validation — that
-  //     open takes no path argument and cannot navigate anywhere, so
-  //     it does not weaken the containment guarantee; it is Step 6's
-  //     per-component ops, which DO carry this path, that this check
-  //     still gates.)
-  //
-  // Leaf function; no calls; no push/pop parity to preserve. Uses only
-  // caller-save regs (rax/rcx/rdx/r8/r10/r11).
-  //
-  // Register plan:
-  //   rax = byte load / return code
-  //   rcx = byte offset i (walks path bytes)
-  //   rdx = start-offset of the currently-open component
-  //   r8  = comp_count (local; committed to .bss at msp_done)
-  //   r10 = length of the currently-open component
-  //   r11 = LEA scratch (paideia-as reserved)
-  //   rdi = path base pointer; temporarily offset by +rdx inside the
-  //         ENH-004 ".." check at each close site, always restored
-  //         (-rdx) before the check falls through or jumps away
-  //
-  // Label prefix `msp_` avoids every paideia-as reserved keyword.
-  // ============================================================================
-  pub let mkdir_split_path : (u64) -> u64 !{mem} @{} =
-    fn (path: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "mkdir.M2-001 + mkdir.ENH-004 mkdir_split_path — leaf component splitter. Walks path bytes once: '/' closes the currently-open non-empty component (empty ones are skipped, absorbing `foo//bar` and trailing `/`); NUL closes the final component and terminates the walk. Absolute paths (first byte '/') are rejected immediately with MK_ABS_PATH_UNSUPPORTED — v1.0 constraint from r49-r50-plan.md §5.9 (invoker-subtree only until shell.M4 publishes a base-cap wire). ENH-004: at each close site, a component of exactly two bytes '..' is rejected with MK_PARENT_REF_UNSUPPORTED — checked BEFORE the too-deep gate so a long `../../..` chain reports the containment error first. The two-byte check temporarily adds `rdx` (the component's start offset) into `rdi` to reach the component's first byte with base+immediate addressing (`[rdi]`, `[rdi + 1]`), then subtracts `rdx` back out before falling through to the too-deep gate or advancing — `rdi` is restored on every path out of the check, matching the same add/sub-around-a-load idiom the main byte-walk already uses for `mov_b rax, [rdi]` with a register-valued cursor. A component that merely CONTAINS '..' (`..foo`, `foo..`) is length != 2 and is not rejected. > PATH_MAX_COMPONENTS levels → MK_PATH_TOO_DEEP (checked at every close, not just at end, so overflow surfaces at the first over-limit level). paideia-as conformance: every byte load is `xor rax,rax; mov_b rax,[ptr]` (#1248 mitigation); every `cmp reg,imm` uses ≤ 0x7F ASCII values or PATH_MAX_COMPONENTS = 16 / MK_PARENT_REF_UNSUPPORTED = 10 (well under 0x7FFFFFFF); r11 scratch (only LEA temps); no test mnemonic; no push/pop parity (leaf). Label prefix msp_ avoids every paideia-as reserved keyword.",
-      block: {
-        // Setup: comp_count = 0, cur_start = 0, cur_len = 0, i = 0.
-        xor r8, r8;                              // r8 = comp_count = 0
-        xor rdx, rdx;                            // rdx = cur_start = 0
-        xor r10, r10;                            // r10 = cur_len = 0
-        xor rcx, rcx;                            // rcx = i = 0
-
-        // ---- Absolute-path check: first byte must not be '/'. ----
-        xor rax, rax;
-        mov_b rax, [rdi];
-        cmp rax, 0x2F;                           // '/'
-        je  msp_abs_path;
-
-      msp_loop:
-        xor rax, rax;
-        add rdi, rcx;
-        mov_b rax, [rdi];
-        sub rdi, rcx;
-        cmp rax, 0;
-        je  msp_close_final;
-        cmp rax, 0x2F;                           // '/'
-        je  msp_close_sep;
-
-        // Normal byte — extend current component.
-        add r10, 1;
-        add rcx, 1;
-        jmp msp_loop;
-
-      msp_close_sep:
-        // '/' encountered. Close the current component iff non-empty
-        // (skip empty from `//` or leading edge past a prior '/').
-        cmp r10, 0;
-        je  msp_after_sep_advance;
-
-        // mkdir.ENH-004: reject a component of exactly two bytes ".."
-        // — subtree containment guard, checked BEFORE the too-deep
-        // gate so a long `../../..` chain reports
-        // MK_PARENT_REF_UNSUPPORTED rather than MK_PATH_TOO_DEEP.
-        cmp r10, 2;
-        jne msp_sep_not_dotdot;
-        add rdi, rdx;
-        xor rax, rax;
-        mov_b rax, [rdi];
-        cmp rax, 0x2E;                           // '.'
-        jne msp_sep_dotdot_restore;
-        xor rax, rax;
-        mov_b rax, [rdi + 1];
-        cmp rax, 0x2E;                           // '.'
-        jne msp_sep_dotdot_restore;
-        sub rdi, rdx;
-        jmp msp_parent_ref;
-
-      msp_sep_dotdot_restore:
-        sub rdi, rdx;
-
-      msp_sep_not_dotdot:
-        cmp r8, 16;                              // PATH_MAX_COMPONENTS
-        jge msp_too_deep;
-
-        lea r11, [rip + comp_start_offsets];
-        mov [r11 + r8*8], rdx;
-        lea r11, [rip + comp_lengths];
-        mov [r11 + r8*8], r10;
-        add r8, 1;
-
-      msp_after_sep_advance:
-        // Advance past '/'; reset cur_start to next byte, cur_len = 0.
-        add rcx, 1;
-        mov rdx, rcx;
-        xor r10, r10;
-        jmp msp_loop;
-
-      msp_close_final:
-        // NUL — close the trailing component iff non-empty.
-        cmp r10, 0;
-        je  msp_done;
-
-        // mkdir.ENH-004: same ".." containment guard as msp_close_sep,
-        // for the trailing (NUL-terminated) component.
-        cmp r10, 2;
-        jne msp_final_not_dotdot;
-        add rdi, rdx;
-        xor rax, rax;
-        mov_b rax, [rdi];
-        cmp rax, 0x2E;                           // '.'
-        jne msp_final_dotdot_restore;
-        xor rax, rax;
-        mov_b rax, [rdi + 1];
-        cmp rax, 0x2E;                           // '.'
-        jne msp_final_dotdot_restore;
-        sub rdi, rdx;
-        jmp msp_parent_ref;
-
-      msp_final_dotdot_restore:
-        sub rdi, rdx;
-
-      msp_final_not_dotdot:
-        cmp r8, 16;                              // PATH_MAX_COMPONENTS
-        jge msp_too_deep;
-
-        lea r11, [rip + comp_start_offsets];
-        mov [r11 + r8*8], rdx;
-        lea r11, [rip + comp_lengths];
-        mov [r11 + r8*8], r10;
-        add r8, 1;
-
-      msp_done:
-        // Commit comp_count to .bss and return MK_OK.
-        lea r11, [rip + comp_count];
-        mov [r11], r8;
-        xor rax, rax;                            // MK_OK
-        ret;
-
-      msp_abs_path:
-        mov rax, 7;                              // MK_ABS_PATH_UNSUPPORTED
-        ret;
-
-      msp_too_deep:
-        mov rax, 8;                              // MK_PATH_TOO_DEEP
-        ret;
-
-      msp_parent_ref:
-        mov rax, 10;                             // MK_PARENT_REF_UNSUPPORTED
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // mkdir_one(path) -> rc            (mkdir.M1-003 + M2-001 + mkdir.ENH-006)
-  //
-  // Signature: mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap}
-  //   rdi = path — NUL-terminated string (a live pointer into argv or a
-  //                positional slot in ParsedArgs::pos_ptrs)
-  //   rax = MK_OK                        (0)
-  //       | MK_MULTI_LEVEL_UNSUPPORTED   (3)  — path contains '/', no -p
-  //       | MK_MKDIR_FAIL                (5)  — sys_cap_invoke(SLOT_PARENT_FILE,...)
-  //       | MK_ABS_PATH_UNSUPPORTED      (7)  — path starts with '/' (M2-001)
-  //       | MK_PATH_TOO_DEEP             (8)  — > 16 levels (M2-001)
-  //       | MK_CAP_TAIL_FAIL             (9)  — sys_cap_invoke(SLOT_USER,...)
-  //       | MK_PARENT_REF_UNSUPPORTED    (10) — a component is exactly
-  //                                             ".." (mkdir.ENH-004)
-  //
-  // mkdir.ENH-006: mkdir_one no longer opens or commits the TXN — it
-  // is called once PER POSITIONAL by mkdir_run, but a TXN is scoped to
-  // the WHOLE invocation (`mkdir a b c` must be one atomic multi-path
-  // create). mkdir_run now opens ONE shared TXN before its positional
-  // loop (stashing `current_txn_id` once) and issues ONE commit after
-  // every positional has returned MK_OK — MK_TXN_OPEN_FAIL (4) and
-  // MK_TXN_COMMIT_FAIL (6) are therefore mkdir_run return states now,
-  // not mkdir_one ones (see mkdir_run's doc comment below). Before this
-  // fix, every positional past the first re-opened the TXN's QUERY_ID
-  // (mostly harmless) then hit the already-COMMITTED row at its OWN
-  // commit and failed MK_TXN_COMMIT_FAIL, while `newly_created_count`
-  // — reset per positional — clobbered every prior positional's staged
-  // records at index 0.
-  //
-  // Steps (per design/architecture.md §4 + §4a + §4f):
-  //   1. Multi-level guard IFF `-p` is NOT set. Any '/' in path →
-  //      MK_MULTI_LEVEL_UNSUPPORTED (POSIX-canonical mkdir behaviour).
-  //      Under `-p`, this guard is bypassed and mkdir_split_path
-  //      handles the path decomposition (M2-001).
-  //   2. Path decomposition:
-  //        - Under `-p`: call mkdir_split_path(path). Populates
-  //          MkdirState::{comp_start_offsets, comp_lengths, comp_count}.
-  //          Errors surface as MK_ABS_PATH_UNSUPPORTED,
-  //          MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004), or
-  //          MK_PATH_TOO_DEEP. comp_count == 0 (empty path) →
-  //          short-circuit to MK_OK (POSIX-idempotent).
-  //        - Without `-p`: manually set comp_count = 1 and populate
-  //          comp_start_offsets[0] / comp_lengths[0] (mkdir.ENH-005)
-  //          so the walk-loop shape AND the Step 6e/6f path_len
-  //          computation are both unified with the `-p` split path.
-  //   3. -v diagnostic. Numbered placeholder only — mkdir.ENH-011
-  //      implements the actual emit at Step 6g (per created level,
-  //      inside the walk), since path_len isn't known until then.
-  //   4. --dry-run short-circuit. Returns MK_OK AFTER the split has
-  //      validated the path — so `mkdir -p --dry-run /abs/path`
-  //      still surfaces MK_ABS_PATH_UNSUPPORTED, matching POSIX
-  //      dry-run semantics (validate, do not execute).
-  //   5. (Hoisted to mkdir_run — mkdir.ENH-006. `current_txn_id` is
-  //      already populated by the time this function reads it.)
-  //   6. Per-component walk (walk_i in .bss counter, survives the
-  //      placeholder syscalls' caller-save clobber without a push):
-  //        6a. Create dir — placeholder sys_cap_invoke(SLOT_PARENT_FILE,
-  //            PFF_OP_DEBUG_PRINT). Real create-dir op is
-  //            mkdir.M2-substrate-001. Negative rax →
-  //            MK_MKDIR_FAIL (TXN abort path — the still-open TXN's
-  //            future kernel-side abort op rolls back every prior
-  //            create in the same scope; at M2 the placeholders are
-  //            no-ops so nothing survives to roll back).
-  //        6b. newly_created_count += 1 — an INVOCATION-WIDE running
-  //            total (mkdir.ENH-006: reset once by mkdir_run, NOT per
-  //            positional), so record indices append across
-  //            positionals instead of clobbering index 0.
-  //        6c. Cap-tail owner write — DEFERRED to mkdir.M2-003.
-  //        6g. mkdir.ENH-011: IFF flag_v == 1, emit
-  //            `mkdir: created <cumulative-prefix>\n` via three
-  //            emit_stderr calls (static prefix, path_ptr/path_len,
-  //            static newline). Reached only by levels that were
-  //            actually created this call — the Step 6a
-  //            pre-existence-hit path jumps straight to
-  //            mkdir_one_advance_walk, skipping 6b-6g entirely, so
-  //            pre-existing levels under -p emit nothing.
-  //        (Pre-existing dir handling — DEFERRED to mkdir.M2-002.
-  //         At M2-001 every component in the walk is treated as
-  //         newly-created; the M2-002 branch adds an existence
-  //         probe that skips create + does NOT advance
-  //         newly_created_count on hit.)
-  //   7. (Hoisted to mkdir_run — mkdir.ENH-006. mkdir_one falls
-  //      through to MK_OK when walk_i reaches comp_count; the
-  //      CDR/RUR count freeze and the single TXN commit happen once,
-  //      after the whole positional loop completes.)
-  //
-  // Register plan (SysV push/pop parity preserved):
-  //   push rbx        — one push aligns rsp for nested `call`s. rbx
-  //                     holds `path` across every emit_stderr /
-  //                     syscall so the caller-save clobber does not
-  //                     lose the pointer.
-  //   rax  = byte load / syscall return / MK_* return value
-  //   rcx  = path walk cursor (Step 1) / walk_i loads (Step 6)
-  //   rdi/rsi = syscall args (SysV) / emit_stderr args / helper args
-  //   r11  = LEA scratch (paideia-as reserved)
-  //   pop rbx — restores caller's rbx before ret.
-  //
-  // Effects / capabilities:
-  //   mem     — path byte scans + emit_stderr writes + .bss reads.
-  //   sysreg  — every sys_cap_invoke SYSCALL.
-  //   @{cap}  — sys_cap_invoke is cap-gated.
-  // ============================================================================
-  pub let mkdir_one : (u64) -> u64 !{mem, sysreg} @{cap} =
-    fn (path: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + M2-001 + M2-002 + M2-003 + M3-001 + M3-003 + mkdir.ENH-006 + mkdir.ENH-011 mkdir_one — M2 lifts the multi-level guard under `-p` and wraps a per-component walk with a pre-existence probe and a per-create cap-tail stamp; M3-001 flips the Step 6a create placeholder to real PXT_OP_CREATE (9) on SLOT_TXN, populates one CreatedDirRecord per successful create+stamp into `.bss` (fields path_ptr / path_len / parent_txn_id / owner_slot_ref); M3-003 adds one RmdirUndoRecord per newly-created level in the same beat immediately after the CDR staging (fields path_ptr / path_len / parent_txn_id; owner intentionally absent since rmdir does not consult owner at replay). mkdir.ENH-006 removes the TXN open (formerly Step 5) and the TXN commit + CDR/RUR count freeze (formerly Step 7) from this function entirely: mkdir_one is called ONCE PER POSITIONAL by mkdir_run, but a TXN is scoped to the WHOLE invocation, so mkdir_run now opens ONE shared TXN before its positional loop (stashing current_txn_id once, read here unchanged at Step 6e/6f) and performs the freeze + single commit once after every positional returns MK_OK. This function also no longer zeroes newly_created_count at Step 6 entry — it is now an invocation-wide running total that mkdir_run resets exactly once, so record indices (newly_created_count - 1) append across positionals (`mkdir a b c` stages 3 CDR/RUR entries at indices 0..2) instead of every positional past the first clobbering index 0 and hitting MK_TXN_COMMIT_FAIL against an already-COMMITTED row. walk_i IS still reset per call — it is this call's LOCAL index into comp_start_offsets/comp_lengths/comp_pre_existed, freshly repopulated by mkdir_split_path (or the no-slash branch) on every call. Pre-existing levels take the mkdir_one_advance_walk jump BEFORE Step 6d and therefore never reach Step 6e/6f — a `mkdir -p a/b/c` where `a` already existed stages exactly two records in each of CDR and RUR (for `a/b` and `a/b/c`), leaving `a` untouched on undo. RUR byte-offset arithmetic: record_idx * 24 is formed as (record_idx * 8) + (record_idx * 16) via two shls into r9/rcx and one add (the encoder has no *24 scaled-index stride; matches acpi/gpe_io.pdx L127 and cap/mint.pdx L114 idioms); r10 holds the record base pointer for the three field stores (base+disp addressing, no SIB). Steps: (1) IF flag_p == 0, walk path bytes for '/' — any hit returns MK_MULTI_LEVEL_UNSUPPORTED; IF flag_p == 1, skip the guard. (2) IF flag_p == 1, call mkdir_split_path(path) — populates comp_start_offsets/comp_lengths/comp_count in .bss; error return propagates as MK_ABS_PATH_UNSUPPORTED, MK_PARENT_REF_UNSUPPORTED (mkdir.ENH-004: a component of exactly two bytes \"..\"), or MK_PATH_TOO_DEEP; comp_count == 0 short-circuits to MK_OK (POSIX-idempotent `mkdir -p \"\"`). IF flag_p == 0, manually set comp_count = 1 AND populate comp_start_offsets[0] = 0 / comp_lengths[0] = strlen(path) (mkdir.ENH-005 — reusing rcx, which already points at path's NUL terminator from the Step 1 scan) so the walk-loop shape AND the path_len computation at Step 6e/6f are both unified with the `-p` split path. (3) -v is a numbered placeholder only — the actual emit is at Step 6g below. (4) --dry-run short-circuits to MK_OK AFTER the split validated the path (POSIX validate-not-execute). (5) elided — see mkdir_run. (6) walk_i-driven loop (.bss counter, survives syscall clobber): (6a) M2-002 pre-existence probe placeholder — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_QUERY_INODE), rax == 1 → level exists (skip create, do NOT advance newly_created_count, set comp_pre_existed[i]=1); rax >= 0 && rax != 1 → not exists (set comp_pre_existed[i]=0, proceed to create); rax < 0 → MK_MKDIR_FAIL. Real per-component existence op is mkdir.M2-substrate-002. (6b) placeholder create — sys_cap_invoke(SLOT_PARENT_FILE, PFF_OP_DEBUG_PRINT); (6c) newly_created_count += 1 on actual create only; (6d) M2-003 cap-tail stamp placeholder — sys_cap_invoke(SLOT_USER, USER_OP_QUERY_FP0), exercises KIND_USER dispatch (kind_user.pdx op-max check); rax < 0 → MK_CAP_TAIL_FAIL. Real stamp op lives on KIND_PDXFS_FILE and takes SLOT_USER as cap arg — mkdir.M2-substrate-003. (6g) mkdir.ENH-011: IFF flag_v == 1, three emit_stderr calls (static \"mkdir: created \" prefix, then rbx/path_len — the same cumulative-prefix pair Step 6e/6f compute, recomputed here since it is not left live in a register — then a static newline); reached only by actually-created levels (the Step 6a exists-hit jumps straight to mkdir_one_advance_walk, past this beat). (7) elided — see mkdir_run; the walk falls through to mkdir_one_ok when walk_i reaches comp_count. paideia-as conformance: one push rbx aligns rsp AND preserves path across every emit_stderr/syscall/mkdir_split_path call; byte loads via `xor rax,rax; mov_b` (#1248 mitigation); every `cmp reg,imm` ≤ 0x7FFFFFFF (max seen: PATH_MAX_COMPONENTS = 16); r11 scratch; no test mnemonic. Label prefix mkdir_one_ avoids every paideia-as reserved keyword (`advance`, `walk`, `probe`, `exists`, `create`, `cap_tail`, `fail` are safe). Every non-OK return path routes through mkdir_one_epilogue so the one pop rbx balances the one push (verified by grep for `ret` in the function body — exactly one `ret`, after the `pop`).",
-      block: {
-        // ---- Prologue: 1 push rbx aligns rsp to 16 for nested calls. ----
-        push rbx;
-        mov rbx, rdi;                             // rbx = path (survives calls)
-
-        // ---- Step 1: multi-level guard IFF flag_p == 0. ----
-        lea r11, [rip + flag_p];
-        mov rax, [r11];
-        cmp rax, 0;
-        jne mkdir_one_split;                      // -p present → skip guard
-
-        // -p absent: reject any '/' in the path (POSIX-canonical mkdir).
-        mov rcx, rbx;
-
-      mkdir_one_scan_head:
-        xor rax, rax;
-        mov_b rax, [rcx];
-        cmp rax, 0;
-        je  mkdir_one_no_slash;
-        cmp rax, 0x2F;                            // '/'
-        je  mkdir_one_reject_multi;
-        add rcx, 1;
-        jmp mkdir_one_scan_head;
-
-      mkdir_one_reject_multi:
-        lea rdi, [rip + err_multi_msg];
-        mov rsi, 38;                              // err_multi_len
-        call emit_stderr;
-        mov rax, 3;                               // MK_MULTI_LEVEL_UNSUPPORTED
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_no_slash:
-        // Single-component path (no -p). comp_count = 1 unifies the
-        // walk-loop shape. mkdir.ENH-005: populate
-        // comp_start_offsets[0] = 0 and comp_lengths[0] = strlen(path)
-        // so Step 6e/6f's path_len computation
-        // (comp_start_offsets[i] + comp_lengths[i]) is correct on the
-        // non-`-p` path too — previously these two arrays were left
-        // uninitialized here (mkdir_state_reset deliberately does not
-        // zero them, per the consume-by-index discipline), so every
-        // CreatedDirRecord / RmdirUndoRecord staged by a plain
-        // `mkdir a` carried path_len == 0.
-        //
-        // rcx already holds a pointer to path's NUL terminator — the
-        // Step 1 scan above (mkdir_one_scan_head) walked rcx from rbx
-        // (path base) until it hit the NUL that landed us here, so
-        // rcx - rbx is exactly strlen(path). No extra scan needed.
-        sub rcx, rbx;                             // rcx = strlen(path)
-
-        xor rax, rax;                             // comp_start_offsets[0] = 0
-        lea r11, [rip + comp_start_offsets];
-        mov [r11], rax;
-
-        lea r11, [rip + comp_lengths];
-        mov [r11], rcx;                           // comp_lengths[0] = strlen(path)
-
-        mov rax, 1;
-        lea r11, [rip + comp_count];
-        mov [r11], rax;
-        jmp mkdir_one_after_split;
-
-      mkdir_one_split:
-        // -p present: split path into components in .bss arrays.
-        mov rdi, rbx;
-        call mkdir_split_path;
-        cmp rax, 0;
-        je  mkdir_one_after_split;
-
-        // Split error — rax already holds MK_ABS_PATH_UNSUPPORTED (7),
-        // MK_PARENT_REF_UNSUPPORTED (10, mkdir.ENH-004), or
-        // MK_PATH_TOO_DEEP (8). Emit the matching diagnostic then
-        // route through the shared epilogue.
-        cmp rax, 7;
-        je  mkdir_one_abs_path_fail;
-        cmp rax, 10;
-        je  mkdir_one_parent_ref_fail;
-        jmp mkdir_one_too_deep_fail;
-
-      mkdir_one_abs_path_fail:
-        lea rdi, [rip + err_abs_path_msg];
-        mov rsi, 39;                              // err_abs_path_len
-        call emit_stderr;
-        mov rax, 7;                               // MK_ABS_PATH_UNSUPPORTED
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_parent_ref_fail:
-        lea rdi, [rip + err_parent_ref_msg];
-        mov rsi, 40;                              // err_parent_ref_len
-        call emit_stderr;
-        mov rax, 10;                              // MK_PARENT_REF_UNSUPPORTED
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_too_deep_fail:
-        lea rdi, [rip + err_too_deep_msg];
-        mov rsi, 37;                              // err_too_deep_len
-        call emit_stderr;
-        mov rax, 8;                               // MK_PATH_TOO_DEEP
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_after_split:
-        // Empty-path short-circuit: comp_count == 0 → MK_OK
-        // (`mkdir -p ""` is a no-op per POSIX idempotence).
-        lea r11, [rip + comp_count];
-        mov rax, [r11];
-        cmp rax, 0;
-        je  mkdir_one_ok;
-
-        // ---- Step 3: -v emission. mkdir.ENH-011 moved the actual
-        // emit to Step 6g (per created level, inside the walk below —
-        // path_len isn't known until then), so there is nothing to do
-        // at this Step-3 beat itself; kept as a numbered placeholder
-        // so the step list here stays 1:1 with design/architecture.md. ----
-
-        // ---- Step 4: --dry-run short-circuit AFTER split validation. ----
-        lea r11, [rip + flag_dry_run];
-        mov rax, [r11];
-        cmp rax, 0;
-        jne mkdir_one_ok;
-
-        // ---- Step 5 (TXN open) hoisted to mkdir_run — mkdir.ENH-006.
-        // mkdir_one is called once PER POSITIONAL, but a TXN is
-        // invocation-scoped: opening it here (as M1-003..M3-003 did)
-        // meant every positional past the first hit an
-        // already-COMMITTED row at the OLD Step 7 and failed
-        // MK_TXN_COMMIT_FAIL, and current_txn_id/newly_created_count
-        // got re-zeroed per positional, clobbering every prior
-        // positional's staged records at index 0. mkdir_run now opens
-        // ONE shared TXN before the positional loop and stashes
-        // current_txn_id once; mkdir_one reads that already-populated
-        // value (Step 6e/6f below) instead of re-deriving it. ----
-
-        // ---- Step 6: per-component walk. walk_i in .bss counter. ----
-        // walk_i is reset here (unlike newly_created_count) because it
-        // is THIS CALL's local index into comp_start_offsets /
-        // comp_lengths / comp_pre_existed, which mkdir_split_path (or
-        // the no-slash branch) repopulates fresh on every mkdir_one
-        // call. newly_created_count is NOT reset here — mkdir.ENH-006
-        // makes it an invocation-wide running total (reset once by
-        // mkdir_run before the positional loop) so record indices
-        // (`newly_created_count - 1` at Step 6e/6f) append across
-        // positionals instead of clobbering index 0 on every call.
-        xor rax, rax;
-        lea r11, [rip + walk_i];
-        mov [r11], rax;
-
-      mkdir_one_walk_head:
-        lea r11, [rip + walk_i];
-        mov rax, [r11];
-
-        lea r11, [rip + comp_count];
-        mov rcx, [r11];
-
-        cmp rax, rcx;
-        jge mkdir_one_ok;
-
-        // Step 6a: pre-existence probe (M2-002 placeholder).
-        // Real per-component existence check on KIND_PDXFS_FILE is
-        // mkdir.M2-substrate-002 at paideia-os. The placeholder invokes
-        // PFF_OP_QUERY_INODE (0) on SLOT_PARENT_FILE — it exercises the
-        // KIND_PDXFS_FILE dispatch through the same slot the create
-        // uses, but its return value at M2 does NOT distinguish
-        // per-component existence (it always reports the parent inode).
-        // Contract established at M2-002: probe returns 1 → level
-        // already exists (skip create, do NOT advance
-        // newly_created_count); probe returns 0 → level does not
-        // exist (proceed to create); probe returns negative → hard
-        // failure, return MK_MKDIR_FAIL. At M2-002 the placeholder
-        // always returns 0 (or the parent inode number, treated as
-        // "not the sentinel 1" per the same rule), so every level in
-        // the walk still hits the create path. The substrate wire
-        // (M2-substrate-002) will make the probe return 1 for a
-        // pre-existing level; the branch below already handles it.
-        mov rdi, 1;                               // SLOT_PARENT_FILE = 1
-        xor rsi, rsi;                             // PFF_OP_QUERY_INODE = 0
-        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_one_mkdir_fail;
-
-        // Store per-component pre_existed bit. `rax == 1` = exists;
-        // anything else = not exists.
-        lea r11, [rip + walk_i];
-        mov rcx, [r11];
-        cmp rax, 1;
-        je  mkdir_one_probe_exists;
-
-        // Not-existing: comp_pre_existed[i] = 0.
-        xor rax, rax;
-        lea r11, [rip + comp_pre_existed];
-        mov [r11 + rcx*8], rax;
-        jmp mkdir_one_do_create;
-
-      mkdir_one_probe_exists:
-        // Existing: comp_pre_existed[i] = 1; skip create (idempotent).
-        // This is the "-p pre-existing dir handling: no-op, not error"
-        // path the plan doc §5.9 M2-002 line requires. Under `-p`,
-        // `mkdir a/b` where `a` exists is a no-op on `a` (do not
-        // advance newly_created_count so M3-003 undo does not queue
-        // `a` for removal) and a create on `b`.
-        mov rax, 1;
-        lea r11, [rip + comp_pre_existed];
-        mov [r11 + rcx*8], rax;
-        jmp mkdir_one_advance_walk;
-
-      mkdir_one_do_create:
-        // Step 6b: real PXT_OP_CREATE = 9 on SLOT_TXN.
-        // R42-PREP-007 (#1629) landed the write-side op ordinal for
-        // PXT_OP_CREATE at src/kernel/core/cap/kind_pdxfs_txn.pdx L117.
-        // The stub returns PXT_STUB_OK = 0xFFFFEBFB, which is positive
-        // in signed i64 (top nibble 0x0) — passes the `jl` gate below.
-        // The mutating walker body that turns PXT_OP_CREATE into an
-        // actual on-disk directory-inode allocation arrives at
-        // mkdir.M2-substrate-001 in paideia-os; until then the STUB
-        // proves the op-code binding and bumps PXT_ST_CREATES so the
-        // boot witness can count mkdir invocations that reached the
-        // create step.
-        //
-        // Kind-slot migration from M2-002: the placeholder was
-        // `sys_cap_invoke(SLOT_PARENT_FILE=1, PFF_OP_DEBUG_PRINT=6)`
-        // — a KIND_PDXFS_FILE-side op. That exercised the wrong cap
-        // kind: mkdir wants a TXN-scoped create (the walker body will
-        // key the new inode into `parent_txn_id`'s WAL group), which
-        // dispatches through KIND_PDXFS_TXN, not KIND_PDXFS_FILE.
-        // The flip aligns the userspace call site with the substrate
-        // that R42-PREP-007 lands.
-        xor rdi, rdi;                             // SLOT_TXN = 0
-        mov rsi, 9;                               // PXT_OP_CREATE = 9
-        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_one_mkdir_fail;
-
-        // Step 6c: newly_created_count += 1 (only on actual create,
-        // not on pre-existing skip — this is the invariant the M3-003
-        // undo record reads to unwind exactly this invocation's
-        // additions).
-        lea r11, [rip + newly_created_count];
-        mov rax, [r11];
-        add rax, 1;
-        mov [r11], rax;
-
-        // Step 6d: cap-tail owner stamp (M2-003 placeholder).
-        // Records the invoker's KIND_USER cap (SLOT_USER=2) into the
-        // newly-created inode's cap-tail owner slot. Real
-        // "stamp-owner" op lives on KIND_PDXFS_FILE and takes SLOT_USER
-        // as its cap argument — that dispatch is
-        // mkdir.M2-substrate-003 at paideia-os. The M2-003 placeholder
-        // invokes USER_OP_QUERY_FP0 (0) on SLOT_USER; this exercises
-        // the KIND_USER slot dispatch (kind_user.pdx L1146 checks
-        // op_id <= USER_OP_MAX = 7) so a mis-seeded slot 2 surfaces
-        // here at M2 rather than silently succeeding into an
-        // unowned inode. Negative rax → MK_CAP_TAIL_FAIL (hard error
-        // — a directory without a recorded owner would fail the
-        // D3/D4 `ls --long` render). Same slot the M3-001
-        // CreatedDirRecord will marshal into the `owner:KIND_USER_ref`
-        // field, so a M2-003 pass here proves the field will render.
-        mov rdi, 2;                               // SLOT_USER = 2
-        xor rsi, rsi;                             // USER_OP_QUERY_FP0 = 0
-        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_one_cap_tail_fail;
-
-        // ---- Step 6e (M3-001): stage a CreatedDirRecord for this level.
-        // Every successful create + stamp gets one record. The record
-        // fields freeze against `CreatedDirRecord@0.1` (schema handle
-        // CDR_SCHEMA_HANDLE in MkdirState) declared in caps.decl.
-        // libpdx-semantic-pipe M2's send_record consumer walks the
-        // array from index 0 to created_dir_records_count (set at
-        // Step 7 == newly_created_count at commit); until that
-        // consumer lands, the staged records live in .bss for the
-        // M3-002 audit hook and the M3-003 undo record to read.
-        //
-        // record_idx == newly_created_count - 1 (post-increment above)
-        //   * CDR_FIELDS_PER_RECORD (= 4)  -> word offset within
-        //     the created_dir_records array.
-        //
-        // Field layout (per MkdirState):
-        //   [+0]  path_ptr        = rbx (base of full path string,
-        //                            preserved across every syscall
-        //                            by the mkdir_one prologue push)
-        //   [+8]  path_len        = comp_start_offsets[walk_i] +
-        //                            comp_lengths[walk_i]
-        //   [+16] parent_txn_id   = current_txn_id (captured at Step 5)
-        //   [+24] owner_slot_ref  = 2 (SLOT_USER)
-        //
-        // Register plan (no push/pop parity change; all caller-save):
-        //   rcx = record_idx (post-shift by 2 to fold *4 into the *8
-        //         addressing scale below)
-        //   rdx = walk_i
-        //   rax = path_len (start) then parent_txn_id
-        //   r10 = comp_lengths[walk_i] intermediate
-        //   r11 = LEA scratch
-        lea r11, [rip + newly_created_count];
-        mov rcx, [r11];
-        sub rcx, 1;                              // record_idx
-        shl rcx, 2;                              // *CDR_FIELDS_PER_RECORD (4)
-
-        // Compute path_len from comp_start_offsets + comp_lengths.
-        lea r11, [rip + walk_i];
-        mov rdx, [r11];                          // walk_i
-        lea r11, [rip + comp_start_offsets];
-        mov rax, [r11 + rdx*8];
-        lea r11, [rip + comp_lengths];
-        mov r10, [r11 + rdx*8];
-        add rax, r10;                            // path_len
-
-        // Write [path_ptr, path_len] at record base.
-        lea r11, [rip + created_dir_records];
-        mov [r11 + rcx*8 + 0],  rbx;             // path_ptr
-        mov [r11 + rcx*8 + 8],  rax;             // path_len
-
-        // Write parent_txn_id (loaded from current_txn_id).
-        lea r11, [rip + current_txn_id];
-        mov rax, [r11];
-        lea r11, [rip + created_dir_records];
-        mov [r11 + rcx*8 + 16], rax;             // parent_txn_id
-
-        // Write owner_slot_ref (== SLOT_USER = 2 at v1.0).
-        mov rax, 2;                              // SLOT_USER
-        mov [r11 + rcx*8 + 24], rax;             // owner_slot_ref
-
-        // ---- Step 6f (M3-003): stage a RmdirUndoRecord for this level.
-        // Every level that reached this beat was actually created by
-        // this invocation (Step 6a's pre-existence probe would have
-        // jumped straight to mkdir_one_advance_walk on a hit, and the
-        // real create + cap-tail must have both succeeded to arrive
-        // here). So one undo record per successful create — matching
-        // the CDR count invariant. The array is written in walk order
-        // (outer → inner); the PdxFS v1 undo-log walker replays in
-        // REVERSE insertion order, giving inner → outer removal so
-        // each rmdir sees an empty target inode.
-        //
-        // Field layout freezes against `RmdirUndoRecord@0.1`:
-        //   [+0]  path_ptr        = rbx (unchanged since the prologue)
-        //   [+8]  path_len        = comp_start_offsets[walk_i] +
-        //                            comp_lengths[walk_i] (recomputed
-        //                            — the CDR staging above did not
-        //                            leave path_len live in any GPR
-        //                            after the owner_slot_ref store)
-        //   [+16] parent_txn_id   = current_txn_id (captured at Step 5)
-        //
-        // Byte offset arithmetic: the encoder has no *24 scaled-index
-        // stride (see kernel/core/acpi/gpe_io.pdx L127 justification),
-        // so record_idx * 24 is formed as (record_idx * 8) +
-        // (record_idx * 16) via two shls. r9 is the shift scratch;
-        // freeing rcx for the +24 accumulator + subsequent SIB-1
-        // addressing into the record base.
-        //
-        // Register plan (all caller-save; no push/pop touched):
-        //   rcx = record_idx * 24 (byte offset from array base)
-        //   rdx = walk_i
-        //   rax = path_len (then parent_txn_id)
-        //   r9  = shift scratch for record_idx * 8
-        //   r10 = &rmdir_undo_records[record_idx] (base + offset)
-        //   r11 = LEA scratch
-        lea r11, [rip + newly_created_count];
-        mov rcx, [r11];
-        sub rcx, 1;                              // record_idx
-
-        mov r9, rcx;                             // r9 = record_idx
-        shl r9, 3;                               // r9 = record_idx * 8
-        shl rcx, 4;                              // rcx = record_idx * 16
-        add rcx, r9;                             // rcx = record_idx * 24
-
-        // r10 = &rmdir_undo_records[record_idx] (base + byte offset).
-        lea r11, [rip + rmdir_undo_records];
-        mov r10, r11;
-        add r10, rcx;                            // r10 = record base
-
-        // Compute path_len from comp_start_offsets + comp_lengths.
-        lea r11, [rip + walk_i];
-        mov rdx, [r11];                          // walk_i
-        lea r11, [rip + comp_start_offsets];
-        mov rax, [r11 + rdx*8];
-        lea r11, [rip + comp_lengths];
-        mov r9, [r11 + rdx*8];
-        add rax, r9;                             // path_len
-
-        // Write path_ptr + path_len at the record base.
-        mov [r10 + 0], rbx;                      // path_ptr
-        mov [r10 + 8], rax;                      // path_len
-
-        // Write parent_txn_id.
-        lea r11, [rip + current_txn_id];
-        mov rax, [r11];
-        mov [r10 + 16], rax;                     // parent_txn_id
-
-        // ---- Step 6g (mkdir.ENH-011): -v per-level emission. ----
-        // Only levels that reach this point were actually created this
-        // call (Step 6a's pre-existence-hit jumps straight to
-        // mkdir_one_advance_walk below, skipping this beat entirely —
-        // so pre-existing levels under -p emit nothing, matching the
-        // fingerprint). path_len is recomputed rather than reused from
-        // a live register (the RUR staging above did not leave it live
-        // in any GPR after the parent_txn_id store).
-        lea r11, [rip + flag_v];
-        mov rax, [r11];
-        cmp rax, 0;
-        je  mkdir_one_advance_walk;
-
-        lea rdi, [rip + verbose_created_msg];
-        mov rsi, 15;                              // verbose_created_len
-        call emit_stderr;
-
-        lea r11, [rip + walk_i];
-        mov rdx, [r11];                           // walk_i
-        lea r11, [rip + comp_start_offsets];
-        mov rax, [r11 + rdx*8];
-        lea r11, [rip + comp_lengths];
-        mov r9, [r11 + rdx*8];
-        add rax, r9;                              // path_len (cumulative prefix)
-
-        mov rdi, rbx;                             // path base (unchanged since prologue)
-        mov rsi, rax;                             // path_len
-        call emit_stderr;
-
-        lea rdi, [rip + verbose_newline_msg];
-        mov rsi, 1;                                // verbose_newline_len
-        call emit_stderr;
-
-      mkdir_one_advance_walk:
-        // Advance walk_i.
-        lea r11, [rip + walk_i];
-        mov rax, [r11];
-        add rax, 1;
-        mov [r11], rax;
-        jmp mkdir_one_walk_head;
-
-        // ---- mkdir.ENH-006: TXN commit hoisted to mkdir_run. ----
-        // The walk loop above falls straight through to
-        // mkdir_one_ok when walk_i reaches comp_count (see the
-        // `jge mkdir_one_ok` at mkdir_one_walk_head) — mkdir_one no
-        // longer commits. mkdir_run freezes created_dir_records_count
-        // / rmdir_undo_records_count == newly_created_count and
-        // issues the single PXT_OP_COMMIT ONCE, after every positional
-        // in the invocation has returned MK_OK from this function.
-
-      mkdir_one_ok:
-        xor rax, rax;                             // MK_OK
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_mkdir_fail:
-        lea rdi, [rip + err_mkdir_msg];
-        mov rsi, 21;                              // err_mkdir_len
-        call emit_stderr;
-        mov rax, 5;                               // MK_MKDIR_FAIL
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_cap_tail_fail:
-        lea rdi, [rip + err_cap_tail_msg];
-        mov rsi, 29;                              // err_cap_tail_len
-        call emit_stderr;
-        mov rax, 9;                               // MK_CAP_TAIL_FAIL
-        jmp mkdir_one_epilogue;
-
-      mkdir_one_epilogue:
-        pop rbx;                                  // restore caller's rbx
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // mkdir_run() — walk pos_ptrs[0..pos_count], call mkdir_one on each.
-  //                                              (mkdir.M1-003 + mkdir.ENH-006)
-  //
-  // Signature: mkdir_run : () -> () !{mem, sysreg} @{cap}
-  //
-  // mkdir.ENH-006: mkdir_run now owns the TXN lifecycle for the WHOLE
-  // invocation — it opens ONE shared TXN before the positional loop
-  // and issues ONE commit after every positional has returned MK_OK.
-  // Before this fix, `mkdir_one` opened + committed its own TXN on
-  // every call, so `mkdir a b c` re-opened an already-open row for `b`
-  // and `c` (mostly harmless — QUERY_ID is a read) and then hit the
-  // already-COMMITTED row at `b`'s own commit, failing
-  // MK_TXN_COMMIT_FAIL; `newly_created_count` was also reset to 0 at
-  // the top of every `mkdir_one` call, so `b`'s records overwrote
-  // `a`'s at index 0 and `a`'s undo record was lost. Both bugs are
-  // instances of the same root cause: TXN + record bookkeeping are
-  // invocation-scoped, but were being managed at positional scope.
-  //
-  // --dry-run (a single flag shared by every positional — there is no
-  // per-positional dry-run) never opens or commits the TXN: every
-  // `mkdir_one` call short-circuits at its own Step 4 before touching
-  // any cap, so opening a TXN just to never use it would be a needless
-  // cap-invoke against the "no side effects" dry-run contract.
-  //
-  // On the first non-MK_OK return from mkdir_one, records the code in
-  // MkdirState::exit_code and the offending index in
-  // MkdirState::err_pos_index and stops the walk WITHOUT committing
-  // (fail-fast — no partial "some created, some not" state, and the
-  // shared TXN is left uncommitted so nothing this invocation staged
-  // is persisted).
-  //
-  // Uses MkdirState::mkdir_run_i as loop-counter storage so the counter
-  // survives mkdir_one calls without a callee-save push. Safe at M1
-  // because mkdir_run runs at most once per _start invocation.
-  //
-  // Register plan (leaf-ish; no callee-save needed thanks to the .bss
-  // loop counter):
-  //   rax = index / mkdir_one return / syscall return
-  //   rcx = pos_count (bound)
-  //   rdi/rsi = pos_ptrs[i] (arg to mkdir_one) / syscall args / emit_stderr args
-  //   r11 = LEA scratch
-  // ============================================================================
-  pub let mkdir_run : () -> () !{mem, sysreg} @{cap} =
-    fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "mkdir.M1-003 + mkdir.ENH-006 mkdir_run — positional walk with invocation-scoped TXN lifecycle. Resets mkdir_run_i and newly_created_count to 0 (the LATTER exactly once per invocation now, not per positional — mkdir.ENH-006 removed mkdir_one's own reset so record indices append across positionals). IF flag_dry_run == 1, skips straight to the positional loop (no TXN open — every mkdir_one call will short-circuit at its own Step 4 before any cap invocation, so there is nothing to open). ELSE opens ONE shared TXN via sys_cap_invoke(SLOT_TXN=0, PXT_OP_QUERY_ID=0) and stashes its txn_id into current_txn_id ONCE (negative rax -> MK_TXN_OPEN_FAIL, exit_code set directly here since there is no mkdir_one call wrapping this open to propagate a return value through). Then iterates MkdirState::mkdir_run_i over 0..ParsedArgs::pos_count; each iteration loads pos_ptrs[i] and calls mkdir_one, which now performs ONLY the per-component create walk (Steps 1-4 + 6) and reads the already-populated current_txn_id — it neither opens nor commits the TXN. On first non-MK_OK return records MkdirState::exit_code + err_pos_index and returns immediately WITHOUT freezing CDR/RUR counts or committing (fail-fast; the shared TXN is left uncommitted, matching the pre-ENH-006 per-positional behaviour of never reaching the commit beat on failure). When the loop completes with every positional MK_OK: IF flag_dry_run == 1, return immediately (nothing was ever opened, so there is nothing to freeze or commit). ELSE freeze created_dir_records_count AND rmdir_undo_records_count == newly_created_count (the SAME twin-freeze invariant M3-001/M3-003 established, now applied once for the whole invocation instead of once per positional) and issue exactly ONE sys_cap_invoke(SLOT_TXN=0, PXT_OP_COMMIT=7) — negative rax -> MK_TXN_COMMIT_FAIL, exit_code set directly. Loop counter lives in .bss so it survives mkdir_one's clobber of every caller-save reg — same trick dispatch.pdx's echo_builtin uses for its echo_idx slot (see paideia-os src/user/dispatch.pdx L165 justification). paideia-as conformance: r11 scratch (LEA); every cmp reg,imm ≤ 0x7FFFFFFF (SC+ IDs 4/7 well under); no `test` mnemonic; leaf-with-nested-calls but no callee-save state so no push/pop parity needed (mirrors _start's own no-push convention for its direct emit_stderr/syscall sequences). Labels prefixed mkdir_run_.",
-      block: {
-        // Initialize i = 0.
-        xor rax, rax;
-        lea r11, [rip + mkdir_run_i];
-        mov [r11], rax;
-
-        // mkdir.ENH-006: newly_created_count is now an INVOCATION-WIDE
-        // running total (record indices are `newly_created_count - 1`
-        // inside mkdir_one). Reset it exactly ONCE here, before any
-        // positional walk, instead of inside mkdir_one per call —
-        // otherwise positional 2+ would clobber positional 1's records
-        // at index 0.
-        xor rax, rax;
-        lea r11, [rip + newly_created_count];
-        mov [r11], rax;
-
-        // --dry-run: no TXN needed. Every mkdir_one call short-circuits
-        // before touching a cap, so skip straight to the walk.
-        lea r11, [rip + flag_dry_run];
-        mov rax, [r11];
-        cmp rax, 0;
-        jne mkdir_run_loop_head;
-
-        // Open ONE shared TXN for the whole invocation. The TXN cap at
-        // SLOT_TXN is pre-opened by the shell at spawn time (see
-        // _init_caps entry 0 above); mkdir does NOT mint a fresh TXN
-        // via sys_pdxfs_txn_open (sysno 70) at v1.0 because the tool
-        // has no KIND_MEMORY mount cap in its sidecar. PXT_OP_QUERY_ID
-        // reads the pre-opened row's txn_id so every CreatedDirRecord
-        // across every positional shares the same parent_txn_id.
-        // Negative rax -> MK_TXN_OPEN_FAIL.
-        xor rdi, rdi;                             // SLOT_TXN = 0
-        xor rsi, rsi;                             // PXT_OP_QUERY_ID = 0
-        mov rax, 4;                               // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_run_txn_open_fail;
-
-        lea r11, [rip + current_txn_id];
-        mov [r11], rax;
-
-      mkdir_run_loop_head:
-        lea r11, [rip + mkdir_run_i];
-        mov rax, [r11];
-
-        lea r11, [rip + pos_count];
-        mov rcx, [r11];
-
-        cmp rax, rcx;
-        jge mkdir_run_all_ok;
-
-        // rdi = pos_ptrs[i]
-        lea r11, [rip + pos_ptrs];
-        mov rdi, [r11 + rax*8];
-        call mkdir_one;
-        // rax = mkdir_one return code.
-
-        cmp rax, 0;
-        je  mkdir_run_advance;
-
-        // Non-OK: record + stop, WITHOUT freezing CDR/RUR counts or
-        // committing — the shared TXN stays uncommitted so nothing
-        // this invocation staged is persisted.
-        lea r11, [rip + exit_code];
-        mov [r11], rax;
-
-        lea r11, [rip + mkdir_run_i];
-        mov rcx, [r11];
-        lea r11, [rip + err_pos_index];
-        mov [r11], rcx;
-        ret;
-
-      mkdir_run_advance:
-        lea r11, [rip + mkdir_run_i];
-        mov rax, [r11];
-        add rax, 1;
-        mov [r11], rax;
-        jmp mkdir_run_loop_head;
-
-      mkdir_run_all_ok:
-        // Every positional returned MK_OK. --dry-run never opened a
-        // TXN (see above), so there is nothing to freeze or commit.
-        lea r11, [rip + flag_dry_run];
-        mov rax, [r11];
-        cmp rax, 0;
-        jne mkdir_run_done;
-
-        // mkdir.ENH-006: freeze created_dir_records_count AND
-        // rmdir_undo_records_count == newly_created_count ONCE for the
-        // whole invocation, before the single commit syscall — same
-        // "staged, never committed on failure" consistency invariant
-        // M3-001/M3-003 established per positional, now invocation-wide.
-        lea r11, [rip + newly_created_count];
-        mov rax, [r11];
-        lea r11, [rip + created_dir_records_count];
-        mov [r11], rax;
-        lea r11, [rip + rmdir_undo_records_count];
-        mov [r11], rax;
-
-        // Real commit op: OPEN -> COMMITTED (R42-PREP-007 #1629 at
-        // kind_pdxfs_txn.pdx L115 + L667..L721). Issued EXACTLY ONCE
-        // per invocation — this is the mkdir.ENH-006 fix for the
-        // double-commit bug (every positional past the first used to
-        // issue its own commit against the same pre-opened row and hit
-        // PXT_BAD_TRANSITION = 0xFFFFEC15, negative as i64).
-        xor rdi, rdi;                             // SLOT_TXN = 0
-        mov rsi, 7;                                // PXT_OP_COMMIT = 7
-        mov rax, 4;                                // SC+ ID 4 = sys_cap_invoke
-        syscall;
-        cmp rax, 0;
-        jl  mkdir_run_commit_fail;
-
-      mkdir_run_done:
-        ret;
-
-      mkdir_run_txn_open_fail:
-        lea rdi, [rip + err_txn_open_msg];
-        mov rsi, 23;                               // err_txn_open_len
-        call emit_stderr;
-        mov rax, 4;                                // MK_TXN_OPEN_FAIL
-        lea r11, [rip + exit_code];
-        mov [r11], rax;
-        ret;
-
-      mkdir_run_commit_fail:
-        lea rdi, [rip + err_commit_msg];
-        mov rsi, 25;                               // err_commit_len
-        call emit_stderr;
-        mov rax, 6;                                // MK_TXN_COMMIT_FAIL
-        lea r11, [rip + exit_code];
-        mov [r11], rax;
-        ret;
-      }
-    }
-
-  // ============================================================================
-  // _start — user program entry point. Never returns (ends in sys_exit).
-  //
-  // Shape (M1-003 + M3-002 audit hooks):
-  //   Step 0  ring3 proof-of-life marker on sys_debug_puts.
-  //   Step 1  mkdir_state_reset()   — clear MkdirState singletons.
-  //   Step 2  reset()               — clear ParsedArgs singletons (libpdx-argv).
-  //   Step 2a M3-002 emit_audit_event(UEJ_KIND_TOOL_INVOKE=130); set
-  //           audit_emitted_invoke = 1 (D3 audit-first: journal
-  //           records the invocation BEFORE any argv work).
-  //   Step 3  Build argv_bootstrap_ptrs from the three static strings.
-  //   Step 4  parse_argv(argv, argc). On error → emit err_argv_msg,
-  //           M3-002 emit_audit_event(UEJ_KIND_TOOL_ERROR=131),
-  //           sys_exit(MK_ARGV_ERR).
-  //   Step 5  parse_flags_from_argv() — populate MkdirState::flag_*.
-  //   Step 5a mkdir.ENH-001: IFF flag_schema == 1, emit schema_msg,
-  //           sys_exit(MK_OK). Checked before Step 6 — no path operand
-  //           required, no cap invocation.
-  //   Step 5b mkdir.ENH-003: IFF flag_version == 1, emit version_msg,
-  //           sys_exit(MK_OK). Same rationale as Step 5a.
-  //   Step 6  Check ParsedArgs::pos_count. If zero → emit err_no_operand_msg,
-  //           M3-002 emit_audit_event(UEJ_KIND_TOOL_ERROR),
-  //           sys_exit(MK_MISSING_PATH).
-  //   Step 7  mkdir_run() — walk positionals, invoke mkdir_one per path.
-  //           On first failure records MkdirState::exit_code + err_pos_index.
-  //   Step 7a M3-002 IFF exit_code != 0: emit_audit_event(UEJ_KIND_TOOL_ERROR).
-  //   Step 8  sys_exit(MkdirState::exit_code) — 0 on all-success, otherwise
-  //           the first mkdir_one MK_* return.
-  //
-  // Register discipline
-  // -------------------
-  // Straight-line body ending in sys_exit — no callee-save state
-  // needed, no SysV push/pop parity to preserve. Each nested call is
-  // to a leaf helper that uses only caller-save regs; `syscall` and
-  // `call` are both safe at any rsp alignment because none of the
-  // callees push additional callee-save (echo_client.pdx precedent).
-  //
-  // Effects / capabilities
-  // ----------------------
-  //   mem     — string loads for debug_puts + argv_bootstrap array init.
-  //   sysreg  — every SYSCALL.
-  //   @{sched} — sys_exit terminates the task (sched teardown).
-  // ============================================================================
-  pub let _start : () -> () !{mem, sysreg} @{sched} =
-    fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {sched},
-      justification: "mkdir.M1-003 + M2-001 + M3-002 + mkdir.ENH-001 + mkdir.ENH-003 _start orchestrator. Full argv + create + audit surface: ring3 marker + mkdir_state_reset + libpdx-argv reset + M3-002 TOOL_INVOKE audit emit (with audit_emitted_invoke gate raised on the same beat) + argv_bootstrap build + parse_argv + argv-error diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + parse_flags_from_argv + ENH-001 --schema static emit (sys_exit(MK_OK) immediately, no TOOL_ERROR — this is a success exit) + ENH-003 --version static emit (same shape) + missing-operand diagnostic (with M3-002 TOOL_ERROR emit before its sys_exit) + mkdir_run + M3-002 conditional TOOL_ERROR emit when exit_code != 0 + sys_exit(exit_code). Both --schema and --version are checked BEFORE the missing-operand check and BEFORE any TXN cap invocation (mkdir_run has not been called yet), so `mkdir --schema` / `mkdir --version` succeed with no path operand and no cap-invoke. Straight-line, ends in sys_exit — no callee-save touched, no SysV push/pop parity. Every immediate ≤ 0x7FFFFFFF (max seen: UEJ_KIND_TOOL_ERROR = 131 and sys_exit ID 60). No `test` mnemonic. Cross-module calls by unqualified linker name (`reset` → libpdx-argv/src/parsed_args.pdx; `parse_argv` → libpdx-argv/src/parser.pdx; `mkdir_state_reset`, `parse_flags_from_argv`, `mkdir_run`, `mkdir_one`, `mkdir_split_path`, `emit_stderr`, `emit_audit_event` → local). Bootstrap argv array is built via four lea+mov stores that observe the paideia-as reserved-scratch rule (r11 always the LEA temp). D3 audit-first invariant: the TOOL_INVOKE emit at Step 2 precedes every argv-parse or user-visible action, and every non-zero exit path (argv-parse fail, missing operand, mkdir_run partial) is paired with a TOOL_ERROR emit before its sys_exit — a tool that can suppress its own audit trail is the exact attack the D3 upgrade forecloses. All audit-emit returns are IGNORED (the sink must never be able to sink the tool op). M2 smoke witness: bootstrap argv `-p -v --dry-run a/b/c` → INVOKE emit → parse OK → flags {p=1, v=1, dry_run=1} → pos_count=1 → mkdir_run calls mkdir_one(\"a/b/c\") which under flag_p=1 calls mkdir_split_path (comp_count=3 for a, b, c) then short-circuits on --dry-run and returns MK_OK → exit_code=0 → NO TOOL_ERROR emit → exit(0). This exercises the M2-001 mkdir_split_path end-to-end (three components split correctly, non-empty each, no absolute-path or too-deep trigger) plus the M3-002 audit-emit-only-on-error branch while the placeholder cap invocations wait on mkdir.M2-substrate-001 in paideia-os.",
-      block: {
-        // ---- Step 0: ring3 proof-of-life marker. ----
-        lea rdi, [rip + ring3_msg];
-        mov rsi, 19;                              // ring3_len
-        mov rax, 12;                              // SC+ ID 12 = sys_debug_puts
+        // ==========================================================
+        // Phase 0 -- argc guard: at least one positional required.
+        // ==========================================================
+        cmp rdi, 2;
+        jl  mkdir_missing_operand;
+
+        // Stash argc + argv base into callee-save registers so the
+        // sys_mkdir syscalls in the loop below do not have to worry
+        // about SysV arg-register clobbering.
+        mov rbx, rdi;                          // rbx = argc
+        mov r12, rsi;                          // r12 = argv base
+        mov r13, 1;                            // r13 = i (skip argv[0])
+
+        // ==========================================================
+        // Phase 1 -- per-positional sys_mkdir loop.
+        // ==========================================================
+
+      mkdir_loop_head:
+        cmp r13, rbx;
+        jge mkdir_all_ok;
+
+        // rdi = argv[i]. Own-aspace pointer per execve ABI --
+        // sys_mkdir's user_read_str_via_walk (kernel-side, in
+        // src/kernel/core/syscall/sys_mkdir.pdx) does the KPTI-safe
+        // walk from this user VA up to path_len_hint bytes.
+        mov rdi, [r12 + r13*8];
+
+        // sys_mkdir(path=rdi, path_len_hint=255, mode=0x1ED)
+        mov rsi, 255;                          // walker CAP hint
+        mov rdx, 0x1ED;                        // mode 0755
+        mov rax, 79;                           // SC+ ID 79 = sys_mkdir
         syscall;
 
-        // ---- Step 1: MkdirState reset. Leaf call. ----
-        call mkdir_state_reset;
-
-        // ---- Step 2: ParsedArgs reset (libpdx-argv). Leaf call. ----
-        call reset;
-
-        // ---- M3-002: emit UEJ_KIND_TOOL_INVOKE at entry. ----
-        // Every mkdir invocation records ONE TOOL_INVOKE event before
-        // any argv parsing. This is the D3 audit-first commitment: a
-        // tool invocation is journaled before it can suppress its own
-        // audit trail. audit_emitted_invoke is set to 1 on the same
-        // straight-line beat so the exit paths know not to re-emit
-        // (defence in depth — nothing today re-enters _start, but the
-        // gate keeps the invariant explicit).
-        mov rdi, 130;                             // UEJ_KIND_TOOL_INVOKE
-        call emit_audit_event;                    // return ignored (D3)
-
-        mov rax, 1;
-        lea r11, [rip + audit_emitted_invoke];
-        mov [r11], rax;
-
-        // ---- Step 3: build argv_bootstrap_ptrs (four static entries). ----
-        lea rcx, [rip + argv_bootstrap_ptrs];
-        lea r11, [rip + argv_flag_p];           mov [rcx + 0],  r11;
-        lea r11, [rip + argv_flag_v];           mov [rcx + 8],  r11;
-        lea r11, [rip + argv_flag_dry_run];     mov [rcx + 16], r11;
-        lea r11, [rip + argv_positional_abc];   mov [rcx + 24], r11;
-
-        // ---- Step 4: parse_argv(argv, argc). rdi=argv_ptr, rsi=argc. ----
-        lea rdi, [rip + argv_bootstrap_ptrs];
-        mov rsi, 4;                               // argv_bootstrap_argc
-        call parse_argv;
-        // rax = ParsedArgs::ERR_OK (0) on success.
-
         cmp rax, 0;
-        je  mkdir_after_parse_ok;
+        jne mkdir_fail;
 
-        // Argv parse error branch: emit diagnostic + sys_exit(MK_ARGV_ERR=1).
-        lea rdi, [rip + err_argv_msg];
-        mov rsi, 24;                              // err_argv_len
-        call emit_stderr;
+        // Success on this positional; advance i and loop.
+        add r13, 1;
+        jmp mkdir_loop_head;
 
-        // M3-002: emit UEJ_KIND_TOOL_ERROR (131) before sys_exit so the
-        // audit journal sees the failure. Return ignored (D3).
-        mov rdi, 131;                             // UEJ_KIND_TOOL_ERROR
-        call emit_audit_event;
+        // ==========================================================
+        // Phase 2 -- all-success terminator.
+        // ==========================================================
 
-        mov rdi, 1;                               // MK_ARGV_ERR
-        mov rax, 60;                              // SC+ ID 60 = sys_exit
+      mkdir_all_ok:
+        xor rdi, rdi;                          // exit status = 0
+        mov rax, 60;                           // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+        // ==========================================================
+        // Phase 3 -- first-failure terminator: preserve -errno and
+        // pass it through to sys_exit.
+        // ==========================================================
+
+      mkdir_fail:
+        // Save -errno into r14 (callee-save; survives the diagnostic
+        // sys_debug_puts syscall below).
+        mov r14, rax;
+
+        lea rdi, [rip + err_mkdir_fail_msg];
+        mov rsi, 19;                           // err_mkdir_fail_len
+        mov rax, 12;                           // SC+ ID 12 = sys_debug_puts
         syscall;
 
-      mkdir_after_parse_ok:
-        // ---- Step 5: parse_flags_from_argv. Leaf call. ----
-        call parse_flags_from_argv;
-
-        // ---- mkdir.ENH-001: --schema static emit. Checked BEFORE the
-        // missing-operand check so `mkdir --schema` (no path operand)
-        // exits 0 rather than MK_MISSING_PATH — the fingerprint this
-        // flag exists to serve is "ask the tool what it emits without
-        // running it," which by definition takes no path. No TXN cap
-        // invocation on this path.
-        lea r11, [rip + flag_schema];
-        mov rax, [r11];
-        cmp rax, 0;
-        je  mkdir_after_schema_check;
-
-        lea rdi, [rip + schema_msg];
-        mov rsi, 95;                              // schema_len
-        call emit_stderr;
-
-        xor rdi, rdi;                              // MK_OK
-        mov rax, 60;                               // SC+ ID 60 = sys_exit
+        // Exit with the negative errno the failing sys_mkdir returned
+        // -- v1.1-A contract: `-errno on first failure`.
+        mov rdi, r14;
+        mov rax, 60;                           // SC+ ID 60 = sys_exit
         syscall;
+        hlt;
 
-      mkdir_after_schema_check:
-        // ---- mkdir.ENH-003: --version static emit. Same rationale as
-        // --schema above: checked before the missing-operand check, no
-        // cap invocation.
-        lea r11, [rip + flag_version];
-        mov rax, [r11];
-        cmp rax, 0;
-        je  mkdir_after_version_check;
+        // ==========================================================
+        // Phase 4 -- missing-operand terminator (argc < 2).
+        // ==========================================================
 
-        lea rdi, [rip + version_msg];
-        mov rsi, 44;                              // version_len
-        call emit_stderr;
-
-        xor rdi, rdi;                              // MK_OK
-        mov rax, 60;                               // SC+ ID 60 = sys_exit
-        syscall;
-
-      mkdir_after_version_check:
-        // ---- Step 6: missing-operand check. pos_count from libpdx-argv. ----
-        lea r11, [rip + pos_count];
-        mov rax, [r11];
-        cmp rax, 0;
-        jne mkdir_after_operand_ok;
-
-        // Missing operand branch.
+      mkdir_missing_operand:
         lea rdi, [rip + err_no_operand_msg];
-        mov rsi, 23;                              // err_no_operand_len
-        call emit_stderr;
-
-        // M3-002: emit UEJ_KIND_TOOL_ERROR (131) before sys_exit.
-        mov rdi, 131;                             // UEJ_KIND_TOOL_ERROR
-        call emit_audit_event;
-
-        mov rdi, 2;                               // MK_MISSING_PATH
-        mov rax, 60;                              // SC+ ID 60 = sys_exit
+        mov rsi, 23;                           // err_no_operand_len
+        mov rax, 12;                           // SC+ ID 12 = sys_debug_puts
         syscall;
 
-      mkdir_after_operand_ok:
-        // ---- Step 7 (M1-003): walk positionals. ----
-        call mkdir_run;
-
-        // ---- M3-002: emit UEJ_KIND_TOOL_ERROR (131) if exit_code != 0. ----
-        // mkdir_run records the first-failed mkdir_one's return in
-        // MkdirState::exit_code (0 == all-success). On any non-zero
-        // exit the audit journal MUST see one TOOL_ERROR record before
-        // sys_exit — every mkdir_one failure path already emit_stderr'd
-        // its user-facing diagnostic, so this hook only closes the
-        // audit stream (no re-emit of diagnostic text). Return of
-        // emit_audit_event is ignored per the D3 non-degrading rule.
-        // The audit_emitted_invoke gate at Step 2 guarantees the paired
-        // TOOL_INVOKE record has already reached the journal.
-        lea r11, [rip + exit_code];
-        mov rax, [r11];
-        cmp rax, 0;
-        je  mkdir_after_audit_error;
-
-        mov rdi, 131;                             // UEJ_KIND_TOOL_ERROR
-        call emit_audit_event;                    // return ignored (D3)
-
-      mkdir_after_audit_error:
-        // ---- Step 8: sys_exit(MkdirState::exit_code). 0 on all-success. ----
-        lea r11, [rip + exit_code];
-        mov rdi, [r11];
-        mov rax, 60;                              // SC+ ID 60 = sys_exit
+        mov rdi, 2;                            // exit status = MK_MISSING_PATH
+        mov rax, 60;                           // SC+ ID 60 = sys_exit
         syscall;
-
-        // Defensive belt-and-suspenders — sys_exit never returns.
-      mkdir_unreachable:
-        jmp mkdir_unreachable;
+        hlt
       }
-    }
+    } @no_frame
 }

@@ -1,15 +1,152 @@
 # mkdir — architecture
 
-**Wave:** R50 coreutil
+**Wave:** R50 coreutil → v1.1-A extraction
 **Repo:** github.com/paideia-os/mkdir
 **Upstream design:** `design/tooling/r49-r50-plan.md` §4.9 + §5.9 in
-[paideia-os](https://github.com/paideia-os/paideia-os).
+[paideia-os](https://github.com/paideia-os/paideia-os) for the M1..M5
+wave-level rationale; `design/user/syscall-table.md` row 79 for the
+`sys_mkdir` primitive v1.1-A is built on top of.
 
 This document describes the internal shape of the `mkdir` tool. It does
 not repeat the wave-level rationale from the paideia-os plan doc; read
 that first for the D3 flag-grammar contract, the D4 signed-cap-tail
 requirement, and the I5 undo obligation that mkdir inverts as `rmdir`
 under `-p`-created levels.
+
+## v1.1-A extraction (real body)
+
+**Status:** LANDED at HEAD; the M1..M5 sections below (§§1..9) are
+frozen as the specification of the v1.0.0 tag and are SUPERSEDED for
+runtime behaviour by this section. The M1..M5 text is retained
+because it documents both a real chapter of the tool's history and
+the seams that v1.2-A relands (`-p` walker on top of the real
+substrate, custom mode, audit-journal emit, semantic-pipe emit).
+
+v1.1-A retires the M1-001 STUB scaffold: every M5-era
+`sys_cap_invoke` placeholder is gone, together with the module-split
+between `Mkdir` and `MkdirState`, the `_init_caps` sidecar, the
+`libpdx-argv` link neighbour, the record-staging arrays, and the
+static-bootstrap argv. What remains in `src/mkdir.pdx` is one
+straight-line `_start` that reads argv per the execve ABI and calls
+the real `sys_mkdir` syscall (paideia-os sysno 79, kernel body at
+`src/kernel/core/syscall/sys_mkdir.pdx`, R56.M3-004 #1793) once per
+positional. `src/mkdir_state.pdx` is deleted.
+
+### v1.1-A public surface
+
+    mkdir <PATH> [<PATH>...]
+
+- Reads `argc` (rdi) and `argv` (rsi) directly per the frozen execve
+  ABI (paideia-os `design/user/execve-abi.md`). Each `argv[i]` is an
+  own-aspace pointer; no strlen is computed userspace-side because
+  the walker CAP hint below already bounds the kernel-side copy.
+- Passes each `argv[i]` (for `i` in `1..argc`) to `sys_mkdir` with
+  mode `0755` (`0x1ED`) and `path_len_hint = 255` (walker CAP
+  convention per paideia-os `design/user/syscall-table.md`
+  §"Walker length hint semantics" — the kernel copies up to
+  `min(hint, 255)` bytes from user VA until it sees NUL).
+- Exit 0 on all-success. On the first `sys_mkdir` that returns
+  non-zero, the tool exits with that value (a negative errno per
+  the paideia-os `-errno` sentinel convention, passed to `sys_exit`
+  verbatim). No further positionals are attempted after the first
+  failure.
+- `argc < 2` (zero positionals) emits `mkdir: missing operand\n` to
+  the debug channel (`sys_debug_puts` SC+ ID 12) and exits `2`
+  (retained for continuity with the M5-era `MK_MISSING_PATH`).
+
+### v1.1-A caps + deps
+
+- **Caps at exec: zero.** `sys_mkdir` is a plain `@{fs}` syscall and
+  does not thread through the `KIND_PDXFS_*` capability subsystem.
+  `caps.decl` carries `requires: []` and no `_init_caps` sidecar
+  ships in `src/mkdir.pdx`, matching every capability-free `/bin`
+  coreutil in the paideia-os user tree (`src/user/true.pdx`,
+  `src/user/cat.pdx`, `src/user/mkdir.pdx`, and so on).
+- **Library deps: zero.** v1.1-A inlines the three syscalls it needs
+  (`sys_mkdir=79`, `sys_debug_puts=12`, `sys_exit=60`) at their
+  call sites; no `syscall_shim` link dependency, no `libpdx-argv`
+  link dependency (argv is read directly). `deps.list` is
+  intentionally empty. `libpdx-cap`, `libpdx-audit`, and
+  `libpdx-semantic-pipe` were grep-verified stale since
+  `mkdir.ENH-009`; v1.1-A completes the retirement `libpdx-argv`
+  started.
+
+### v1.1-A `_start` shape
+
+```
+Step 0  cmp argc, 2; jl mkdir_missing_operand
+Step 1  stash argc into rbx; argv into r12; i := 1 into r13
+Step 2  loop:
+          cmp r13, rbx; jge mkdir_all_ok
+          rdi := argv[r13]   (mov rdi, [r12 + r13*8])
+          sys_mkdir(rdi, 255, 0x1ED)     (rax = 79; syscall)
+          cmp rax, 0; jne mkdir_fail
+          r13 += 1; loop
+Step 3  mkdir_all_ok:   sys_exit(0)
+Step 4  mkdir_fail:     r14 := rax (save -errno)
+                        sys_debug_puts("mkdir: create failed\n")
+                        sys_exit(r14)
+Step 5  mkdir_missing_operand:
+                        sys_debug_puts("mkdir: missing operand\n")
+                        sys_exit(2)
+```
+
+### v1.1-A register discipline
+
+- `rbx` = argc; `r12` = argv base; `r13` = loop index; `r14` = saved
+  `-errno` across the failure diagnostic. All four are SysV
+  callee-save and preserved by the amd64 fast-syscall (only rcx/r11
+  clobbered), so no `push`/`pop` parity is needed across the loop
+  iterations or the diagnostic syscall.
+- `rdi`/`rsi`/`rdx`/`rax` carry syscall args at each site.
+- `@no_frame` on `_start` reflects the never-return shape (every
+  terminal path ends in `sys_exit`). Entry `rsp % 16 == 0` per the
+  PVH loader contract.
+
+### v1.1-A paideia-as encoder conformance
+
+- No `add reg, [mem]` / `sub reg, [mem]` anywhere (encoder gap per
+  `feedback_pdx_encoder_pitfalls`). `mov rdi, [r12 + r13*8]` is a
+  plain SIB load that the encoder supports directly.
+- Every `cmp reg, imm` uses an immediate ≤ `0x1ED` (mode), well
+  under the imm16 boundary; no MOVABS-verbatim-load hazard.
+- No `test` mnemonic; every zero-check is `cmp reg, 0`.
+- `r11` reserved as LEA scratch per the reserved-scratch rule (not
+  used here — straight-line body has no LEA-into-scratch pattern).
+- Every label prefixed `mkdir_` to dodge paideia-as reserved
+  keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`,
+  `structure`, `unsafe`, `block`).
+
+### What v1.1-A defers to v1.2-A
+
+- `-p` multi-level with parent creation. v1.2-A relands the
+  `mkdir_split_path` walker on top of the real substrate — because
+  v1.1-A's create primitive is now a real syscall, the M2-era
+  pre-existence-probe / cap-tail-stamp placeholders disappear;
+  the walker is just a per-component `sys_mkdir` with `sys_stat`
+  absorbing pre-existing hits (matching the shape
+  `paideia-os/src/user/rootfs_seed.pdx` uses for its idempotent
+  seed pass).
+- `-m <mode>` custom mode. v1.2-A adds argv-consumed mode parsing
+  once the flag recogniser reappears with `-p`.
+- Audit-journal emit (`UEJ_KIND_TOOL_INVOKE` /
+  `UEJ_KIND_TOOL_ERROR`). v1.2-A relands the emit on top of the
+  real `libpdx-audit` marshaller.
+- `CreatedDirRecord@0.1` semantic-pipe emit. Relands together with
+  the audit hookup at v1.2-A once a real `libpdx-semantic-pipe
+  send_record` consumer exists.
+- `..`-containment guard (mkdir.ENH-004). v1.2-A relands the guard
+  in the walker; v1.1-A does no path validation of its own and
+  relies on `sys_mkdir`'s kernel-side path-resolver to refuse
+  paths that escape a mount (the kernel is the correct site for
+  the check now that the primitive is real).
+
+The M1..M5 sections that follow document the SUPERSEDED shape.
+Retained verbatim for history + as the source-of-truth spec for the
+v1.2-A relands listed above.
+
+---
+
 
 ## 1. Public surface
 

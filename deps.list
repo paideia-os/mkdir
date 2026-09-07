@@ -1,90 +1,47 @@
-# mkdir — deps.list
+# mkdir -- deps.list
 #
-# Wave: R50 coreutil
-# Doc:  design/tooling/plan.md §7 (paideia-os) for the shared-library
-#       roster; design/tooling/r49-r50-plan.md §5.9 for the mkdir-specific
-#       dependency set.
+# Wave: R50 -> v1.1-A extraction
+# Doc:  paideia-os design/tooling/plan.md §7 (shared-library roster);
+#       this repo's design/architecture.md (v1.1-A section).
 #
-# One row per shared-library dependency. Each row is a semver pin against
-# the library's dual-signed 1.0 release. `pkg install mkdir` resolves
-# this list transitively at install time and refuses the install if any
-# row's dual-sig verification fails.
+# One row per shared-library dependency. `pkg install mkdir`
+# resolves this list transitively at install time and refuses the
+# install if any row's dual-sig verification fails.
 #
 # Row format (I3-consistent with libpdx-argv, libpdx-cap):
 #   <name>@<semver> <ml-dsa-65-author-fp> <ml-dsa-65-paideia-root-fp>
 #
-# The two fingerprints let `pkg verify` short-circuit re-verification
-# when the local pkg store already holds the matching signed manifest.
-# Fingerprint format: 16 hex chars = truncated BLAKE3-256 of the
-# ML-DSA-65 public key (matches libpdx-cap M3-001 KIND_USER_ref fp).
+# v1.1-A: no dependencies
+# -----------------------
 #
-# Placeholder-until-signing-bot: every `PLACEHOLDER_*_FP` entry is
-# replaced with the real fingerprint at the M5-002 mirror-push step
-# once the paideia-signing-bot host is stood up (T-INFRA-002 in
-# design/tooling/plan.md §10). The row structure is frozen at v1.0;
-# only the fingerprint hex changes.
+# v1.1-A is a single-file straight-line tool that inlines the three
+# syscalls it needs (sys_mkdir=79, sys_debug_puts=12, sys_exit=60)
+# and reads argv directly from the frozen execve ABI (rdi=argc,
+# rsi=argv). This is the same one-file-one-ELF pattern that the
+# paideia-os /bin/mkdir at `src/user/mkdir.pdx` uses today (and
+# every sibling: true / cat / cp / mv / rm / touch).
+#
+# Retired from M5-era pins
+# ------------------------
+#
+#   libpdx-argv              -- v1.1-A reads argv directly; no
+#                                Parser::parse_argv call.
+#   libpdx-cap               -- v1.1-A holds no caps at exec.
+#   libpdx-audit             -- v1.1-A emits no audit records; the
+#                                seam relands on libpdx-audit's real
+#                                marshaller at v1.2-A.
+#   libpdx-semantic-pipe     -- v1.1-A stages no CreatedDirRecord[];
+#                                the emit relands together with the
+#                                audit hookup at v1.2-A.
+#
+# Every one of the four M5-era pins is grep-verified NEVER linked in
+# `src/` at any point in the M1..M5 scaffold either -- see
+# `design/enhancement-plan.md` §3.7 for the audit that surfaced the
+# three-of-four overstatement at the tail of milestone #6. libpdx-argv
+# was the one actual link neighbour at M5; v1.1-A drops it.
 
-# --- mkdir.ENH-009 correction (post-1.0.0, milestone #6) ---
-#
-# This file previously pinned libpdx-cap, libpdx-audit, and
-# libpdx-semantic-pipe alongside libpdx-argv, on the assumption that
-# mkdir linked all four. A grep-verified audit of src/ (see
-# design/enhancement-plan.md §3.7 and the mkdir.ENH-008 investigation)
-# found exactly one cross-module symbol actually called from _start's
-# reachable graph: `reset` + `parse_argv`, both libpdx-argv. Per this
-# file's own header, `pkg install mkdir` resolves every pinned row
-# transitively and REFUSES the install if that row's dual-sig
-# verification fails — so the three dropped rows below were pure
-# supply-chain surface for zero linked benefit; a tool should not make
-# its own installability depend on a library it does not call.
-#
-# `manifest.pdxsig [deps]` still lists all four rows as of this
-# correction — that section is part of the signed manifest body,
-# frozen at v1.0 per design/tooling/plan.md §D4 ("the signing bot MUST
-# NOT rewrite §1 during re-sign or the hash chain breaks"), so
-# reconciling it is deferred to the next signed manifest revision
-# rather than hand-edited here. This file (deps.list) is not part of
-# that signed body and is safe to correct immediately.
+# --- Real dependency set (grep-verified: none) ---
 
-# --- Real dependency set (grep-verified) ---
-
-libpdx-argv@1.0.0                  PLACEHOLDER_LPDX_ARGV_AUTHOR_FP  PLACEHOLDER_PAIDEIA_ROOT_FP
-
-# --- v1.0 does NOT depend on: ---
-#
-# libpdx-cap — mkdir declares five caps in caps.decl / _init_caps, but
-#   `cap_manifest_verify` is never called (mkdir.ENH-008 confirmed this
-#   is zero call sites repo-wide AND ecosystem-wide: even the shell's
-#   own exec path does its own inline cap narrowing rather than calling
-#   into libpdx-cap for it). Cap-delivery enforcement for mkdir is the
-#   kernel loader's InitCap validator, not a libpdx-cap userspace call.
-#   Re-add this pin only if/when mkdir grows a real libpdx-cap call
-#   site (e.g. a future self-check variant of cap_manifest_verify).
-#
-# libpdx-audit — `emit_audit_event` (src/mkdir.pdx) is a hand-rolled
-#   raw `sys_cap_invoke` against the KIND_IPC_ENDPOINT at SLOT_AUDIT_EP,
-#   not a libpdx-audit library call. Re-add this pin if/when
-#   emit_audit_event is rewritten to route through a real libpdx-audit
-#   marshalling call (its own doc comment already flags this as a
-#   likely M3-substrate-002 follow-up).
-#
-# libpdx-semantic-pipe — `send_record` is never called and cap slot 3
-#   (the semantic pipe) is never invoked; `caps.decl` and
-#   `manifest.pdxsig` both declare `CreatedDirRecord@0.1` as an output
-#   schema, but nothing in src/ marshals a record through this library.
-#   Tracked as mkdir.ENH-002 (`--json` + live slot-3 emit, milestone #6,
-#   open); re-add this pin when that lands with a real `send_record`
-#   call site.
-#
-# libpdx-elevate — mkdir writes only inside the invoker's subtree; the
-#   cross-user / cross-subtree elevate hop is out of scope for v1.0 per
-#   design/tooling/r49-r50-plan.md §5.9. Adding it is a post-1.0 minor
-#   bump.
-#
-# pdx-regex, pdx-time, pdx-help, pdx-color — no pattern, no time input,
-#   no color output at v1.0. --help lives in doc/mkdir.pdxdoc and is
-#   rendered by the `doc` tool at read time.
-#
-# pdx-tls, libpaideia-ui — no network reach, no GUI variant.
+# (intentionally empty at v1.1-A)
 
 # EOF

@@ -4,6 +4,90 @@ Semver-tagged release history. Every entry corresponds to a git tag on
 this repository and (starting at 1.0.0) a dual-signed
 `manifest.pdxsig` at the same commit.
 
+## Unreleased — v1.1-A (real body extraction)
+
+Retires the M1-001 STUB scaffold: the M1..M5 tree dispatched every
+create/probe/stamp/commit step through placeholder `sys_cap_invoke`
+ops on four cap slots (KIND_PDXFS_TXN / KIND_PDXFS_FILE / KIND_USER /
+KIND_IPC_ENDPOINT) that never actually created a directory on disk,
+and read a static bootstrap argv (`-p -v --dry-run a/b/c`) so the
+tool could not see what a user typed. v1.1-A rebuilds `_start` on
+top of the real `sys_mkdir` syscall (paideia-os sysno 79, kernel
+body at `src/kernel/core/syscall/sys_mkdir.pdx`, R56.M3-004 #1793)
+and the frozen execve ABI's own-aspace argv wire (rdi=argc,
+rsi=argv). The result is the minimum viable tool a paideia-os user
+can invoke and observe a directory afterwards.
+
+### v1.1-A behaviour
+
+    mkdir <PATH> [<PATH>...]
+
+- Each positional is passed to `sys_mkdir` with mode 0755 (0x1ED)
+  and a `path_len_hint` of 255 -- the walker CAP convention per
+  paideia-os `design/user/syscall-table.md` §Walker length hint
+  semantics.
+- Exit 0 on all-success; on the first `sys_mkdir` that returns
+  non-zero the tool exits with that value (a negative errno per
+  the paideia-os -errno sentinel convention, passed through to
+  `sys_exit`'s status word verbatim).
+- `argc < 2` (no positional) emits `mkdir: missing operand\n` to
+  the debug channel and exits 2.
+- No `-p`, no `-m`, no `-v`, no `--dry-run`, no `--schema`, no
+  `--version`: v1.1-A recognises no flags. `--help` remains
+  shell-dispatched to `doc mkdir`.
+
+### What v1.1-A retires
+
+- `src/mkdir_state.pdx` deleted. v1.1-A carries no state across
+  loop iterations, so `MkdirState`'s `.bss` singletons, per-
+  component bookkeeping arrays, and `CreatedDirRecord[]` /
+  `RmdirUndoRecord[]` staging are all unnecessary.
+- `_init_caps` sidecar removed from `src/mkdir.pdx`. `sys_mkdir` is
+  a plain `@{fs}` syscall; it does not thread through the
+  capability subsystem, so v1.1-A takes zero caps at exec (matching
+  every `/bin` coreutil in the paideia-os user tree).
+- `parse_flags_from_argv`, `mkdir_split_path`, `mkdir_one`,
+  `mkdir_run`, `emit_audit_event`, `emit_stderr`,
+  `mkdir_state_reset` all deleted. `_start` is one straight-line
+  loop.
+- `libpdx-argv`, `libpdx-cap`, `libpdx-audit`,
+  `libpdx-semantic-pipe` dependencies dropped from `deps.list`.
+  `libpdx-argv` was the one M5-era pin that was actually linked;
+  v1.1-A reads argv directly. The other three had been grep-verified
+  stale since `mkdir.ENH-009` (see `design/enhancement-plan.md`
+  §3.7); v1.1-A completes their retirement.
+- `caps.decl` narrowed to `requires: []` +
+  `declares_output_schemas: []`. `CreatedDirRecord@0.1` re-enters
+  as a live schema when v1.2-A relands the emit against a real
+  `libpdx-semantic-pipe` consumer (grep-verified zero call sites
+  in the ecosystem at v1.1-A).
+- `tests/` M4 + ENH-012 drivers and their `expected-*.txt` witnesses
+  all deleted -- every driver asserted against the retired
+  `MkdirState` singletons. `tests/README.md` records the v1.1-A
+  smoke-witness follow-ups (v1.1-A-T1..T3) that belong in the
+  paideia-os smoke matrix rather than this repo's in-process
+  driver shape (v1.1-A no longer exposes a `mkdir_run`-style
+  function for a driver to call into).
+
+### What v1.1-A defers
+
+- `-p` multi-level with parent creation. v1.2-A relands the
+  `mkdir_split_path` walker on top of the real substrate --
+  because v1.1-A's create primitive is now real, the walker no
+  longer needs the M2-era pre-existence-probe / cap-tail-stamp
+  placeholders; it becomes a straight per-component `sys_mkdir`
+  with pre-existing hits absorbed via `sys_stat` (`-ENOENT` vs
+  hit).
+- `-m <mode>` custom mode. v1.2-A adds argv-consumed mode parsing
+  once the flag-recogniser reappears with `-p`.
+- Audit-journal emit (`UEJ_KIND_TOOL_INVOKE` /
+  `UEJ_KIND_TOOL_ERROR`). v1.2-A relands the emit on top of the
+  real `libpdx-audit` marshaller (the M5-era hand-rolled
+  `sys_cap_invoke` shape was never a real library call).
+- `CreatedDirRecord@0.1` semantic-pipe emit. Relands together with
+  the audit hookup at v1.2-A once a real `libpdx-semantic-pipe
+  send_record` consumer exists.
+
 ## Unreleased — Enhancement v1.x (milestone #6)
 
 Post-1.0 correctness + doc-truth fixes tracked in

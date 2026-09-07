@@ -1,13 +1,26 @@
 # mkdir
 
-paideia-os directory create — a R50 coreutil that creates one or more
-directories inside a single `KIND_PDXFS_TXN`, stamps the invoker's
-`KIND_USER` cap as the owner tail of every created inode, and journals
-the invocation.
+paideia-os directory create — at v1.1-A a minimum viable body that
+walks argv positionals and calls the real `sys_mkdir` syscall
+(paideia-os sysno 79, kernel body at
+`src/kernel/core/syscall/sys_mkdir.pdx`, R56.M3-004 #1793) per
+positional with mode 0755.
 
-## Synopsis
+## Synopsis (v1.1-A)
 
-    mkdir [-p] [-v] [--dry-run] <path> [<path>...]
+    mkdir <PATH> [<PATH>...]
+
+Every positional is created with mode `0755` (`0x1ED`) and a
+`path_len_hint` of 255 (walker CAP per paideia-os
+`design/user/syscall-table.md`). Exit 0 on all-success; exit
+`-errno` on the first `sys_mkdir` that returns non-zero
+(passed to `sys_exit` verbatim). No positional → exit 2 with
+`mkdir: missing operand\n`.
+
+No flags are recognised at v1.1-A. `-p`, `-m`, `-v`, `--dry-run`,
+`--schema`, `--version` all wait on v1.2-A (see `CHANGELOG.md`
+Unreleased v1.2-A follow-ups). `--help` remains shell-dispatched to
+`doc mkdir`.
 
 Install:
 
@@ -16,8 +29,16 @@ Install:
 `pkg` verifies the dual-signed `manifest.pdxsig` (ML-DSA-65 under
 `author_pk` + `paideia_root_pk`) before extracting into
 `/pkgs/mkdir-1.0.0/` and symlinking `/bin/mkdir`.
+(The `1.0.0` path stays until v1.1-A cuts a `1.1.0` tag.)
 
-## Description
+## Description (SUPERSEDED — v1.0.0 tag)
+
+**The v1.0.0 description below documents the M1..M5 STUB scaffold
+that v1.1-A retires at HEAD.** See `CHANGELOG.md` Unreleased v1.1-A
+for the file-by-file retirement inventory and the new
+`_start` shape; `design/architecture.md` §"v1.1-A extraction" for
+the register plan + encoder discipline.
+
 
 `_start` (`src/mkdir.pdx`) runs a fixed sequence: ring3 marker →
 `mkdir_state_reset` → libpdx-argv `reset` → **audit `TOOL_INVOKE` emit**

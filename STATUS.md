@@ -1,90 +1,89 @@
 # mkdir — status
 
-**Wave:** R50 coreutil
-**Current milestone:** M5 — CLOSED. Tag `v1.0.0` at HEAD (M1..M5 milestone
-rollup below is the frozen v1.0.0 snapshot).
-mkdir is *released* per the `r49-r50-plan.md` §5.9 rubric.
+**Wave:** R50 coreutil → v1.1-A extraction
+**Current milestone:** v1.1-A — LANDED in the Unreleased section of
+`CHANGELOG.md`. Retires the M1-001 STUB and wires the real
+`sys_mkdir` syscall (paideia-os sysno 79, kernel body at
+`src/kernel/core/syscall/sys_mkdir.pdx`, R56.M3-004 #1793).
 
-**Milestone #6 — Enhancement v1.x:** IN PROGRESS post-1.0.0. See
-`design/enhancement-plan.md` for the grep-verified defect list and
-`CHANGELOG.md`'s "Unreleased" section for landed fixes. 9 of 12 issues
-closed: the `..` subtree-containment escape (ENH-004), the non-`-p`
-`path_len == 0` bug (ENH-005), the TXN double-commit / record-clobber
-bug across multiple positionals (ENH-006), `--schema` / `--version`
-(ENH-001 / ENH-003), the false `cap_manifest_verify`-runs-at-`_start`
-claim + missing caps.decl slot 4 (ENH-008), `deps.list` reconciliation
-(ENH-009), `-v` per-level emission (ENH-011), and an extended test
-matrix asserting record FIELDS across multiple positionals (ENH-012).
-Open: `--json` + live semantic-pipe emit (ENH-002 — no confirmed
-`send_record` call site exists anywhere in the ecosystem yet, see that
-issue), and two issues with kernel/shell-side companions not yet
-landed (ENH-007 real argv-in-sidecar; ENH-010 kernel `sys_getcwd` wire).
+`mkdir` at HEAD is the minimum viable body a paideia-os user can
+invoke and observe a directory afterwards. Every M1..M5 seam that
+was placeholder-only (cap-invoke stubs, static bootstrap argv,
+record-staging, audit-journal hand-roll) has been retired; see the
+Unreleased v1.1-A entry in `CHANGELOG.md` for the file-by-file
+inventory.
+
+## v1.1-A behaviour
+
+    mkdir <PATH> [<PATH>...]
+
+- Reads argv from rdi/rsi per the frozen execve ABI (paideia-os
+  `design/user/execve-abi.md`).
+- Walks argv[1..argc], calling `sys_mkdir` with mode 0755 (0x1ED)
+  and `path_len_hint` 255 (walker CAP per
+  `design/user/syscall-table.md`) on each.
+- Exit 0 on all-success; exit -errno on the first `sys_mkdir` that
+  returns non-zero (verbatim through `sys_exit`'s status word).
+- Exit 2 with `mkdir: missing operand\n` on the debug channel when
+  `argc < 2`.
+- No flags recognised at v1.1-A: no `-p`, no `-m`, no `-v`, no
+  `--dry-run`, no `--schema`, no `--version`. `--help` remains
+  shell-dispatched to `doc mkdir`.
+
+## Local layout
+
+- `caps.decl` — `requires: []` and `declares_output_schemas: []`;
+  v1.1-A takes no caps at exec (`sys_mkdir` is a plain @{fs}
+  syscall, not cap-gated).
+- `deps.list` — empty at v1.1-A; the M5-era pins on `libpdx-argv`,
+  `libpdx-cap`, `libpdx-audit`, `libpdx-semantic-pipe` are all
+  retired.
+- `manifest.pdxsig` — carries the M5-era body verbatim (signed
+  block frozen at v1.0 per `design/tooling/plan.md` §D4 in
+  paideia-os; the T-INFRA-002 signing bot pass will replace it
+  when v1.1-A cuts a `1.1.0` tag).
+- `CHANGELOG.md` — v1.1-A entry lives in the Unreleased section;
+  cuts to `1.1.0` when tagged.
+- `doc/mkdir.pdxdoc` — carries the M5-era text; a doc-truth pass
+  paired with the v1.1-A extraction is filed as a v1.1-A follow-up
+  (SYNOPSIS drops the retired flags; FLAGS narrows to the
+  positional operand; EXIT CODES documents the `0 / 2 / -errno`
+  triad).
+- `design/architecture.md` — v1.1-A section supersedes §§2..8 of
+  the M1..M5 body.
+- `design/enhancement-plan.md` — M5-era enhancement plan; every
+  open item at that plan's tail is absorbed (retired or deferred)
+  by the v1.1-A extraction.
+- `src/mkdir.pdx` — v1.1-A body: one straight-line `_start`
+  reading argv, looping `sys_mkdir` per positional.
+- `src/mkdir_state.pdx` — DELETED at v1.1-A.
+- `tests/` — M4 + ENH-012 drivers and witnesses all deleted at
+  v1.1-A (see `tests/README.md` for the v1.1-A smoke-witness
+  follow-ups).
+- `.pkgs-mirror/` — mirror-push staging manifest untouched; the
+  T-INFRA-001 mirror host + T-INFRA-002 signing bot follow-up
+  bounds when a v1.1-A dual-signed manifest.pdxsig can ship.
+- `.plans/` — per-milestone implementation notes; the v1.1-A
+  extraction lands one further note (`v1.1-A-notes.md`, filed
+  as a follow-up).
+
+## v1.2-A follow-ups (deferred from v1.1-A)
+
+- `-p` multi-level with parent creation, rebuilt on top of the
+  real `sys_mkdir` primitive (walker becomes a straight per-
+  component syscall with `sys_stat` for pre-existing hits).
+- `-m <mode>` custom mode parsing.
+- Audit-journal emit on top of the real `libpdx-audit`
+  marshaller.
+- `CreatedDirRecord@0.1` semantic-pipe emit on top of a real
+  `libpdx-semantic-pipe send_record` consumer.
 
 ## Milestone rollup
 
 | ID              | Title                                                                  | State  |
 |-----------------|------------------------------------------------------------------------|--------|
-| M1-001 (#1)     | scaffold + caps.decl (target-parent write cap + TXN cap)               | LANDED |
-| M1-002 (#2)     | argv surface via libpdx-argv (mkdir [-p\|-v\|--dry-run])               | LANDED |
-| M1-003 (#3)     | first runnable: single-level mkdir a in TXN with cap-tail as owner     | LANDED |
-| M2-001 (#4)     | -p create-parents: multi-level path atomic in single TXN               | LANDED |
-| M2-002 (#5)     | -p pre-existing dir handling (no-op, not error)                        | LANDED |
-| M2-003 (#6)     | cap-tail write on every created directory (KIND_USER_ref in inode)     | LANDED |
-| M3-001 (#7)     | CreatedDirRecord[] schema bind (path, parent_txn_id, owner)            | LANDED |
-| M3-002 (#8)     | CreateDirRecord via libpdx-audit                                       | LANDED |
-| M3-003 (#9)     | PdxFS v1 undo record: replay is rmdir; -p unwinds only new levels      | LANDED |
-| M4-001 (#10)    | single + multi-level test                                              | LANDED |
-| M4-002 (#11)    | mixed pre-existing + new under -p: undo removes only new levels        | LANDED |
-| M4-003 (#12)    | TXN-abort mid-create: no dirs left                                     | LANDED |
-| M4-004 (#13)    | cap-tail correctness (owner matches invoker in every created inode)    | LANDED |
-| M5-001 (#14)    | dual-signed release + .pdxdoc                                          | LANDED |
-| M5-002 (#15)    | mirror push to pkgs.paideia-os                                         | LANDED |
+| v1.1-A          | Real body extraction: retire M1-001 STUB, wire sys_mkdir               | LANDED |
+| ENH-004..012 (#) | Enhancement v1.x -- absorbed by v1.1-A (retired or deferred to v1.2-A) | LANDED |
+| M1..M5 (#1..#15) | Placeholder scaffold (v1.0.0 tag)                                     | LANDED |
 
-See `design/tooling/r49-r50-plan.md` §5.9 in paideia-os for the full
-milestone breakdown (M1-M5) and cross-repo dependencies.
-
-## Local layout
-
-- `caps.decl` — four required caps (KIND_PDXFS_TXN, KIND_PDXFS_FILE,
-  KIND_USER, KIND_IPC_ENDPOINT) plus the M3-002-added audit endpoint;
-  declares `CreatedDirRecord@0.1` output.
-- `deps.list` (M5-001) — semver-pinned shared-library dependencies
-  (libpdx-argv, libpdx-cap, libpdx-audit, libpdx-semantic-pipe, all
-  at 1.0.0). Fingerprint columns placeholder until T-INFRA-002 signing
-  bot lands.
-- `manifest.pdxsig` (M5-001) — dual-signed release manifest per
-  `design/tooling/plan.md` §D4 + §6.4: `[manifest]` per-file SHA-256
-  hash table + `[capabilities]` + `[schemas]` + `[deps]` sub-blocks,
-  `[author-sig]` block (ML-DSA-65 under author_pk), `[paideia-sig]`
-  block (ML-DSA-65 under paideia_root_pk). Signature blocks placeholder
-  until the signing bot pass at M5-002.
-- `CHANGELOG.md` (M5-001) — semver history; 1.0.0 entry documents the
-  M1..M5 landings, cross-repo dep pin, placeholder-substrate seams
-  still open, and v1.0 known limitations.
-- `doc/mkdir.pdxdoc` (M5-001) — man-equivalent for the `doc` tool per
-  plan.md §I7 (`doc mkdir`) + `--help` back-end via shell dispatch.
-- `design/architecture.md` — internal spec (module boundary, `_start`
-  flow, `mkdir_one` sequence, sidecar cap slot map, paideia-as
-  conformance).
-- `src/mkdir_state.pdx` — `MkdirState` module (return codes, slot/op
-  constants, singleton flag storage, per-invocation path decomposition,
-  CreatedDirRecord + audit + undo staging, `reset`).
-- `src/mkdir.pdx` — `Mkdir` module (`_init_caps` sidecar,
-  `_start` orchestrator, `parse_flags_from_argv`, `mkdir_one`,
-  `mkdir_run`, `mkdir_split_path`, `emit_stderr`, audit-emit helper).
-- `tests/` — M4 coreutil test drivers + `expected-*.txt` witnesses
-  (M4-001..M4-004 all LANDED).
-- `.pkgs-mirror/` (M5-002) — mirror-push staging manifest
-  (`staging.pdxpush`) documenting the two-phase push flow to
-  `pkgs.paideia-os` per plan.md §6.3 + §9.3. Placeholder rows fill
-  once T-INFRA-001 (mirror host) + T-INFRA-002 (signing bot) land.
-- `.plans/` — per-milestone implementation notes.
-
-## v1.0 release pointer
-
-Tag `v1.0.0` marks the M5-001 landing commit. `manifest.pdxsig` is
-authoritative for what ships in `pkg.tar` at M5-002 mirror push — 17
-files hashed under SHA-256. The signature blocks in the manifest are
-placeholder until the paideia-signing-bot host (T-INFRA-002) is stood
-up; the signing bot replaces both blocks without editing the
-`[manifest]` body.
+See `CHANGELOG.md` for the per-milestone landing detail.
