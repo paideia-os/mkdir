@@ -4,6 +4,125 @@ Semver-tagged release history. Every entry corresponds to a git tag on
 this repository and (starting at 1.0.0) a dual-signed
 `manifest.pdxsig` at the same commit.
 
+## Unreleased — v1.1-B (userspace cwd-relative resolution)
+
+Closes paideia-os/mkdir#25 (`mkdir.ENH-010 wire relative-path
+resolution to the kernel cwd (R86 sys_getcwd)`).
+
+Under v1.1-A mkdir passed each argv positional to `sys_mkdir` raw and
+relied on the kernel's `path_resolve(..., cwd=TASK_OFF_CWD)`
+(R86.M1-005 #1958) to anchor relatives against the task's TCB cwd.
+That was correct once the kernel was updated, but it left the tool
+blind to what it was actually creating: the string handed to
+`sys_mkdir` was the same "foo" the user typed while the on-disk path
+was `getcwd() + "/foo"`. v1.1-B moves the join into userspace so the
+string handed to `sys_mkdir` IS the absolute path that lands on disk
+— smoke witnesses assert against argv-visible state instead of the
+kernel's TCB cwd, and a future backend adapter that does not honour
+`TASK_OFF_CWD` (a networked or overlay FS, an out-of-band probe tool)
+still gets the correct target because resolution has happened before
+the syscall boundary.
+
+### v1.1-B behaviour
+
+Each positional PATH argv[1..argc] is classified by its first byte:
+
+- `'/'` — absolute; passed to `sys_mkdir` as-is (any prefixing would
+  be actively wrong since `path_resolve` anchors absolute paths
+  against the mount root regardless of cwd).
+- `'.'` followed by NUL (exactly `.`) — nonsensical (mkdir the cwd
+  itself creates nothing on-disk; the kernel would fail it as
+  `-EEXIST` regardless). Emits `mkdir: refusing to mkdir .\n` and
+  exits **1** (new: `MK_DOT_CWD_NONSENSICAL`).
+- anything else — relative. Calls `sys_getcwd` (SC+ ID 86, R86.M1-003
+  #1956 kernel body at `src/kernel/core/syscall/sys_getcwd.pdx`)
+  into a 256-byte scratch, then joins `cwd + '/' + path` into a
+  second 256-byte scratch and passes that to `sys_mkdir`. The
+  separator is elided when cwd is exactly `/` (no double slash on
+  `mkdir foo` under root). "./foo", "..", ".foo", and multi-component
+  paths like "a/b" all flow through this arm; the kernel's
+  `path_resolve` normalises "." components and refuses ".." per its
+  own semantics.
+
+### v1.1-B new exit codes
+
+- `1` = `MK_DOT_CWD_NONSENSICAL` — `mkdir .`
+- `4` = `MK_PATH_TOO_LONG` — resolved path exceeds `SYS_MKDIR_PATH_MAX-1`
+  (255 bytes; cwd_len + sep + user_len must fit with room for the
+  trailing NUL at index 255). `argc<2` still exits 2; `-errno`
+  passthrough from a failed `sys_mkdir` (or `sys_getcwd`) is
+  unchanged from v1.1-A.
+
+### v1.1-B new SC+ IDs
+
+- `86` = `sys_getcwd(buf_va, buf_len) -> u64` — returns bytes written
+  INCLUDING the trailing NUL (POSIX `getcwd(3)` convention: N-1 is
+  the string's strlen) or negative errno. Inlined at the call site,
+  matching the one-file-one-ELF pattern the rest of `_start` uses;
+  no `syscall_shim` link dependency.
+
+### v1.1-B new scratches
+
+Two 256-byte `.bss` slots in `Mkdir`:
+
+- `_mkdir_cwd_scratch` — destination for `sys_getcwd`. 256 bytes
+  matches `SYS_GETCWD_PATH_MAX` in the kernel's own header, so any
+  path the kernel can compose fits without a `-ERANGE` round-trip.
+- `_mkdir_resolved_scratch` — staging for the joined absolute path
+  handed to `sys_mkdir`. 256 bytes matches `SYS_MKDIR_PATH_MAX` in
+  the kernel's own header. Any join exceeding 255 bytes exits `4`.
+
+### v1.1-B corrections to issue #25
+
+Issue #25 references `sys_getcwd` as "sysno 84". That is a typo —
+84 is `mountinfo` per `design/user/syscall-table.md` row 84.
+`getcwd` is row 86 and every consumer in-tree (`syscall_shim.pdx`
+L184, `dispatch.pdx`'s `pwd_builtin` / `cd_builtin`) uses
+`mov rax, 86`. v1.1-B follows the syscall table.
+
+Issue #25's "MK_CWD_MISMATCH cross-check" fingerprint targeted the
+M5-era `SLOT_PARENT_FILE` (slot 1) cap dispatch shape. v1.1-A
+retired every cap slot when it ripped out `_init_caps` and switched
+to plain `sys_mkdir` — there is no longer a parent cap for cwd to
+mismatch against. v1.1-B addresses the underlying concern (that
+mkdir sees an unresolved-against-cwd path) with the more natural
+fix for the current shape: perform the resolution explicitly in
+userspace so the argv-visible path IS the on-disk path.
+
+### v1.1-B files touched
+
+- `src/mkdir.pdx` — `_start` gains the classify-and-resolve prologue
+  before the common `sys_mkdir` call site. Five new diagnostic
+  strings (`err_dot_cwd_msg`, `err_getcwd_fail_msg`,
+  `err_path_too_long_msg`) and their `_len` companions. Two new
+  256-byte `.bss` scratches (`_mkdir_cwd_scratch`,
+  `_mkdir_resolved_scratch`).
+- `design/architecture.md` — v1.1-B section added ahead of the v1.1-A
+  section; the v1.1-A `_start` shape diagram is superseded by a
+  v1.1-B version showing the resolve prologue and the shared
+  `mkdir_call_sys_mkdir` tail.
+- `design/enhancement-plan.md` — `ENH-010` landed entry.
+- `doc/mkdir.pdxdoc` — SYNOPSIS unchanged; DESCRIPTION gains the
+  "relative paths resolve against `sys_getcwd`" note; EXIT STATUS
+  gains rows 1 and 4.
+- `tests/README.md` — `v1.1-B-T4` smoke witness added to the
+  paideia-os-side matrix note.
+- `CHANGELOG.md` — this entry.
+
+### v1.1-B what it does NOT change
+
+- `sys_mkdir` in the kernel is unchanged. `path_resolve`'s
+  cwd-anchoring at `sys_mkdir.pdx` L266-272 still fires for any
+  future caller that hands it a relative path; v1.1-B just stops
+  being one of those callers.
+- The tool still refuses no path on validation grounds (v1.1-A's
+  behavioural line "does no path validation of its own"). The one
+  new refusal is the exact-`.` operand, which is a userspace
+  affordance (early diagnostic) rather than a security guarantee.
+- No `-p`, no `-m`, no `-v`: v1.1-B keeps v1.1-A's flag-free
+  surface. `-p` multi-level with parent creation still relands at
+  v1.2-A.
+
 ## Unreleased — v1.1-A (real body extraction)
 
 Retires the M1-001 STUB scaffold: the M1..M5 tree dispatched every

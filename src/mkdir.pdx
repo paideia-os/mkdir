@@ -1,11 +1,43 @@
-// src/mkdir.pdx -- mkdir v1.1-A (real body extraction)
+// src/mkdir.pdx -- mkdir v1.1-B (userspace cwd-relative path resolution)
 //
-// v1.1-A retires the M1..M5 STUB scaffold and wires the real
-// `sys_mkdir` syscall (sysno 79, per paideia-os
-// design/user/syscall-table.md row 79) as the tool's create primitive.
+// v1.1-B extends v1.1-A with explicit userspace resolution of relative
+// paths against the caller's kernel cwd via `sys_getcwd` (SC+ ID 86,
+// R86.M1-003 #1956 kernel body at src/kernel/core/syscall/sys_getcwd.pdx).
 //
 // -----------------------------------------------------------------------------
-// v1.1-A behavioural contract
+// mkdir.ENH-010 rationale (paideia-os/mkdir issue #25)
+// -----------------------------------------------------------------------------
+//
+// R86 landed real kernel cwd (`sys_chdir` / `sys_getcwd`) AFTER mkdir
+// shipped v1.0.0. Under v1.1-A mkdir passed argv[i] raw to `sys_mkdir`
+// and relied on the kernel-side `path_resolve(..., cwd=TASK_OFF_CWD)`
+// (sys_mkdir.pdx §(6), R86.M1-005 #1958) to anchor a relative path
+// against the task's TCB cwd. That was correct *once* the kernel was
+// updated, but it left the tool blind to what it was actually creating:
+// the string handed to `sys_mkdir` was the same "foo" the user typed,
+// while the on-disk path was `getcwd() + "/foo"`. Any smoke witness
+// asserting the created path had to consult the kernel's cwd for the
+// prefix -- a coupling nothing else in the coreutil surface has.
+//
+// v1.1-B moves the join into userspace: for a relative path we call
+// `sys_getcwd` first, concatenate `cwd + '/' + path` into a bounded
+// scratch, and pass the resolved absolute path to `sys_mkdir`. Two
+// benefits fall out:
+//
+//   (a) The string handed to `sys_mkdir` is the absolute path that
+//       lands on disk. Smoke witnesses assert against argv-visible
+//       state instead of the kernel's TCB cwd.
+//   (b) A future backend adapter that does NOT honour TASK_OFF_CWD
+//       (a future networked or overlay FS, an out-of-band probe tool)
+//       still gets the correct target, because the resolution has
+//       happened before the syscall boundary.
+//
+// Absolute paths (leading '/') are passed through unchanged -- the
+// kernel-side walker anchors them against the mount root regardless of
+// cwd, so any prefixing on our side would be actively wrong.
+//
+// -----------------------------------------------------------------------------
+// v1.1-B behavioural contract
 // -----------------------------------------------------------------------------
 //
 //   mkdir <PATH> [<PATH>...]
@@ -13,98 +45,97 @@
 // - argv is read directly from the frozen execve ABI: rdi = argc,
 //   rsi = argv (u64*), where argv[0] is the program name. See
 //   paideia-os design/user/execve-abi.md.
-// - Each positional PATH argv[1..argc] is passed to sys_mkdir with
-//   mode 0755 (0x1ED) and a path_len_hint of 255 -- the walker-cap
-//   convention documented in paideia-os design/user/syscall-table.md
-//   §"Walker length hint semantics" (the kernel copies up to
-//   min(hint, 255) bytes from user VA until it sees NUL; callers pass
-//   255 or any bound larger than the actual path).
-// - No -p (parents), no -m (custom mode): v1.1-A is intentionally the
-//   minimum viable body. Multi-level paths that need parent creation
-//   are the caller's obligation until v1.2-A relands the -p walker on
-//   top of the real substrate.
-// - Exit contract: 0 on all-success; on the first sys_mkdir that
+// - Each positional PATH argv[1..argc] is classified by its first byte:
+//     '/'  -> absolute; passed to `sys_mkdir` as-is.
+//     '.'  followed by NUL (exactly ".") -> nonsensical (mkdir the cwd
+//          itself creates nothing); emits `mkdir: refusing to mkdir "."\n`
+//          on the debug channel and exits 1.
+//     anything else -> relative; resolved against `sys_getcwd` and passed
+//          to `sys_mkdir` as an absolute path. "./foo", "..", ".foo",
+//          and multi-component paths like "a/b" all flow through this
+//          arm; the kernel's path_resolve normalises "." components
+//          and refuses ".." per its own semantics.
+// - `sys_mkdir` is called with mode 0755 (0x1ED) and a path_len_hint of
+//   255 -- the walker-cap convention documented in paideia-os
+//   design/user/syscall-table.md §"Walker length hint semantics".
+// - No -p (parents), no -m (custom mode): v1.1-B keeps v1.1-A's
+//   minimum-viable body. Multi-level paths that need parent creation
+//   are the caller's obligation until v1.2-A relands the -p walker.
+// - Exit contract: 0 on all-success; on the first `sys_mkdir` that
 //   returns non-zero the tool exits with that value (a negative errno
-//   per the paideia-os -errno sentinel convention, which sys_exit
-//   accepts verbatim as its status word). No further positionals are
-//   attempted after the first failure.
-// - argc < 2 (no positional) is a hard error: emits `mkdir: missing
-//   operand\n` and exits 2 (retained for continuity with the M5-era
-//   MK_MISSING_PATH code).
+//   per the paideia-os -errno sentinel convention, accepted verbatim
+//   by `sys_exit`). No further positionals are attempted after the
+//   first failure. Additional v1.1-B exits:
+//     1 = MK_DOT_CWD_NONSENSICAL (`mkdir .`)
+//     2 = MK_MISSING_PATH        (argc < 2, retained from v1.1-A)
+//     4 = MK_PATH_TOO_LONG       (resolved path exceeds SYS_MKDIR_PATH_MAX-1)
+//   plus the negative -errno passthrough from `sys_getcwd` when its
+//   own -EFAULT / -ENOENT / -ERANGE fires (not reachable in practice
+//   at R86; a task's cwd is always valid and a full 256-byte buffer
+//   never triggers -ERANGE, but the syscall's own contract allows all
+//   three and we pass whatever it returns).
 //
 // -----------------------------------------------------------------------------
-// What v1.1-A retires from M1..M5
+// SC+ IDs used (inlined; no syscall_shim link)
 // -----------------------------------------------------------------------------
 //
-// The v1.0.0 tag shipped a shape-only scaffold that dispatched every
-// step through placeholder `sys_cap_invoke` ops on four cap slots
-// (KIND_PDXFS_TXN / KIND_PDXFS_FILE / KIND_USER / KIND_IPC_ENDPOINT).
-// No directory was ever created on disk -- PXT_OP_CREATE stubbed to
-// PXT_STUB_OK, the "commit" was a state-transition on a placeholder
-// TXN, and argv was a static bootstrap array (`-p -v --dry-run
-// a/b/c`) so the tool could not read what a user typed. Every one of
-// those seams is retired at v1.1-A:
-//
-//   - `_init_caps` sidecar removed entirely -- the tool takes no caps
-//     at exec, since sys_mkdir is a plain @{fs} syscall and does not
-//     go through the cap subsystem.
-//   - `parse_flags_from_argv`, `mkdir_split_path`, `mkdir_one`,
-//     `mkdir_run` deleted -- v1.1-A is one straight-line loop in
-//     `_start` with no per-path helper.
-//   - `mkdir_state.pdx` deleted -- v1.1-A carries no state across
-//     iterations, so MkdirState's `.bss` singletons, per-component
-//     bookkeeping arrays, and CreatedDirRecord[] / RmdirUndoRecord[]
-//     staging are all unnecessary.
-//   - libpdx-argv dependency dropped -- argv is read directly from
-//     rdi/rsi per the execve ABI, matching the pattern
-//     paideia-os/src/user/mkdir.pdx (the in-kernel /bin/mkdir) uses.
-//   - libpdx-cap, libpdx-audit, libpdx-semantic-pipe dependencies
-//     dropped (grep-verified never linked in the M1..M5 scaffold
-//     either; enhancement-plan §3.7 already listed these three as
-//     stale pins).
-//   - `caps.decl` narrowed to zero required caps.
-//   - `-p`, `-v`, `--dry-run`, `--schema`, `--version` flags removed:
-//     v1.1-A recognises no flags. `--help` remains shell-dispatched to
-//     `doc mkdir` (mkdir never saw the flag under M5 either).
-//   - CreatedDirRecord@0.1 and RmdirUndoRecord@0.1 schema emit removed
-//     -- with no state to stage and no consumer in the ecosystem, the
-//     record shape returns as a live emit when a follow-up wave lands
-//     the semantic-pipe consumer.
-//   - Audit-journal emit removed -- audit is D3 obligation but the
-//     hand-rolled sys_cap_invoke shape was never a real libpdx-audit
-//     call. A follow-up wave rebuilds it on the real library.
-//
-// -----------------------------------------------------------------------------
-// SC+ IDs used
-// -----------------------------------------------------------------------------
-//
-// Inlined directly at call sites -- no syscall_shim link dependency,
-// mirroring paideia-os/src/user/mkdir.pdx and its sibling /bin
-// tools (true.pdx / cat.pdx / rm.pdx / mv.pdx / cp.pdx).
-//
-//   12 = sys_debug_puts(buf, count) -- stderr diagnostic emit
-//   60 = sys_exit(status)           -- never returns
+//   12 = sys_debug_puts(buf, count)    -- stderr diagnostic emit
+//   60 = sys_exit(status)              -- never returns
 //   79 = sys_mkdir(path_va, path_len_hint, mode) -- R56.M3-004 (#1793)
-//        kernel body at src/kernel/core/syscall/sys_mkdir.pdx. rax = 0
-//        on success, negative errno on failure (see paideia-os
-//        design/user/syscall-table.md and sys_mkdir.pdx §Failure
-//        taxonomy: -EFAULT / -ENOENT / -ENOTDIR / -EIO / etc.).
+//   86 = sys_getcwd(buf_va, buf_len)   -- R86.M1-003 (#1956); returns
+//        bytes written INCLUDING trailing NUL (POSIX getcwd(3)
+//        convention: N-1 is the string's strlen) or negative errno.
+//        Kernel body at src/kernel/core/syscall/sys_getcwd.pdx.
+//
+// (Historical note: paideia-os/mkdir issue #25 describes the syscall
+// as "sysno 84". That is a typo -- 84 is `mountinfo` per
+// design/user/syscall-table.md row 84. `getcwd` is row 86 and every
+// consumer in-tree -- syscall_shim.pdx L184, dispatch.pdx's
+// pwd_builtin / cd_builtin -- calls `mov rax, 86`.)
+//
+// -----------------------------------------------------------------------------
+// Buffers
+// -----------------------------------------------------------------------------
+//
+// Two 256-byte .bss scratches:
+//
+//   _mkdir_cwd_scratch       -- destination for sys_getcwd. 256 bytes
+//                               matches SYS_GETCWD_PATH_MAX in the
+//                               kernel's own header (sys_getcwd.pdx),
+//                               so any path the kernel can compose
+//                               fits without a -ERANGE round-trip.
+//   _mkdir_resolved_scratch  -- staging for the joined absolute path
+//                               handed to sys_mkdir. 256 bytes matches
+//                               SYS_MKDIR_PATH_MAX in the kernel's own
+//                               header (sys_mkdir.pdx). We refuse any
+//                               join whose total length exceeds 255
+//                               (leaving room for the trailing NUL at
+//                               index 255) with exit code 4.
+//
+// Both scratches are single-flow: only `_start` writes them, and
+// `_start` is one straight-line loop. There is no per-positional
+// reset between iterations because every write path fully overwrites
+// the bytes it consumes.
 //
 // -----------------------------------------------------------------------------
 // Register discipline
 // -----------------------------------------------------------------------------
 //
-// - rbx = argc (SysV callee-save; syscall preserves it -- amd64
-//   fast-syscall only clobbers rcx/r11).
+// - rbx = argc (SysV callee-save; syscall preserves it).
 // - r12 = argv base pointer (SysV callee-save).
 // - r13 = current positional index (starts at 1 to skip argv[0]).
-// - r14 = saved -errno across the failure-diagnostic sys_debug_puts
-//   call (so we can pass the original -errno through to sys_exit).
+// - r14 = saved -errno across a diagnostic sys_debug_puts (so we can
+//         pass the original -errno through to sys_exit).
+// - r15 = raw argv[i] pointer, preserved across the `sys_getcwd`
+//         syscall so the copy-user-bytes loop can read from it.
+// - r8/r9/r10/r11/rcx/rdx/rax carry syscall args and per-loop scratch.
+//   r11 is safe as loop scratch here because every use lies within a
+//   syscall-free stretch (the copy loops run between syscalls; r11 is
+//   never assumed live across a `syscall`).
 // - rdi/rsi/rdx/rax carry syscall args at each site.
 // - No prologue push: entry rsp % 16 == 0 per the PVH loader
 //   contract, and every terminal path ends in sys_exit (never
-//   returns), so there is no callee-save state to preserve for a
-//   caller that does not exist.
+//   returns), so there is no callee-save state to preserve.
 // - @no_frame attribute reflects the never-return shape.
 //
 // -----------------------------------------------------------------------------
@@ -112,10 +143,13 @@
 // -----------------------------------------------------------------------------
 //
 // - No `add reg, [mem]` / `sub reg, [mem]` anywhere.
-// - All `cmp reg, imm` immediates fit in imm16 (max seen: 0x1ED = 493).
-// - No `test` mnemonic; zero-checks use `cmp rax, 0`.
-// - r11 reserved as LEA scratch (not used here -- straight-line body
-//   has no LEA-into-scratch pattern).
+// - No `test rN, rN`; every zero-check is `cmp reg, 0`.
+// - No `and rN, imm64` on r8..r15.
+// - No 2-op `imul r, imm`.
+// - Every cmp immediate fits in imm16 (max seen: 0x1ED = 493).
+// - Byte loads use `xor rax, rax; mov_b rax, [ptr]` per the #1248
+//   mitigation pattern (mov_b does not zero-extend on its own --
+//   same discipline sys_getcwd_body itself uses).
 // - Reserved-label discipline: every label is prefixed `mkdir_` to
 //   dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`,
 //   `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`).
@@ -124,14 +158,33 @@ module Mkdir = structure {
 
   // Diagnostic strings -- NUL-terminated for future strlen consumers;
   // wire length excludes the trailing NUL. ASCII "--" in place of an
-  // em-dash keeps every line 7-bit ASCII (mirrors paideia-os user
-  // tools' fingerprint-string convention).
+  // em-dash keeps every line 7-bit ASCII.
 
-  pub let err_no_operand_msg : [u8; 24] = "mkdir: missing operand\n\0"
-  pub let err_no_operand_len : u64 = 23
+  pub let err_no_operand_msg      : [u8; 24] = "mkdir: missing operand\n\0"
+  pub let err_no_operand_len      : u64 = 23
 
-  pub let err_mkdir_fail_msg : [u8; 20] = "mkdir: create failed\n\0"
-  pub let err_mkdir_fail_len : u64 = 19
+  pub let err_mkdir_fail_msg      : [u8; 22] = "mkdir: create failed\n\0"
+  pub let err_mkdir_fail_len      : u64 = 21
+
+  pub let err_dot_cwd_msg         : [u8; 28] = "mkdir: refusing to mkdir .\n\0"
+  pub let err_dot_cwd_len         : u64 = 27
+
+  pub let err_getcwd_fail_msg     : [u8; 24] = "mkdir: getcwd failed\n\0\0\0"
+  pub let err_getcwd_fail_len     : u64 = 21
+
+  pub let err_path_too_long_msg   : [u8; 32] = "mkdir: resolved path too long\n\0\0"
+  pub let err_path_too_long_len   : u64 = 30
+
+  // -----------------------------------------------------------------------
+  // .bss scratches
+  //
+  // Both sized at 256 bytes to match the kernel's own SYS_GETCWD_PATH_MAX
+  // and SYS_MKDIR_PATH_MAX limits verbatim -- see the header comment
+  // above for the rationale.
+  // -----------------------------------------------------------------------
+
+  pub let mut _mkdir_cwd_scratch      : [u8; 256] = uninit @align(8)
+  pub let mut _mkdir_resolved_scratch : [u8; 256] = uninit @align(8)
 
   // -----------------------------------------------------------------------
   // _start -- user program entry point. Never returns.
@@ -141,48 +194,169 @@ module Mkdir = structure {
   //   rsi = argv (u64*) -- argv[0] is program name
   //
   // Effects/caps:
-  //   mem     -- reads err_* rodata; dereferences argv[i] pointers.
+  //   mem     -- reads err_* rodata; dereferences argv[i] pointers;
+  //              writes _mkdir_cwd_scratch and _mkdir_resolved_scratch.
   //   sysreg  -- every SYSCALL clobbers rcx (RIP) / r11 (rflags).
-  //   fs      -- sys_mkdir surface.
+  //   fs      -- sys_mkdir + sys_getcwd surface.
   //   sched   -- sys_exit terminates the task.
   //
-  // @no_frame because every terminal path ends in sys_exit (never
-  // returns), matching every /bin coreutil in the paideia-os user tree.
+  // @no_frame because every terminal path ends in sys_exit.
   // -----------------------------------------------------------------------
   pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "mkdir v1.1-A _start: real sys_mkdir extraction from the M1..M5 STUB. Reads argc (rdi) and argv (rsi) per the frozen execve ABI (paideia-os design/user/execve-abi.md, matching src/user/mkdir.pdx and every /bin sibling). argc < 2 -> emit `mkdir: missing operand\\n` via sys_debug_puts (SC+ ID 12), sys_exit(2). Otherwise walk argv[1..argc]: for each positional, load argv[i] into rdi and call sys_mkdir (SC+ ID 79, R56.M3-004 kernel body at src/kernel/core/syscall/sys_mkdir.pdx) with rsi = 255 (walker-cap hint per design/user/syscall-table.md §Walker length hint semantics) and rdx = 0x1ED (mode 0755, matching rootfs_seed.pdx's /home mkdir at src/user/rootfs_seed.pdx L213). rax == 0 -> advance to next positional. rax != 0 -> failure branch: preserve -errno in r14 across a diagnostic sys_debug_puts of `mkdir: create failed\\n`, then sys_exit(r14) -- the -errno is passed through verbatim to sys_exit's status word per the v1.1-A contract (`0 on success, -errno on first failure`). Loop-index invariant: r13 starts at 1 (skip argv[0] = program name) and increments by 1 on each success; loop exits when r13 == rbx (argc). All-success path: sys_exit(0). Register plan: rbx = argc, r12 = argv base, r13 = i, r14 = saved -errno (all SysV callee-save; amd64 fast-syscall preserves them, so no push/pop needed across the sys_mkdir loop iterations). rdi/rsi/rdx/rax are the SysV syscall arg registers. @no_frame because every terminal path ends in sys_exit; entry rsp%16==0 per the PVH loader contract. Encoder-gap discipline: no `add reg, [mem]` / `sub reg, [mem]` anywhere; `mov rdi, [r12 + r13*8]` uses base+index*scale addressing which the encoder supports directly (mirrors src/user/mkdir.pdx's `mov rbx, [rsi + 8]` for a single-index load). Every cmp uses an immediate <= 0x1ED (mode) or a register (argc bound), all fitting imm16 with no sign-extension hazard. No `test` mnemonic. Labels prefixed `mkdir_` to dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`).",
+      justification: "mkdir.ENH-010 (#25) v1.1-B _start: extends v1.1-A with userspace cwd-relative resolution. Reads argc (rdi) and argv (rsi) per the frozen execve ABI. argc < 2 -> emit `mkdir: missing operand\\n`, sys_exit(2). Otherwise walk argv[1..argc]: peek argv[i]'s first byte. First byte '/' (0x2F) -> absolute; skip resolve and jump straight to the sys_mkdir call site with rdi = argv[i]. First byte '.' (0x2E) AND second byte NUL -> exactly `.`; emit `mkdir: refusing to mkdir .\\n` and sys_exit(1) (mkdir the cwd itself creates nothing on-disk, and the kernel would fail it as -EEXIST regardless). Any other first byte (including '.' followed by '/' or '.', producing `./foo`, `..`, `.foo`) -> relative: call sys_getcwd (SC+ ID 86, R86.M1-003 kernel body sys_getcwd.pdx) into _mkdir_cwd_scratch with buf_len=256. rax < 0 -> emit `mkdir: getcwd failed\\n` and sys_exit(-errno) verbatim. rax > 0 -> rax = bytes incl NUL, so cwd_len = rax - 1. Inline bounded strlen on argv[i] (capped at 255; overflow -> exit 4 MK_PATH_TOO_LONG). Determine separator: if cwd is exactly `/` (cwd_len == 1 AND _mkdir_cwd_scratch[0] == '/'), sep = 0 (no double slash on `mkdir foo` when cwd is root); else sep = 1. total_len = cwd_len + sep + user_len; > 255 -> exit 4 MK_PATH_TOO_LONG. Copy cwd bytes into _mkdir_resolved_scratch, then '/' if sep==1, then user bytes, then NUL-terminate. rdi = &_mkdir_resolved_scratch. Common sys_mkdir call site: rsi = 255 (walker CAP hint), rdx = 0x1ED (mode 0755), rax = 79, syscall. rax == 0 -> advance i. rax != 0 -> save -errno in r14, emit `mkdir: create failed\\n`, sys_exit(r14). All-success: sys_exit(0). Register plan: rbx = argc, r12 = argv base, r13 = i, r14 = saved -errno, r15 = raw argv[i] preserved across sys_getcwd (all five SysV callee-save; amd64 fast-syscall preserves them). r8/r9/r10/r11/rcx/rdx/rax carry per-loop scratch; r11 is safe as loop scratch here because every use lies within a syscall-free stretch (the copy loops run between syscalls). Encoder-gap discipline: no `add reg, [mem]`/`sub reg, [mem]` anywhere -- every base+index load goes through mov_b/mov with SIB addressing (`mov_b rax, [rsi + rcx*1]`, `mov rdi, [r12 + r13*8]`). No `test rN, rN` (uses `cmp rN, 0`). No `and rN, imm64` on r8-r15. No 2-op `imul r, imm`. Every cmp immediate fits imm16 (max seen: 0x1ED). Byte loads use `xor rax, rax; mov_b rax, [ptr]` per the #1248 mitigation pattern that sys_getcwd_body itself uses. Labels prefixed `mkdir_` to dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`). @no_frame because every terminal path ends in sys_exit; entry rsp%16==0 per the PVH loader contract.",
       block: {
         // ==========================================================
-        // Phase 0 -- argc guard: at least one positional required.
+        // Phase 0 -- argc guard.
         // ==========================================================
         cmp rdi, 2;
         jl  mkdir_missing_operand;
 
-        // Stash argc + argv base into callee-save registers so the
-        // sys_mkdir syscalls in the loop below do not have to worry
-        // about SysV arg-register clobbering.
         mov rbx, rdi;                          // rbx = argc
         mov r12, rsi;                          // r12 = argv base
         mov r13, 1;                            // r13 = i (skip argv[0])
 
         // ==========================================================
-        // Phase 1 -- per-positional sys_mkdir loop.
+        // Phase 1 -- per-positional loop.
         // ==========================================================
 
       mkdir_loop_head:
         cmp r13, rbx;
         jge mkdir_all_ok;
 
-        // rdi = argv[i]. Own-aspace pointer per execve ABI --
-        // sys_mkdir's user_read_str_via_walk (kernel-side, in
-        // src/kernel/core/syscall/sys_mkdir.pdx) does the KPTI-safe
-        // walk from this user VA up to path_len_hint bytes.
-        mov rdi, [r12 + r13*8];
+        // Raw argv[i] pointer. Own-aspace per execve ABI.
+        mov r15, [r12 + r13*8];                // r15 = raw path ptr
 
-        // sys_mkdir(path=rdi, path_len_hint=255, mode=0x1ED)
+        // Classify first byte.
+        xor rax, rax;
+        mov_b rax, [r15];
+        cmp rax, 0x2F;                         // '/'
+        je  mkdir_use_raw_absolute;
+
+        cmp rax, 0x2E;                         // '.'
+        jne mkdir_do_resolve;
+
+        // First byte is '.'; check for exactly "." (byte 1 == NUL).
+        xor rcx, rcx;
+        mov_b rcx, [r15 + 1];
+        cmp rcx, 0;
+        je  mkdir_dot_error;
+        // else: ".foo" / "./bar" / ".." -- treat as relative.
+        jmp mkdir_do_resolve;
+
+        // ==========================================================
+        // Absolute-path fast path: rdi = argv[i] directly.
+        // ==========================================================
+
+      mkdir_use_raw_absolute:
+        mov rdi, r15;
+        jmp mkdir_call_sys_mkdir;
+
+        // ==========================================================
+        // Relative-path resolve: cwd + '/' + argv[i] -> resolved.
+        // ==========================================================
+
+      mkdir_do_resolve:
+        // sys_getcwd(&_mkdir_cwd_scratch, 256)
+        lea rdi, [rip + _mkdir_cwd_scratch];
+        mov rsi, 256;
+        mov rax, 86;                           // SC+ ID 86 = sys_getcwd
+        syscall;
+
+        cmp rax, 0;
+        jl  mkdir_getcwd_fail;
+
+        // r8 = cwd_len (excluding NUL).
+        mov r8, rax;
+        sub r8, 1;
+
+        // Inline bounded strlen(r15), cap at 255. r9 = user_len.
+        xor r9, r9;
+      mkdir_ulen_top:
+        cmp r9, 255;
+        jae mkdir_path_too_long;
+        xor rax, rax;
+        mov_b rax, [r15 + r9*1];
+        cmp rax, 0;
+        je  mkdir_ulen_done;
+        add r9, 1;
+        jmp mkdir_ulen_top;
+
+      mkdir_ulen_done:
+        // Compute separator length: sep = (cwd is not "/") ? 1 : 0.
+        // r10 will hold sep.
+        mov r10, 1;                            // default: need '/'
+        cmp r8, 1;
+        jne mkdir_sep_done;                    // cwd_len != 1 -> keep sep=1
+
+        // cwd_len == 1: check whether the single byte is '/'.
+        lea rax, [rip + _mkdir_cwd_scratch];
+        xor rdx, rdx;
+        mov_b rdx, [rax];
+        cmp rdx, 0x2F;
+        jne mkdir_sep_done;                    // single byte != '/' -> sep=1
+        xor r10, r10;                          // cwd == "/" -> sep = 0
+
+      mkdir_sep_done:
+        // total_len = cwd_len + sep + user_len. Must fit with NUL at
+        // index total_len, so total_len <= 255.
+        mov rdx, r8;
+        add rdx, r10;
+        add rdx, r9;
+        cmp rdx, 255;
+        ja  mkdir_path_too_long;
+
+        // ---- Copy cwd bytes into resolved scratch ----
+        lea rdi, [rip + _mkdir_resolved_scratch];
+        lea rsi, [rip + _mkdir_cwd_scratch];
+        xor r11, r11;                          // r11 = write cursor
+      mkdir_cpy_cwd_top:
+        cmp r11, r8;
+        jae mkdir_cpy_cwd_done;
+        xor rax, rax;
+        mov_b rax, [rsi + r11*1];
+        mov_b [rdi + r11*1], rax;
+        add r11, 1;
+        jmp mkdir_cpy_cwd_top;
+
+      mkdir_cpy_cwd_done:
+        // ---- Emit separator if needed ----
+        cmp r10, 0;
+        je  mkdir_cpy_user_start;
+        mov rax, 0x2F;                         // '/'
+        mov_b [rdi + r11*1], rax;
+        add r11, 1;
+
+      mkdir_cpy_user_start:
+        // ---- Copy user bytes ----
+        xor rcx, rcx;                          // rcx = user read index
+      mkdir_cpy_user_top:
+        cmp rcx, r9;
+        jae mkdir_cpy_user_done;
+        xor rdx, rdx;
+        mov_b rdx, [r15 + rcx*1];
+        mov_b [rdi + r11*1], rdx;
+        add r11, 1;
+        add rcx, 1;
+        jmp mkdir_cpy_user_top;
+
+      mkdir_cpy_user_done:
+        // NUL-terminate at [rdi + r11].
+        xor rax, rax;
+        mov_b [rdi + r11*1], rax;
+
+        // rdi already points to _mkdir_resolved_scratch -- fall through
+        // to the sys_mkdir call site with rdi holding the resolved
+        // absolute path.
+        lea rdi, [rip + _mkdir_resolved_scratch];
+
+        // ==========================================================
+        // Common sys_mkdir call site.
+        // ==========================================================
+
+      mkdir_call_sys_mkdir:
         mov rsi, 255;                          // walker CAP hint
         mov rdx, 0x1ED;                        // mode 0755
         mov rax, 79;                           // SC+ ID 79 = sys_mkdir
@@ -196,49 +370,64 @@ module Mkdir = structure {
         jmp mkdir_loop_head;
 
         // ==========================================================
-        // Phase 2 -- all-success terminator.
+        // Terminators.
         // ==========================================================
 
       mkdir_all_ok:
-        xor rdi, rdi;                          // exit status = 0
+        xor rdi, rdi;
         mov rax, 60;                           // SC+ ID 60 = sys_exit
         syscall;
         hlt;
-
-        // ==========================================================
-        // Phase 3 -- first-failure terminator: preserve -errno and
-        // pass it through to sys_exit.
-        // ==========================================================
 
       mkdir_fail:
-        // Save -errno into r14 (callee-save; survives the diagnostic
-        // sys_debug_puts syscall below).
-        mov r14, rax;
-
+        mov r14, rax;                          // save -errno
         lea rdi, [rip + err_mkdir_fail_msg];
-        mov rsi, 19;                           // err_mkdir_fail_len
+        mov rsi, 21;                           // err_mkdir_fail_len
         mov rax, 12;                           // SC+ ID 12 = sys_debug_puts
         syscall;
-
-        // Exit with the negative errno the failing sys_mkdir returned
-        // -- v1.1-A contract: `-errno on first failure`.
         mov rdi, r14;
-        mov rax, 60;                           // SC+ ID 60 = sys_exit
+        mov rax, 60;
         syscall;
         hlt;
-
-        // ==========================================================
-        // Phase 4 -- missing-operand terminator (argc < 2).
-        // ==========================================================
 
       mkdir_missing_operand:
         lea rdi, [rip + err_no_operand_msg];
         mov rsi, 23;                           // err_no_operand_len
-        mov rax, 12;                           // SC+ ID 12 = sys_debug_puts
+        mov rax, 12;
         syscall;
+        mov rdi, 2;                            // MK_MISSING_PATH
+        mov rax, 60;
+        syscall;
+        hlt;
 
-        mov rdi, 2;                            // exit status = MK_MISSING_PATH
-        mov rax, 60;                           // SC+ ID 60 = sys_exit
+      mkdir_dot_error:
+        lea rdi, [rip + err_dot_cwd_msg];
+        mov rsi, 27;                           // err_dot_cwd_len
+        mov rax, 12;
+        syscall;
+        mov rdi, 1;                            // MK_DOT_CWD_NONSENSICAL
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      mkdir_getcwd_fail:
+        mov r14, rax;                          // preserve -errno
+        lea rdi, [rip + err_getcwd_fail_msg];
+        mov rsi, 21;                           // err_getcwd_fail_len
+        mov rax, 12;
+        syscall;
+        mov rdi, r14;                          // -errno passthrough
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      mkdir_path_too_long:
+        lea rdi, [rip + err_path_too_long_msg];
+        mov rsi, 30;                           // err_path_too_long_len
+        mov rax, 12;
+        syscall;
+        mov rdi, 4;                            // MK_PATH_TOO_LONG
+        mov rax, 60;
         syscall;
         hlt
       }

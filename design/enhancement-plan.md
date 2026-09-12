@@ -14,6 +14,28 @@ internal spec.
 
 ---
 
+## ENH-010 — cwd-relative resolution via sys_getcwd (v1.1-B LANDED, closes #25)
+
+**Status:** LANDED at v1.1-B (this commit).
+
+Under v1.1-A `_start` passed each argv positional to `sys_mkdir` raw
+and relied on the kernel's `path_resolve(..., cwd=TASK_OFF_CWD)`
+(R86.M1-005 #1958) to anchor relatives against the task's TCB cwd.
+That coupled every smoke witness to the kernel's cwd to know what
+path actually landed on-disk. v1.1-B classifies each positional's
+first byte and, on the relative arm, calls `sys_getcwd` (SC+ ID 86)
+into a bounded 256-byte `.bss` scratch, joins `cwd + '/' + path`
+into a second 256-byte scratch, and hands the resolved absolute
+path to `sys_mkdir` — so the argv-visible string IS the on-disk
+path. See `design/architecture.md` §"v1.1-B extension" and
+`CHANGELOG.md` "v1.1-B" for the full behavioural spec and the
+issue-#25 corrections (sysno is 86, not 84; the parent-cap
+mismatch fingerprint predates v1.1-A's cap-slot retirement and
+is resolved by explicit userspace resolution rather than a
+mismatch check).
+
+---
+
 ## 1. Current state
 
 `mkdir` is two paideia-as modules — `MkdirState` (constants, `.bss`

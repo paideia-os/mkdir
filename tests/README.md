@@ -33,7 +33,7 @@ Every assertion has to be observed from the outside — filesystem-side
 via `sys_stat` after the tool exits, and exit-code side via the
 paideia-os smoke matrix's `$?` render.
 
-Two smoke witnesses are wanted (both filed as follow-up issues, not
+Four smoke witnesses are wanted (all filed as follow-up issues, not
 this milestone):
 
 1. **v1.1-A-T1** — `mkdir /tmp/mkdir-v1.1-A-t1`; assert `sys_stat`
@@ -41,11 +41,32 @@ this milestone):
 2. **v1.1-A-T2** — `mkdir` with zero positionals; assert the
    `mkdir: missing operand` line reaches the debug channel and the
    tool's exit status is 2.
-
-The `-errno` first-failure path (v1.1-A-T3) waits on a repeatable
-`sys_mkdir` failure fixture — a collision on an existing entry
-returns `-EIO` per `sys_mkdir.pdx §Failure taxonomy`, which is the
-simplest to script once T1's fixture is in place.
+3. **v1.1-A-T3** — `-errno` first-failure path. Waits on a
+   repeatable `sys_mkdir` failure fixture — a collision on an
+   existing entry returns `-EIO` per `sys_mkdir.pdx §Failure
+   taxonomy`, which is the simplest to script once T1's fixture is
+   in place.
+4. **v1.1-B-T4** — cwd-relative resolution (paideia-os/mkdir#25 /
+   ENH-010). Shell script:
+       cd /tmp
+       mkdir ./foo
+       mkdir bar
+       mkdir baz/inner            # expected -ENOENT (no baz/)
+       mkdir .                    # expected exit 1, dot-cwd diagnostic
+   Assertions:
+       - `sys_stat("/tmp/foo")` sees a directory (exit 0);
+       - `sys_stat("/tmp/bar")` sees a directory (exit 0);
+       - the `baz/inner` invocation exits with a negative errno
+         (`-ENOENT` = 0xFFFFFFFFFFFFFFFE) and no `/tmp/baz` appears;
+       - `mkdir .` exits `1` and emits
+         `mkdir: refusing to mkdir .\n` on the debug channel;
+       - the path echoed by `sys_debug_puts` on the successful
+         create arms is the ABSOLUTE `/tmp/foo` / `/tmp/bar` (the
+         v1.1-B userspace-resolved witness), not the raw `./foo` /
+         `bar` argv the user typed.
+   The last assertion is the one v1.1-A cannot satisfy — under
+   v1.1-A the kernel resolved the relative internally and the
+   userspace-visible path stayed raw.
 
 These belong in the paideia-os smoke matrix (external to this repo)
 rather than the M4-era `run_test_m4_*` in-process driver shape;

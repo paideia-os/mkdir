@@ -13,6 +13,146 @@ that first for the D3 flag-grammar contract, the D4 signed-cap-tail
 requirement, and the I5 undo obligation that mkdir inverts as `rmdir`
 under `-p`-created levels.
 
+## v1.1-B extension (userspace cwd-relative resolution)
+
+**Status:** LANDED at HEAD; this section extends (does NOT supersede)
+the v1.1-A section below with the mkdir.ENH-010 (#25) prologue.
+
+v1.1-B adds a classify-and-resolve prologue in front of the v1.1-A
+`sys_mkdir` call site so the argv path handed to `sys_mkdir` is
+always ABSOLUTE. Under v1.1-A the tool passed relatives raw and
+relied on the kernel's `path_resolve(..., cwd=TASK_OFF_CWD)`
+(sys_mkdir.pdx L266-272, R86.M1-005 #1958) to anchor them against
+the task's TCB cwd. That was correct, but coupled every smoke
+witness to the kernel's cwd to know what path actually landed
+on-disk. v1.1-B moves the join into userspace via `sys_getcwd`
+(SC+ ID 86, R86.M1-003 #1956) so the string handed to `sys_mkdir`
+IS the on-disk path.
+
+### v1.1-B classification
+
+Each positional's first byte is inspected:
+
+    '/'     -> absolute; passed to sys_mkdir unchanged.
+    '.'+NUL -> exactly "."; MK_DOT_CWD_NONSENSICAL (exit 1) with a
+               `mkdir: refusing to mkdir .\n` diagnostic. The kernel
+               would fail this as -EEXIST regardless; the userspace
+               refusal is an early, argv-visible diagnostic.
+    other   -> relative; sys_getcwd -> join cwd + '/' + path into
+               _mkdir_resolved_scratch -> hand that to sys_mkdir.
+
+The relative arm covers everything else, including ".", "./x", "..",
+".foo" (a leading-dot hidden dir), and multi-component paths like
+"a/b/c". The kernel's `path_resolve` normalises "." components and
+refuses ".." per its own semantics — v1.1-B does not duplicate that
+work.
+
+### v1.1-B join rules
+
+- **cwd == "/" (root)** — separator is elided. `mkdir foo` under cwd
+  `/` produces `/foo`, not `//foo`.
+- **cwd != "/"** — separator is `'/'`. `mkdir foo` under cwd
+  `/home/user` produces `/home/user/foo`.
+- **length gate** — `cwd_len + sep + user_len` must fit in 255 bytes
+  (leaving room for the trailing NUL at index 255). Overflow exits
+  `4` (`MK_PATH_TOO_LONG`) with a
+  `mkdir: resolved path too long\n` diagnostic.
+
+Both scratches (`_mkdir_cwd_scratch`, `_mkdir_resolved_scratch`) are
+256 bytes each, matching `SYS_GETCWD_PATH_MAX` and
+`SYS_MKDIR_PATH_MAX` in the kernel's own headers verbatim.
+
+### v1.1-B `_start` shape (extends v1.1-A §"_start shape")
+
+```
+Step 0  cmp argc, 2; jl mkdir_missing_operand
+Step 1  stash argc, argv into rbx, r12; i := 1 into r13
+
+Step 2  loop:
+          cmp r13, rbx; jge mkdir_all_ok
+          r15 := argv[r13]          (own-aspace pointer)
+
+          peek argv[r13][0]:
+            == '/'  -> rdi := r15;               jmp mkdir_call_sys_mkdir
+            == '.'  AND argv[r13][1] == NUL   -> jmp mkdir_dot_error
+                    else                       -> fall to Step 2b
+            else    -> fall to Step 2b
+
+Step 2b resolve (relative):
+          sys_getcwd(&_mkdir_cwd_scratch, 256) -> rax; rax<0 -> getcwd_fail
+          r8 := rax - 1                     (cwd_len)
+          r9 := bounded strlen(r15, 255)    (user_len; overflow -> path_too_long)
+          r10 := (cwd == "/") ? 0 : 1       (separator)
+          if r8 + r10 + r9 > 255            -> jmp mkdir_path_too_long
+          copy _mkdir_cwd_scratch[0..r8] -> _mkdir_resolved_scratch
+          if r10==1: append '/'
+          append argv[r13][0..r9]
+          NUL-terminate
+          rdi := &_mkdir_resolved_scratch
+
+Step 3  mkdir_call_sys_mkdir:
+          sys_mkdir(rdi, 255, 0x1ED)         (rax = 79)
+          cmp rax, 0; jne mkdir_fail
+          r13 += 1; loop
+
+Step 4..8   unchanged from v1.1-A:
+Step 4  mkdir_all_ok:            sys_exit(0)
+Step 5  mkdir_fail:              r14 := rax; diagnostic; sys_exit(r14)
+Step 6  mkdir_missing_operand:   diagnostic; sys_exit(2)
+Step 7  mkdir_dot_error:         diagnostic; sys_exit(1)          (v1.1-B)
+Step 8  mkdir_getcwd_fail:       r14 := rax; diagnostic; sys_exit(r14)  (v1.1-B)
+Step 9  mkdir_path_too_long:     diagnostic; sys_exit(4)          (v1.1-B)
+```
+
+### v1.1-B register discipline
+
+- `rbx` = argc, `r12` = argv base, `r13` = i, `r14` = saved -errno.
+  Unchanged from v1.1-A; all SysV callee-save.
+- `r15` = raw `argv[i]` pointer. NEW at v1.1-B: preserved across
+  the `sys_getcwd` syscall so the copy-user-bytes loop can read
+  from it after the syscall returns. Callee-save, amd64
+  fast-syscall preserves it.
+- `r8` = `cwd_len` (excluding NUL) during resolve.
+- `r9` = `user_len` (bounded strlen of argv[i]) during resolve.
+- `r10` = separator length (0 or 1) during resolve.
+- `r11` = write cursor during the copy loops. Safe as loop scratch
+  because every use lies within a syscall-free stretch (the copy
+  loops run between syscalls); `r11` is never assumed live across
+  a `syscall`.
+- `rdi`/`rsi`/`rdx`/`rax` carry syscall args at each site.
+
+### v1.1-B paideia-as encoder conformance
+
+- Byte loads use `xor rax, rax; mov_b rax, [ptr]` per the #1248
+  mitigation pattern (proven in sys_getcwd_body's own body).
+- `mov_b rax, [r15 + 1]` uses a literal 1-byte displacement —
+  proven in `sys_execve_shim.pdx` L465 (`mov_b rax, [r15 + 1]`),
+  supported by the encoder.
+- `mov_b [rdi + r11*1], rax` uses SIB with scale=1 — proven in
+  sys_getcwd_body L217 (`mov_b [rdi + r9*1], rax`).
+- No `add reg, [mem]`, no `test rN, rN`, no `and rN, imm64`, no
+  2-op `imul r, imm`. Every cmp immediate fits imm16 (max 0x1ED).
+- Every new label prefixed `mkdir_` (`mkdir_use_raw_absolute`,
+  `mkdir_do_resolve`, `mkdir_ulen_top`/`_done`, `mkdir_sep_done`,
+  `mkdir_cpy_cwd_top`/`_done`, `mkdir_cpy_user_start`/`_top`/`_done`,
+  `mkdir_call_sys_mkdir`, `mkdir_dot_error`, `mkdir_getcwd_fail`,
+  `mkdir_path_too_long`).
+
+### v1.1-B what does NOT change
+
+- `sys_mkdir` in the kernel is unchanged. `path_resolve`'s
+  cwd-anchoring at `sys_mkdir.pdx` L266-272 still fires for any
+  future caller that hands it a relative path; v1.1-B just stops
+  being one of those callers.
+- v1.1-A's zero-caps posture stands. `caps.decl` still carries
+  `requires: []`; no `_init_caps` sidecar; `sys_getcwd` (like
+  `sys_mkdir`) is a plain `@{fs}` syscall.
+- v1.1-A's zero-deps posture stands. `deps.list` still empty;
+  `sys_getcwd` is inlined at its call site alongside the other
+  three syscalls.
+
+---
+
 ## v1.1-A extraction (real body)
 
 **Status:** LANDED at HEAD; the M1..M5 sections below (§§1..9) are

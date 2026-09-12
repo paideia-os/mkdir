@@ -9,6 +9,30 @@
 
 mkdir — create directories under the invoker's PdxFS subtree
 
+# ADDENDUM — v1.1-A / v1.1-B (behaviour changes since v1.0.0)
+
+The DESCRIPTION and FLAGS sections below describe the M1..M5 shape
+that shipped at v1.0.0. As of v1.1-A the tool was rebuilt on top of
+the real `sys_mkdir` syscall (paideia-os sysno 79) and every M5-era
+cap-slot, flag, and record-emit was retired; as of v1.1-B (this
+release) `_start` gained a userspace resolve prologue that joins
+`sys_getcwd() + '/' + argv[i]` before handing the absolute path to
+`sys_mkdir`. See `CHANGELOG.md` and `design/architecture.md` §"v1.1-B
+extension" for the current behavioural contract. In particular:
+
+  - `mkdir /abs/path`  — passed as-is to sys_mkdir.
+  - `mkdir foo`        — resolves to `<cwd>/foo` in userspace.
+  - `mkdir .`          — refused with exit 1 (v1.1-B).
+  - `mkdir ../etc`     — resolves to `<cwd>/../etc`; the kernel's
+                          `path_resolve` handles the `..` component.
+
+Exit codes at v1.1-B:
+  0 = success
+  1 = MK_DOT_CWD_NONSENSICAL   (mkdir .)                  (v1.1-B)
+  2 = MK_MISSING_PATH          (argc < 2)
+  4 = MK_PATH_TOO_LONG         (resolved path > 255 bytes) (v1.1-B)
+  <0 = -errno passthrough from sys_mkdir or sys_getcwd
+
 # SYNOPSIS
 
     mkdir [-p] [-v] [--dry-run] [--json] [--schema] [--help] [--version] <path> [<path>...]
