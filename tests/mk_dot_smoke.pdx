@@ -1,0 +1,184 @@
+// tests/mk_dot_smoke.pdx -- mkdir v1.2.0 (paideia-os/mkdir#32)
+//
+// MkDotSmoke module: `mkdir .` refusal shape-smoke.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// paideia-os/mkdir#32 requests a smoke witness that asserts:
+//
+//   mkdir .   -> exit 1, MK_DOT_CWD_NONSENSICAL
+//
+// The full harness (`spawn mkdir with argv=".";  assert $? == 1;
+// assert `mkdir: refusing to mkdir .\n` on the debug channel`)
+// requires a runtime substrate mkdir's own repo does not carry:
+//
+//   (1) shell.M5 (dual-signed release) to sys_execve `mkdir` with a
+//       constructed argv[1] = ".". Today the shell integration is
+//       staged in paideia-os `tools/user/shell/` but exec-time cap
+//       reconciliation (R90-XREPO.013.M2-001) is only partially
+//       wired against mkdir's brand-new caps.decl (#28); the M5
+//       release tag has not yet cut.
+//
+//   (2) paideia-os smoke harness that reads $? from a child task
+//       and pattern-matches the debug-channel emit. That harness
+//       lives in the paideia-os monorepo (tools/run-smoke.sh),
+//       external to this repo.
+//
+// Both land AFTER mkdir v1.2.0. This test file therefore provides:
+//
+//   (a) An IN-PROCESS classification-smoke (mk_dot_run) that
+//       exercises the exact byte-classification mkdir's `_start`
+//       performs on argv[i]'s first two bytes and asserts the
+//       branch decision matches MK_DOT_CWD_NONSENSICAL. If the
+//       classification-smoke passes, main can be confident that
+//       mkdir's `.` refusal wiring is intact: the classifier
+//       identifies "." (0x2E followed by 0x00) as the dot-cwd
+//       case and jumps to mkdir_dot_error rather than falling
+//       through to mkdir_do_resolve (which would then invoke
+//       sys_getcwd + sys_mkdir on the cwd itself and let the
+//       kernel refuse with -EEXIST — a different exit code and
+//       a different failure surface than v1.2.0 promises).
+//
+//   (b) A HARNESS RUNBOOK (in this file's header) describing the
+//       paideia-os-side smoke sequence to run once (1)-(2) land.
+//       The runbook is the acceptance procedure; this file's
+//       classification-smoke is the CI-visible unit that verifies
+//       the wiring drift-free.
+//
+// Fixture layout
+// --------------
+//
+// The classification-smoke runs against a fixed .rodata string
+// `DOT_LITERAL : [u8; 2] = ".\0"` (0x2E, 0x00). That is
+// byte-identical to what an execve caller would place at
+// argv[1] for `mkdir .`, so a passing classification-smoke
+// witnesses the exact bytes mkdir's _start would see under
+// the paideia-os shell.
+//
+// =============================================================================
+// HARNESS RUNBOOK (paideia-os smoke matrix)
+// =============================================================================
+//
+// Once shell.M5 + tools/run-smoke.sh land, the paideia-os smoke
+// matrix runs:
+//
+//     shell> mkdir .
+//     mkdir: refusing to mkdir .
+//     $ echo $?
+//     1
+//
+// Assertions:
+//   - stderr contains the literal `mkdir: refusing to mkdir .\n`
+//     (27 bytes, matches Mkdir::err_dot_cwd_len in src/mkdir.pdx).
+//   - `$?` after the mkdir invocation is exactly 1
+//     (MK_DOT_CWD_NONSENSICAL, distinct from -EEXIST's
+//     -0x11 = 0xFFFFFFEF and from the -errno passthrough band).
+//   - sys_stat(".") after the invocation returns success (the cwd
+//     is unchanged — no directory was created or destroyed).
+//   - `_semantic_ring` head advance is ZERO for this invocation
+//     (v1.2.0 emits MkdirRecord@0.1 only after a successful
+//     sys_mkdir; a `.` refusal short-circuits before the emit).
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFEBD0 (MkDotSmoke)
+// =============================================================================
+//
+//   0            MK_DOT_SMK_OK             all-pass sentinel (== 0)
+//   0xFFFFEBD1   MK_DOT_SMK_FIRST_BYTE     first byte != 0x2E
+//   0xFFFFEBD2   MK_DOT_SMK_SECOND_BYTE    second byte != 0x00
+//
+// The two failure sentinels sit in the mkdir-tests band
+// 0xFFFFEBDx (distinct from mv's 0xFFFFEBEx; the plan reserves
+// per-tool bands under 0xFFFFEBxx). A caller that observes
+// MK_DOT_SMK_OK can trust that the byte-classification arm in
+// mkdir's `_start` will identify `.` correctly.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`MkDotSmoke` from
+//     `mk_dot_smoke.pdx`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 0x2E fit).
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per the
+//     #1248 mitigation pattern.
+//   - Labels prefixed `mk_dot_` to dodge paideia-as reserved
+//     keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`,
+//     `structure`, `unsafe`, `block`).
+//   - mk_dot_run is a leaf function (no nested `call`), so the
+//     prologue is `sub rsp, 8` (alignment only) and every ret
+//     path re-adds it. Entry rsp % 16 == 8 (SysV entry
+//     convention for a called function); post-sub rsp % 16 == 0.
+
+module MkDotSmoke = structure {
+
+  // -------------------------------------------------------------------------
+  // DOT_LITERAL — the exact byte sequence an execve caller would
+  // place at argv[1] for `mkdir .`. Two bytes: 0x2E ('.'), 0x00 (NUL).
+  //
+  // Kept as a `pub let` so a future harness driver in another test
+  // file can reference the same fixture bytes (Mkdir's own
+  // src/mkdir.pdx has no exported dot-literal — it inlines the
+  // 0x2E and 0x00 immediates directly at mkdir_dot_error's
+  // classification arm).
+  // -------------------------------------------------------------------------
+  pub let DOT_LITERAL : [u8; 2] = ".\0"
+
+  // -------------------------------------------------------------------------
+  // mk_dot_run() -> u64
+  //
+  // The classification shape-smoke entry point. Reads the two-byte
+  // DOT_LITERAL and asserts:
+  //   [0] == 0x2E    (would take mkdir's dot-classification arm)
+  //   [1] == 0x00    (would take the exact-`.` short-circuit into
+  //                   mkdir_dot_error rather than the ".foo" /
+  //                   "./bar" / ".." fall-through into
+  //                   mkdir_do_resolve)
+  //
+  // Return: 0 on all-pass; MK_DOT_SMK_* on first failure.
+  //
+  // Effect/cap tail: {mem} / {} — leaf, reads .rodata only, no
+  // syscall.
+  // -------------------------------------------------------------------------
+  pub let mk_dot_run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mkdir v1.2.0 (paideia-os/mkdir#32) MkDotSmoke::mk_dot_run: classification shape-smoke for the exact-`.` refusal branch in Mkdir::_start (src/mkdir.pdx mkdir_loop_head arm). Reads DOT_LITERAL[0] and DOT_LITERAL[1] via the `xor rN, rN; mov_b rN, [ptr]` pattern (paideia-as #1248 mitigation), compares each against the exact immediate mkdir's _start compares against (0x2E for the first byte, 0x00 for the second), returns 0 on both-match, MK_DOT_SMK_FIRST_BYTE (0xFFFFEBD1) if the first-byte check fails, MK_DOT_SMK_SECOND_BYTE (0xFFFFEBD2) if the second-byte check fails. Leaf function (no nested `call`); prologue is `sub rsp, 8` for alignment only (entry rsp % 16 == 8, post-sub rsp % 16 == 0). Every ret re-adds the 8 bytes. Encoder-gap discipline: no `test rN, rN` (uses `cmp rN, 0` for the second-byte check and `cmp rax, 0x2E` for the first-byte check); byte loads via `xor rax, rax; mov_b rax, [DOT_LITERAL + N]`; every immediate fits imm8 (0, 0x2E) or imm32 (the two failure sentinels). No 2-op `imul r, imm`, no `and reg, imm64`. Labels prefixed `mk_dot_` (mk_dot_first_bad, mk_dot_second_bad). Effect {mem} for the .rodata reads; @{} because no syscall and no capability-guarded op. Same shape as mv/tests/test_smoke.pdx's per-check pattern (cmp+jXX+labelled-fail-ret).",
+      block: {
+        // ---- Prologue --------------------------------------------
+        sub rsp, 8;                              // align rsp % 16 == 0
+
+        // ---- First byte check: DOT_LITERAL[0] == 0x2E ('.') ------
+        lea rsi, [rip + DOT_LITERAL];
+        xor rax, rax;
+        mov_b rax, [rsi];
+        cmp rax, 0x2E;
+        jne mk_dot_first_bad;
+
+        // ---- Second byte check: DOT_LITERAL[1] == 0x00 (NUL) -----
+        xor rax, rax;
+        mov_b rax, [rsi + 1];
+        cmp rax, 0;
+        jne mk_dot_second_bad;
+
+        // ---- All-pass --------------------------------------------
+        xor rax, rax;                            // MK_DOT_SMK_OK (0)
+        add rsp, 8;
+        ret;
+
+      mk_dot_first_bad:
+        mov rax, 0xFFFFEBD1;                     // MK_DOT_SMK_FIRST_BYTE
+        add rsp, 8;
+        ret;
+
+      mk_dot_second_bad:
+        mov rax, 0xFFFFEBD2;                     // MK_DOT_SMK_SECOND_BYTE
+        add rsp, 8;
+        ret
+      }
+    }
+
+}

@@ -4,6 +4,204 @@ Semver-tagged release history. Every entry corresponds to a git tag on
 this repository and (starting at 1.0.0) a dual-signed
 `manifest.pdxsig` at the same commit.
 
+## Unreleased — v1.2.0 (Wave E omnibus)
+
+Bundles the paideia-os/mkdir open-issue drain. Closes five issues in
+one signed release cut:
+
+### Closes paideia-os/mkdir#22 — mkdir.ENH-007 real argv (already landed at v1.1-A)
+
+The M5-era `_start` read a hard-coded bootstrap argv literal
+(`-p -v --dry-run a/b/c`) so the tool never saw user input. v1.1-A
+retired that scaffold and rebuilt `_start` on top of the frozen
+execve ABI: rdi = argc, rsi = argv (u64\*), argv[0] = program name.
+The `mov rbx, rdi; mov r12, rsi` prologue at `src/mkdir.pdx`
+mkdir_loop_head immediate-predecessor is the argv read; every
+positional walk (`mov r15, [r12 + r13*8]`) dereferences it directly.
+
+v1.2.0 does not touch that arm. #22 is closed against v1.1-A's
+already-landed code path; this CHANGELOG entry cites the closure to
+tie the issue to a signed release cut.
+
+### Closes paideia-os/mkdir#28 — R90-XREPO.013.M3-006 caps.decl + adoption
+
+`caps.decl` at v1.1-A was `requires: []` (v1.1-A retired every M5-era
+cap-slot placeholder). v1.2.0 lands the R90-XREPO.013.M3-006
+adoption profile:
+
+    requires:
+      - KIND_PDXFS_VOL(mkdir, <arg-parent>)
+      - KIND_IPC_ENDPOINT(write, semantic-pipe)
+
+    declares_output_schemas:
+      - MkdirRecord@0.1
+
+The two rows are the real cap footprint for the real body:
+
+- **KIND_PDXFS_VOL(mkdir, \<arg-parent\>)** — the volume-level mkdir-op
+  cap, narrowed per positional at exec by shell.M2-001's
+  `sys_exec_reconcile_caps` invocation. Cross-subtree targets and
+  `/system/` targets are refused at exec (no KIND_ELEVATE_CHANNEL
+  declared here; ambient elevate would violate D4).
+
+- **KIND_IPC_ENDPOINT(write, semantic-pipe)** — the ring substrate for
+  the v1.2.0 MkdirRecord@0.1 emit. Declared even though the send
+  path is best-effort so a downstream broker that enforces "emit or
+  refuse" at libpdx-semantic-pipe M3 does not silently drop mkdir's
+  records.
+
+The M5-era five-slot declaration (KIND_PDXFS_TXN / KIND_PDXFS_FILE /
+KIND_USER + two KIND_IPC_ENDPOINT) is NOT re-added. See
+`caps.decl` header for the full rationale.
+
+`manifest.pdxsig [capabilities]` rewritten to the two-row v1.2.0
+profile (slot 0 = KIND_PDXFS_VOL(R_PDXFS_VOL_MKDIR); slot 1 =
+KIND_IPC_ENDPOINT(R_IPC_WRITE)).
+
+### Closes paideia-os/mkdir#29 — v1.1-A Real-body extraction (already landed)
+
+v1.1-A retired the M1-001 STUB scaffold and rebuilt `_start` on top
+of the real `sys_mkdir` syscall (paideia-os sysno 79, kernel body at
+`src/kernel/core/syscall/sys_mkdir.pdx`, R56.M3-004 #1793). See the
+v1.1-A entry below for the file-by-file inventory. v1.1-B extended
+v1.1-A with userspace cwd-relative resolution (paideia-os/mkdir#25);
+v1.2.0 extends v1.1-B with the semantic-pipe emit.
+
+The `sys_cap_invoke`-on-placeholder pattern documented in issue #29
+was fully retired at v1.1-A; v1.2.0 does not re-add it. #29 is
+closed against v1.1-A's already-landed code path.
+
+### Closes paideia-os/mkdir#30 — v1.1-B Semantic-pipe emission wire
+
+Adds the MkdirRecord@0.1 emit via `sys_semantic_send` (SC+ ID 115,
+R107-M0-001 #2350; kernel body at
+`src/kernel/core/syscall/handlers/sys_semantic_send.pdx`) after
+every successful `sys_mkdir`.
+
+#### Record layout (32 bytes total; 4 × u64 lanes)
+
+    [0..8]   path_ptr    -- VA of the NUL-terminated path passed to
+                           sys_mkdir. Absolute-path positional: the
+                           argv[i] pointer; relative: interior
+                           pointer into _mkdir_resolved_scratch.
+    [8..16]  path_len    -- byte length of the path (NUL excluded);
+                           bounded by SYS_MKDIR_PATH_MAX-1 (255).
+    [16..24] mode        -- st_mode of the created directory. Fixed
+                           at 0x1ED (0755) at v1.2.0 (no -m flag).
+    [24..32] status      -- 0 on success. v1.2.0 emits a record ONLY
+                           after sys_mkdir returns 0; failures do
+                           not stage a record.
+
+Schema tag: `0x4D6B646972526501` ("MkdirRe\x01") — a magic u64
+consumers filter by when they drain `_semantic_ring`.
+
+#### Wire discipline
+
+- Best-effort: sys_semantic_send's return (0 / -EFAULT / -EINVAL)
+  is discarded — the directory is already on disk, the 32-byte
+  static rip-relative buf never fails user_ptr_ok, and 32 sits
+  well inside the [1, 240] length gate. Same discipline pdxsock's
+  v1.1-B session-close emit follows (`src/main.pdx` L1917-L1929).
+
+- `_mkdir_record_buf` at `.bss` (@align(8), 32 bytes). mode and
+  status are pre-filled once at `_start` entry (post-argc-guard);
+  path_ptr and path_len are set per iteration before each
+  sys_mkdir call in both the absolute and relative arms.
+
+- Absolute arm gains an inline `strlen(argv[i])` loop (capped at
+  255; overflow → exit 4 MK_PATH_TOO_LONG, same exit as the
+  relative arm) so the emitted `path_len` matches the byte count
+  on the disk-visible path.
+
+#### v1.2.0 files touched by #30
+
+- `src/mkdir.pdx` — new `_mkdir_record_buf` .bss slot; pre-fill
+  block after the argc guard; strlen loop in
+  `mkdir_use_raw_absolute`; record-field stashes at both the
+  absolute arm and the relative arm's post-copy tail;
+  sys_semantic_send emit block after the sys_mkdir success check.
+- `caps.decl` — `KIND_IPC_ENDPOINT(write, semantic-pipe)` row
+  added under `requires:`; `MkdirRecord@0.1` declared under
+  `declares_output_schemas:`.
+- `manifest.pdxsig [schemas]` — `CreatedDirRecord@0.1` replaced
+  by `MkdirRecord@0.1` (the M5-era CreatedDirRecord had no live
+  producer/consumer pair; MkdirRecord@0.1 is the v1.2.0 canonical
+  shape).
+
+### Closes paideia-os/mkdir#32 — mkdir . refusal smoke
+
+Adds `tests/mk_dot_smoke.pdx` — an in-process
+classification-shape-smoke that exercises the exact byte
+sequence mkdir's `_start` sees for `mkdir .` (DOT_LITERAL = 0x2E,
+0x00) and asserts the classifier's branch decision matches
+`mkdir_dot_error` (which would issue sys_exit(1) with the
+MK_DOT_CWD_NONSENSICAL diagnostic).
+
+The full runtime harness (`spawn mkdir with argv="."; assert
+$? == 1; assert debug-channel emit`) requires shell.M5 (dual-signed
+release) + the paideia-os smoke-runner extension; both land AFTER
+mkdir v1.2.0. The file's HARNESS RUNBOOK header documents the
+paideia-os-side sequence for when those substrates arrive.
+
+Return-code band `0xFFFFEBD0` reserved for MkDotSmoke:
+
+    0            MK_DOT_SMK_OK             all-pass sentinel
+    0xFFFFEBD1   MK_DOT_SMK_FIRST_BYTE     first byte != 0x2E
+    0xFFFFEBD2   MK_DOT_SMK_SECOND_BYTE    second byte != 0x00
+
+Complementary to `tests/README.md`'s `v1.1-B-T4` note (which
+covers the same refusal case as one arm of a broader cwd-relative
+smoke); #32's file is a standalone driver that isolates the `.`
+classification without a filesystem fixture dependency.
+
+### v1.2.0 tool-ident wire (provisional)
+
+Adds `src/tool_ident.pdx` declaring `PDX_TOOL_NAME : [u8; 6] =
+"mkdir\0"`. mkdir does NOT link libpdx-argv at v1.2.0 (deps.list
+unchanged from v1.1-A's empty set); the extern is declared
+PROVISIONALLY so a v1.3 landing that adds `-m` / `-p` via a
+Parser::parse_argv call links against libpdx-argv without a
+tool-ident-symbol churn. `PDX_TOOL_VERSION` is intentionally
+OMITTED at v1.2.0 — libpdx-argv's `emit_default` needs BOTH
+symbols to be safe under `--version`, and mkdir has no
+`--version` implementation today; adding the version literal
+without a consumer invites doc-truth drift on every bump. Same
+posture cat/src/tool_ident.pdx took at v1.2.0-A.
+
+### v1.2.0 files touched (summary)
+
+- `src/mkdir.pdx` — semantic-pipe emit block + record-buf stashes
+  (see #30 subsection).
+- `src/tool_ident.pdx` — new: PDX_TOOL_NAME extern (provisional).
+- `tests/mk_dot_smoke.pdx` — new: `mkdir .` classification smoke
+  (see #32 subsection).
+- `caps.decl` — full rewrite for R90-XREPO.013.M3-006 adoption
+  (see #28 subsection).
+- `manifest.pdxsig` — `%ver` bumped 1.0.0 → 1.2.0; `%wave` adds
+  R90-XREPO.013.M3-006 + R107-M0-001; `[manifest]` file-hash
+  table regenerated to the v1.2.0 inventory (placeholder rows
+  awaiting signing-bot rehash); `[capabilities]` narrowed to
+  slots 0/1 (KIND_PDXFS_VOL + KIND_IPC_ENDPOINT); `[schemas]`
+  swapped CreatedDirRecord@0.1 → MkdirRecord@0.1; `[deps]`
+  reconciled to the v1.1-A/v1.2.0 empty set.
+- `VERSION` — new: `1.2.0` (satellite version-witness file, joins
+  the libpdx-argv precedent).
+- `CHANGELOG.md` — this entry.
+
+### v1.2.0 what it does NOT change
+
+- `sys_mkdir` in the kernel is unchanged (v1.1-B's note carries).
+- No `-p`, no `-m`, no `-v` — v1.2.0 keeps v1.1-B's flag-free
+  surface. `-p` multi-level and `-m <mode>` re-enter at v1.3.
+- No shell-side pipe binding (no fd-3 write, no libpdx-semantic-pipe
+  fd-bind path). v1.2.0 uses only the direct sys_semantic_send
+  ring substrate; the fd-bound producer-broker seam re-enters if
+  shell.M3 pipe-plumbing lands with a schema-typed passthrough.
+- No `_init_caps` sidecar. mkdir at v1.2.0 continues to declare
+  no InitCap array; the shell narrows the ambient cap-set at
+  exec per R90-XREPO.013.M2-001 rather than seeding a caller-
+  side cap_table.
+
 ## Unreleased — v1.1-B (userspace cwd-relative resolution)
 
 Closes paideia-os/mkdir#25 (`mkdir.ENH-010 wire relative-path

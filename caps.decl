@@ -1,57 +1,122 @@
 # mkdir -- caps.decl
 #
-# Wave: R50 -> v1.1-A extraction
-# Doc:  design/architecture.md (v1.1-A section) in this repo;
-#       design/user/syscall-table.md row 79 in paideia-os.
+# Wave: R50 -> v1.1-A extraction -> v1.2.0 (#28)
+# Doc:  design/architecture.md (v1.2.0 section) in this repo;
+#       design/round-retrospectives/r90-xrepo-wave3-plan.md
+#         §R90-XREPO.013.M3-006 in paideia-os.
 #
-# v1.1-A takes NO caps at exec. The tool's create primitive is the
-# plain `sys_mkdir` syscall (sysno 79) which is @{fs}-gated at the
-# effect-system level but does not thread through the KIND_PDXFS_*
-# capability subsystem -- the kernel-side sys_mkdir_body walks its
-# path argument against the mount tree via `mount_root_vnode +
-# path_resolve`, not via a KIND_PDXFS_TXN row seeded by the shell.
+# Purpose
+# -------
+# This file is the invariant-I6 (capability handoff visible +
+# refusable) manifest the shell validates at exec: mkdir receives
+# exactly the caps below and no more. Missing a required cap in the
+# reconciled set is an exec refusal; extra caps in the received set
+# are dropped at cap_manifest_verify (libpdx-cap M2-001) before
+# mkdir's `_start` observes them.
 #
-# What v1.1-A retires from M1..M5
-# -------------------------------
+# v1.2.0 (#28) — KIND_PDXFS_VOL adoption per R90-XREPO.013.M3-006
+# ----------------------------------------------------------------
 #
-# The M5-era declaration required five cap rows (slots 0..4):
+# v1.1-A retired every M5-era cap-slot placeholder (`requires: []`)
+# because the `sys_mkdir` syscall body walks its path argument
+# against `mount_root_vnode + path_resolve` — the substrate is
+# @{fs}-gated at the effect-system level but does not thread
+# through the KIND_PDXFS_* capability subsystem AT KERNEL DISPATCH
+# TIME. That remains true at v1.2.0 for the syscall itself.
 #
-#   slot 0 : KIND_PDXFS_TXN     (INVOKE|OBSERVE) -- pre-opened TXN
-#   slot 1 : KIND_PDXFS_FILE    (INVOKE)         -- target parent
-#   slot 2 : KIND_USER          (INVOKE)         -- owner tail stamp
-#   slot 3 : KIND_IPC_ENDPOINT  (WRITE|INVOKE)   -- semantic pipe
-#   slot 4 : KIND_IPC_ENDPOINT  (WRITE|INVOKE)   -- audit journal
+# R90-XREPO.013 (`design/round-retrospectives/r90-xrepo-wave3-plan.md`
+# §5) shifts cap-reconciliation to EXEC TIME: shell.M2-001 invokes
+# `sys_exec_reconcile_caps` for every child before returning
+# control, narrowing the ambient cap-set to what the child's
+# `caps.decl` declares. Every /bin coreutil (ls, cat, cp, mv, rm,
+# mkdir, doc, pkg) publishes a `caps.decl` under R90-XREPO.013.M3-*
+# so the shell can perform the narrowing rather than granting the
+# ambient set unmodified.
 #
-# Every one of those was consumed by placeholder `sys_cap_invoke`
-# ops that never actually created a directory, staged the
-# CreatedDirRecord/RmdirUndoRecord shapes, or reached a real
-# libpdx-audit consumer (grep-verified never linked; see
-# design/enhancement-plan.md §3.7 and §3.6). v1.1-A retires the
-# scaffold and its cap surface together -- see
-# `src/mkdir.pdx` header for the file-by-file retirement inventory.
+# For mkdir the caps that materially affect what the tool can do
+# are:
 #
-# The audit-journal seam re-enters as a real dependency when the
-# next wave rebuilds it on top of libpdx-audit's marshaller (issue
-# not yet filed; documented as a v1.2-A follow-up).
+#   * KIND_PDXFS_VOL(mkdir, <arg-parent>) — the volume-level
+#     mkdir-op cap. The shell narrows the ambient KIND_PDXFS_VOL
+#     cap (which authorises every op on the volume) to the mkdir
+#     right on the parent directory of each argv positional (per-
+#     argument narrowing: `mkdir a b c` receives three distinct
+#     KIND_PDXFS_VOL caps, one per positional's parent). Cross-
+#     subtree targets (`mkdir /system/...`) require an elevate hop
+#     that mkdir does NOT declare here — mkdir refuses cross-
+#     subtree creates by exec-time cap absence, matching rm's M1
+#     posture (rm/caps.decl §"The elevate channel"). This is the
+#     specific narrowing R90-XREPO.013.M3-006 (paideia-os #2002
+#     child) requires mkdir to publish.
 #
-# The `_init_caps` sidecar in `src/mkdir.pdx` is likewise dropped
-# at v1.1-A: with `requires:` empty the loader's
-# `init_caps_validate` (paideia-os src/kernel/core/loader/
-# init_caps.pdx) has nothing to check, matching every
-# capability-free /bin coreutil in the paideia-os user tree
-# (`src/user/true.pdx`, `src/user/cat.pdx`, `src/user/mkdir.pdx`,
-# etc. -- none carry an `_init_caps` array).
+#   * KIND_IPC_ENDPOINT(write, semantic-pipe) — the pipe substrate
+#     for the v1.2.0 (#30) MkdirRecord@0.1 emit via
+#     `sys_semantic_send` (SC+ ID 115). The send path is
+#     best-effort at v1.2.0 (return code discarded), but the cap
+#     must appear in the declared set so a downstream broker that
+#     enforces "emit or refuse" at libpdx-semantic-pipe M3 does
+#     not silently drop mkdir's records.
+#
+# The KIND_ELEVATE_CHANNEL cap (R48.M7 at paideia-os
+# src/kernel/core/ipc/elevate_channel.pdx) is intentionally NOT
+# declared here. Elevate is a per-operation request lodged when
+# the target crosses the invoker's subtree; `mkdir` does not
+# currently support that hop, and ambient elevate authority would
+# violate D4 (destructive ops require per-op consent). A v1.3
+# follow-up (currently unfiled) adds `mkdir --sudo /system/...`
+# behind a libpdx-elevate wire-up; that landing edits this file
+# to add KIND_ELEVATE_CHANNEL.
+#
+# The KIND_USER cap is NOT declared at v1.2.0. mkdir's create
+# path does not stamp an owner tail (unlike rm's RemoveRecord
+# `trash_handle` which carries the invoker's KIND_USER cap-tail);
+# a v1.3 follow-up that adds owner-attribution to MkdirRecord@0.1
+# will add KIND_USER here.
+#
+# What v1.1-A retired (M5-era; NOT restored at v1.2.0)
+# ----------------------------------------------------
+#
+# The M5-era declaration required five cap rows (slots 0..4:
+# KIND_PDXFS_TXN, KIND_PDXFS_FILE, KIND_USER, KIND_IPC_ENDPOINT x2)
+# consumed by placeholder `sys_cap_invoke` ops that never actually
+# created a directory. v1.1-A retired the scaffold; v1.2.0 does
+# not re-add any of those slots. The two rows below are the real
+# cap footprint for the real body.
 
-requires: []
+requires:
+  - KIND_PDXFS_VOL(mkdir, <arg-parent>)
+  - KIND_IPC_ENDPOINT(write, semantic-pipe)
 
 # Declared output schemas
 # -----------------------
 #
-# v1.1-A emits no typed records. The M5-era
-# `CreatedDirRecord@0.1` (handle 0x0100000100010001) had no
-# consumer in the ecosystem anyway (`libpdx-semantic-pipe
-# send_record` grep-verified zero call sites); v1.2-A relands the
-# emit against a live consumer, together with the audit-journal
-# hookup above.
+# v1.2.0 (#30) lands the MkdirRecord@0.1 emit via sys_semantic_send
+# (SC+ ID 115). The kernel-side ring at `_semantic_ring` is a fixed
+# 16-slot buffer (per-slot stride 256 bytes, per-record cap 240;
+# our 32-byte record fits trivially). The schema tag is a magic
+# u64 (0x4D6B646972526501, "MkdirRe\x01") — consumers filter by
+# this tag when they drain the ring.
+#
+# Layout (32 bytes total; 4 x u64 lanes):
+#
+#   [0..8]   path_ptr    -- VA of the NUL-terminated path passed to
+#                            sys_mkdir. For an absolute-path argv
+#                            positional this is a snapshot pointer
+#                            into the invoker's argv buffer; for a
+#                            relative positional this is the
+#                            interior pointer into mkdir's own
+#                            `_mkdir_resolved_scratch` .bss slot
+#                            (mkdir owns that memory for the
+#                            duration of the invocation).
+#   [8..16]  path_len    -- byte length of the path (NUL excluded).
+#                            Bounded by SYS_MKDIR_PATH_MAX-1 (255).
+#   [16..24] mode        -- st_mode of the created directory. Fixed
+#                            at 0x1ED (0755) at v1.2.0 (no -m flag).
+#   [24..32] status      -- 0 on success. v1.2.0 emits a record ONLY
+#                            after sys_mkdir returns 0; failures do
+#                            not stage a record (the diagnostic
+#                            `mkdir: create failed\n` on the debug
+#                            channel is the failure witness).
 
-declares_output_schemas: []
+declares_output_schemas:
+  - MkdirRecord@0.1

@@ -1,4 +1,18 @@
-// src/mkdir.pdx -- mkdir v1.1-B (userspace cwd-relative path resolution)
+// src/mkdir.pdx -- mkdir v1.2.0 (semantic-pipe emission wire)
+//
+// v1.2.0 (paideia-os/mkdir#30) extends v1.1-B with a MkdirRecord@0.1
+// emit via `sys_semantic_send` (SC+ ID 115, R107-M0-001 #2350; kernel
+// body at src/kernel/core/syscall/handlers/sys_semantic_send.pdx)
+// after every successful `sys_mkdir`. Best-effort: the return value
+// (0 / -EFAULT / -EINVAL) is discarded — the directory is already on
+// disk and a ring-refusal is a marshalling bug in this file (32-byte
+// record within the [1, 240] cap, static rip-relative record_ptr never
+// fails user_ptr_ok) rather than a per-run condition the caller can
+// act on. The record's field layout is documented in caps.decl's
+// `declares_output_schemas:` block: 32 bytes = { path_ptr u64,
+// path_len u64, mode u64, status u64 }, schema tag 0x4D6B646972526501
+// ("MkdirRe\x01"). See below §"v1.2.0 record marshalling" for the
+// register plan and the record_buf .bss layout.
 //
 // v1.1-B extends v1.1-A with explicit userspace resolution of relative
 // paths against the caller's kernel cwd via `sys_getcwd` (SC+ ID 86,
@@ -86,6 +100,13 @@
 //        bytes written INCLUDING trailing NUL (POSIX getcwd(3)
 //        convention: N-1 is the string's strlen) or negative errno.
 //        Kernel body at src/kernel/core/syscall/sys_getcwd.pdx.
+//  115 = sys_semantic_send(schema, record_ptr, record_len) -- R107-M0-001
+//        (paideia-os #2350); ring-emission substrate for the
+//        libpdx-semantic-pipe producer path. Return 0 on ring commit,
+//        -EFAULT / -EINVAL on marshalling failure. mkdir at v1.2.0
+//        (#30) treats the return as best-effort and discards it.
+//        Kernel body at src/kernel/core/syscall/handlers/
+//        sys_semantic_send.pdx.
 //
 // (Historical note: paideia-os/mkdir issue #25 describes the syscall
 // as "sysno 84". That is a typo -- 84 is `mountinfo` per
@@ -112,7 +133,20 @@
 //                               (leaving room for the trailing NUL at
 //                               index 255) with exit code 4.
 //
-// Both scratches are single-flow: only `_start` writes them, and
+// v1.2.0 adds one 32-byte .bss slot:
+//
+//   _mkdir_record_buf        -- record composition buffer for
+//                               sys_semantic_send. 32 bytes = 4 x u64
+//                               lanes (path_ptr, path_len, mode,
+//                               status). Well within the kernel-side
+//                               per-record cap of 240 (SSS_MAX_RECORD
+//                               at sys_semantic_send.pdx). @align(8)
+//                               so every u64 store is naturally
+//                               aligned. Written to on each iteration
+//                               (path_ptr / path_len) plus once at
+//                               entry (mode / status).
+//
+// All scratches are single-flow: only `_start` writes them, and
 // `_start` is one straight-line loop. There is no per-positional
 // reset between iterations because every write path fully overwrites
 // the bytes it consumes.
@@ -186,6 +220,18 @@ module Mkdir = structure {
   pub let mut _mkdir_cwd_scratch      : [u8; 256] = uninit @align(8)
   pub let mut _mkdir_resolved_scratch : [u8; 256] = uninit @align(8)
 
+  // v1.2.0 (#30): 32-byte MkdirRecord@0.1 composition buffer.
+  //
+  //   [0..8]   path_ptr    (u64) -- filled per iteration before mkdir
+  //   [8..16]  path_len    (u64) -- filled per iteration before mkdir
+  //   [16..24] mode        (u64) -- pre-filled 0x1ED at _start entry
+  //   [24..32] status      (u64) -- pre-filled 0 at _start entry
+  //
+  // The kernel's per-record cap (SSS_MAX_RECORD = 240 at
+  // sys_semantic_send.pdx §Section 2) is 7.5x this size; the [1, 240]
+  // length gate never trips on our 32-byte emit.
+  pub let mut _mkdir_record_buf       : [u8; 32]  = uninit @align(8)
+
   // -----------------------------------------------------------------------
   // _start -- user program entry point. Never returns.
   //
@@ -195,10 +241,20 @@ module Mkdir = structure {
   //
   // Effects/caps:
   //   mem     -- reads err_* rodata; dereferences argv[i] pointers;
-  //              writes _mkdir_cwd_scratch and _mkdir_resolved_scratch.
+  //              writes _mkdir_cwd_scratch, _mkdir_resolved_scratch,
+  //              _mkdir_record_buf (v1.2.0).
   //   sysreg  -- every SYSCALL clobbers rcx (RIP) / r11 (rflags).
   //   fs      -- sys_mkdir + sys_getcwd surface.
   //   sched   -- sys_exit terminates the task.
+  //
+  // v1.2.0 (#30) note: sys_semantic_send (SC+ ID 115) declares no
+  // {cap} at either the shim (src/user/syscall_shim.pdx L661) or the
+  // kernel body (sys_semantic_send.pdx L158) — it writes into the
+  // fixed 16-slot global `_semantic_ring` and takes no cap slots.
+  // The @{fs, sched} tail here therefore does NOT gain a new cap
+  // when the emit lands; the @{ipc} declaration lives at caps.decl
+  // for the shell-side reconciliation (exec-time), not in the
+  // effect signature.
   //
   // @no_frame because every terminal path ends in sys_exit.
   // -----------------------------------------------------------------------
@@ -206,7 +262,7 @@ module Mkdir = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "mkdir.ENH-010 (#25) v1.1-B _start: extends v1.1-A with userspace cwd-relative resolution. Reads argc (rdi) and argv (rsi) per the frozen execve ABI. argc < 2 -> emit `mkdir: missing operand\\n`, sys_exit(2). Otherwise walk argv[1..argc]: peek argv[i]'s first byte. First byte '/' (0x2F) -> absolute; skip resolve and jump straight to the sys_mkdir call site with rdi = argv[i]. First byte '.' (0x2E) AND second byte NUL -> exactly `.`; emit `mkdir: refusing to mkdir .\\n` and sys_exit(1) (mkdir the cwd itself creates nothing on-disk, and the kernel would fail it as -EEXIST regardless). Any other first byte (including '.' followed by '/' or '.', producing `./foo`, `..`, `.foo`) -> relative: call sys_getcwd (SC+ ID 86, R86.M1-003 kernel body sys_getcwd.pdx) into _mkdir_cwd_scratch with buf_len=256. rax < 0 -> emit `mkdir: getcwd failed\\n` and sys_exit(-errno) verbatim. rax > 0 -> rax = bytes incl NUL, so cwd_len = rax - 1. Inline bounded strlen on argv[i] (capped at 255; overflow -> exit 4 MK_PATH_TOO_LONG). Determine separator: if cwd is exactly `/` (cwd_len == 1 AND _mkdir_cwd_scratch[0] == '/'), sep = 0 (no double slash on `mkdir foo` when cwd is root); else sep = 1. total_len = cwd_len + sep + user_len; > 255 -> exit 4 MK_PATH_TOO_LONG. Copy cwd bytes into _mkdir_resolved_scratch, then '/' if sep==1, then user bytes, then NUL-terminate. rdi = &_mkdir_resolved_scratch. Common sys_mkdir call site: rsi = 255 (walker CAP hint), rdx = 0x1ED (mode 0755), rax = 79, syscall. rax == 0 -> advance i. rax != 0 -> save -errno in r14, emit `mkdir: create failed\\n`, sys_exit(r14). All-success: sys_exit(0). Register plan: rbx = argc, r12 = argv base, r13 = i, r14 = saved -errno, r15 = raw argv[i] preserved across sys_getcwd (all five SysV callee-save; amd64 fast-syscall preserves them). r8/r9/r10/r11/rcx/rdx/rax carry per-loop scratch; r11 is safe as loop scratch here because every use lies within a syscall-free stretch (the copy loops run between syscalls). Encoder-gap discipline: no `add reg, [mem]`/`sub reg, [mem]` anywhere -- every base+index load goes through mov_b/mov with SIB addressing (`mov_b rax, [rsi + rcx*1]`, `mov rdi, [r12 + r13*8]`). No `test rN, rN` (uses `cmp rN, 0`). No `and rN, imm64` on r8-r15. No 2-op `imul r, imm`. Every cmp immediate fits imm16 (max seen: 0x1ED). Byte loads use `xor rax, rax; mov_b rax, [ptr]` per the #1248 mitigation pattern that sys_getcwd_body itself uses. Labels prefixed `mkdir_` to dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`). @no_frame because every terminal path ends in sys_exit; entry rsp%16==0 per the PVH loader contract.",
+      justification: "mkdir v1.2.0 (#30) _start: extends v1.1-B (userspace cwd-relative resolution, #25) with MkdirRecord@0.1 emit via sys_semantic_send (SC+ ID 115, R107-M0-001 #2350) after every successful sys_mkdir. Reads argc (rdi) and argv (rsi) per the frozen execve ABI. argc < 2 -> emit `mkdir: missing operand\\n`, sys_exit(2). Pre-fills _mkdir_record_buf[16..24] = 0x1ED (mode) and _mkdir_record_buf[24..32] = 0 (status) once at entry via lea r11, [rip + _mkdir_record_buf] + mov [r11 + 16], rax pattern (rip-relative store proven at pdxsock main.pdx L1912). Walks argv[1..argc]: peeks argv[i]'s first byte. First byte '/' (0x2F) -> absolute arm mkdir_use_raw_absolute: inline bounded strlen(r15) into r9 (capped at 255, exits 4 MK_PATH_TOO_LONG on overflow), stashes r15 as path_ptr and r9 as path_len into _mkdir_record_buf via lea r11 + two mov, sets rdi = r15, jumps to shared sys_mkdir call site. First byte '.' (0x2E) AND second byte NUL -> exactly `.`; emits `mkdir: refusing to mkdir .\\n` and sys_exit(1) MK_DOT_CWD_NONSENSICAL (mkdir the cwd itself creates nothing; kernel would fail as -EEXIST regardless). Anything else -> relative arm mkdir_do_resolve: calls sys_getcwd (SC+ ID 86, R86.M1-003 kernel body sys_getcwd.pdx) into _mkdir_cwd_scratch with buf_len=256; rax < 0 -> emit `mkdir: getcwd failed\\n` and sys_exit(-errno) verbatim; rax > 0 -> cwd_len = rax - 1. Inline bounded strlen on argv[i] (capped at 255; overflow -> exit 4 MK_PATH_TOO_LONG). Separator = 0 if cwd is exactly `/`, else 1. total_len > 255 -> exit 4. Copies cwd + optional '/' + user into _mkdir_resolved_scratch, NUL-terminates, then stashes &_mkdir_resolved_scratch as path_ptr and r11 (final cursor, excludes NUL) as path_len into _mkdir_record_buf; falls through to sys_mkdir call site with rdi = &_mkdir_resolved_scratch. Common sys_mkdir call site: rsi = 255, rdx = 0x1ED, rax = 79, syscall. rax != 0 -> save -errno in r14, emit `mkdir: create failed\\n`, sys_exit(r14). rax == 0 -> emit MkdirRecord@0.1: mov rdi, 0x4D6B646972526501 (schema tag `MkdirRe\\x01`, movabs form, proven at sys_semantic_send.pdx L221 for errno constants); lea rsi, [rip + _mkdir_record_buf]; mov rdx, 32; mov rax, 115; syscall. Return value (0/-EFAULT/-EINVAL) discarded — best-effort (dir already on disk; 32-byte static rip-relative buf never fails user_ptr_ok and 32 sits inside [1, 240]). Advance i; loop. All-success: sys_exit(0). Register plan: rbx = argc, r12 = argv base, r13 = i, r14 = saved -errno (error paths only), r15 = raw argv[i] preserved across sys_getcwd (all five SysV callee-save; amd64 fast-syscall preserves them). r8/r9/r10/r11/rcx/rdx/rax carry per-loop scratch; r11 is safe as loop scratch here because every use lies within a syscall-free stretch (the copy loops and record-buf stores run between syscalls). Encoder-gap discipline: no `add reg, [mem]`/`sub reg, [mem]` anywhere; base+index loads go through mov_b/mov with SIB addressing (`mov_b rax, [rsi + rcx*1]`, `mov rdi, [r12 + r13*8]`). No `test rN, rN` (uses `cmp rN, 0`). No `and rN, imm64` on r8-r15. No 2-op `imul r, imm`. Every cmp immediate fits imm16 (max seen: 0x1ED). Byte loads use `xor rax, rax; mov_b rax, [ptr]` per the #1248 mitigation pattern. mov r64, imm64 (movabs) used for the schema-tag constant (0x4D6B646972526501). mov [rip + label + N], reg used for the record-buf stores (rip-relative store with u64 offset, proven at pdxsock main.pdx L1912 for [reg + offset] and sys_semantic_send.pdx L214 for rip-relative). Labels prefixed `mkdir_` (mkdir_loop_head, mkdir_use_raw_absolute, mkdir_alen_top/done, mkdir_do_resolve, mkdir_ulen_top/done, mkdir_sep_done, mkdir_cpy_cwd_top/done, mkdir_cpy_user_start/top/done, mkdir_call_sys_mkdir, mkdir_all_ok, mkdir_fail, mkdir_missing_operand, mkdir_dot_error, mkdir_getcwd_fail, mkdir_path_too_long) to dodge paideia-as reserved keywords (`loop`, `if`, `let`, `fn`, `pub`, `mut`, `struct`, `structure`, `unsafe`, `block`). @no_frame because every terminal path ends in sys_exit; entry rsp%16==0 per the PVH loader contract.",
       block: {
         // ==========================================================
         // Phase 0 -- argc guard.
@@ -217,6 +273,23 @@ module Mkdir = structure {
         mov rbx, rdi;                          // rbx = argc
         mov r12, rsi;                          // r12 = argv base
         mov r13, 1;                            // r13 = i (skip argv[0])
+
+        // ==========================================================
+        // v1.2.0 (#30): pre-fill invariant record fields.
+        //
+        // mode (0x1ED = 0755) and status (0) never change across
+        // iterations at v1.2.0. path_ptr and path_len are set per
+        // iteration before the sys_mkdir call (see mkdir_use_raw_
+        // absolute and mkdir_cpy_user_done arms below). r11 is safe
+        // as a base pointer here: entry to _start is between syscalls
+        // and every use of r11 up to mkdir_call_sys_mkdir is
+        // syscall-free scratch (per the register-plan header).
+        // ==========================================================
+        lea r11, [rip + _mkdir_record_buf];
+        mov rax, 0x1ED;
+        mov [r11 + 16], rax;                   // mode = 0755
+        xor rax, rax;
+        mov [r11 + 24], rax;                   // status = 0 (success only)
 
         // ==========================================================
         // Phase 1 -- per-positional loop.
@@ -248,9 +321,40 @@ module Mkdir = structure {
 
         // ==========================================================
         // Absolute-path fast path: rdi = argv[i] directly.
+        //
+        // v1.2.0 (#30): before entering the shared sys_mkdir call
+        // site we compute strlen(argv[i]) into r9 (capped at 255, same
+        // MK_PATH_TOO_LONG exit as the relative-path arm) so the
+        // record marshalled after a successful sys_mkdir carries the
+        // real byte count. This mirrors the ulen loop in the
+        // relative-path arm verbatim (mkdir_ulen_top .. mkdir_ulen_done)
+        // — same byte-load pattern (xor rax, rax; mov_b rax, [ptr]),
+        // same 255-byte cap, same MK_PATH_TOO_LONG exit.
         // ==========================================================
 
       mkdir_use_raw_absolute:
+        // Inline bounded strlen(r15), cap at 255. r9 = user_len.
+        xor r9, r9;
+      mkdir_alen_top:
+        cmp r9, 255;
+        jae mkdir_path_too_long;
+        xor rax, rax;
+        mov_b rax, [r15 + r9*1];
+        cmp rax, 0;
+        je  mkdir_alen_done;
+        add r9, 1;
+        jmp mkdir_alen_top;
+
+      mkdir_alen_done:
+        // Stash record fields for the sys_semantic_send emit after
+        // the successful sys_mkdir. path_ptr = argv[i] pointer;
+        // path_len = strlen just computed. r11 is safe scratch here
+        // (no live value between the absolute-path classification
+        // and the sys_mkdir call).
+        lea r11, [rip + _mkdir_record_buf];
+        mov [r11 + 0], r15;                    // path_ptr = argv[i]
+        mov [r11 + 8], r9;                     // path_len
+
         mov rdi, r15;
         jmp mkdir_call_sys_mkdir;
 
@@ -347,6 +451,18 @@ module Mkdir = structure {
         xor rax, rax;
         mov_b [rdi + r11*1], rax;
 
+        // v1.2.0 (#30): stash record fields for the sys_semantic_send
+        // emit after the successful sys_mkdir. path_ptr = interior
+        // pointer into _mkdir_resolved_scratch (mkdir owns that memory
+        // for the invocation); path_len = the r11 cursor we finished
+        // the copy at (excludes NUL, matches wire convention). Uses
+        // rax as the record_buf base pointer here because rdi is still
+        // pinned to _mkdir_resolved_scratch (we hand that same pointer
+        // to sys_mkdir below).
+        lea rax, [rip + _mkdir_record_buf];
+        mov [rax + 0], rdi;                    // path_ptr = &_mkdir_resolved_scratch
+        mov [rax + 8], r11;                    // path_len (excludes NUL)
+
         // rdi already points to _mkdir_resolved_scratch -- fall through
         // to the sys_mkdir call site with rdi holding the resolved
         // absolute path.
@@ -364,6 +480,36 @@ module Mkdir = structure {
 
         cmp rax, 0;
         jne mkdir_fail;
+
+        // ==========================================================
+        // v1.2.0 (#30): emit MkdirRecord@0.1 via sys_semantic_send.
+        //
+        // Best-effort ring emission. The record buffer has already
+        // been fully composed (path_ptr, path_len before this call;
+        // mode, status once at _start entry). Schema tag is the
+        // magic u64 0x4D6B646972526501 ("MkdirRe\x01"). Record length
+        // is 32 (well inside [1, 240], the kernel-side per-record
+        // cap at SSS_MAX_RECORD).
+        //
+        // Return value (0 / -EFAULT / -EINVAL) is intentionally
+        // discarded: (a) the directory is already on disk so a
+        // ring-refusal cannot roll it back, and (b) the 32-byte
+        // static rip-relative buffer never fails user_ptr_ok and
+        // 32 sits inside the length gate — a nonzero return here
+        // would be a marshalling bug in this file, not a per-run
+        // condition the caller can act on. Same discipline pdxsock's
+        // v1.1-B session-close emit follows (src/main.pdx L1917-L1929).
+        //
+        // Encoder discipline: `mov rdi, imm64` is the movabs form
+        // (proven at sys_semantic_send.pdx line 221 for errno
+        // constants); rip-relative lea for rsi (proven at pdxsock
+        // main.pdx L1926); every other operand is imm8 or imm32.
+        // ==========================================================
+        mov rdi, 0x4D6B646972526501;           // schema tag "MkdirRe\x01"
+        lea rsi, [rip + _mkdir_record_buf];
+        mov rdx, 32;                           // record_len
+        mov rax, 115;                          // SC+ ID 115 = sys_semantic_send
+        syscall;
 
         // Success on this positional; advance i and loop.
         add r13, 1;

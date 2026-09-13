@@ -1,0 +1,79 @@
+// src/tool_ident.pdx — mkdir v1.2.0
+//
+// ToolIdent module: per-tool identity extern consumed by
+// libpdx-argv >= 1.1.3 VersionBackend::emit_default (ENH-032 hotfix,
+// paideia-os/libpdx-argv #42).
+//
+// Why this file exists — Wave 6 libpdx-argv contract
+// --------------------------------------------------
+// libpdx-argv 1.1.3 removed the hard-coded `DOC_TOOL_NAME` /
+// `DOC_TOOL_VERSION` literals from VersionBackend::emit_default and
+// replaced them with two `UND` externs — PDX_TOOL_NAME (lowercase,
+// NUL-terminated) and PDX_TOOL_VERSION (semver, NUL-terminated).
+// Every consumer of libpdx-argv >= 1.1.3 must provide both symbols
+// at final-link time or `ld` fails with an undefined-symbol error
+// naming the missing symbol (deliberate: no STB_WEAK fallback
+// because the pre-hotfix "doc" default would silently pass under
+// `--version` — worse than a link-time failure).
+//
+// See tools/user/libpdx-argv/src/version_backend.pdx §60-90 for
+// the full contract and the ENH-032 hotfix rationale.
+//
+// Wire-in posture at v1.2.0
+// -------------------------
+// mkdir's satellite deps.list does NOT declare libpdx-argv at v1.2.0
+// — the tool inlines its three syscalls (sys_debug_puts, sys_exit,
+// sys_mkdir) plus the R86 sys_getcwd and R107 sys_semantic_send
+// additions, and reads argv directly from the frozen execve ABI
+// (rdi=argc, rsi=argv). PDX_TOOL_NAME is declared here PROVISIONALLY
+// (matching cat/src/tool_ident.pdx v1.2.0-A posture) so a future
+// v1.3 landing that adds a Parser::parse_argv call — the natural
+// substrate for `-m <mode>` and `-p` at that milestone — links
+// against libpdx-argv without a fresh caps.decl edit and without a
+// deps.list churn on the tool-ident symbol.
+//
+// PDX_TOOL_VERSION is intentionally OMITTED at v1.2.0. Two reasons:
+//
+//   (a) libpdx-argv's emit_default requires BOTH symbols; a partial
+//       declaration is worse than none (the tool would half-satisfy
+//       the extern and produce a name/version mismatch under a
+//       future --version implementation). Adding PDX_TOOL_VERSION
+//       here without a `--version` code path invites a doc-truth
+//       drift between this literal and the CHANGELOG's tag —
+//       exactly the ENH-032 regression class the hotfix was cutting.
+//
+//   (b) mkdir has no `--version` implementation today (v1.1-A
+//       explicitly retired the --version flag when it retired the
+//       whole flag parser). Adding PDX_TOOL_VERSION as a symbol
+//       without a consumer creates an unused-symbol footprint and
+//       an unnecessary two-line update on every version bump.
+//
+// The v1.3 landing that adds `-m` / `-p` (and re-adds --version
+// as an emit_default entry point) adds PDX_TOOL_VERSION here.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`ToolIdent`).
+//   - No function bodies -> no register plan, no push/pop parity,
+//     no encoder guardrails to enforce here.
+//   - String literal on a single line (fingerprint-extractor
+//     requirement + libpdx-argv linker resolves the symbol as-is).
+//   - Array size == literal byte count including NUL: "mkdir\0" = 6
+//     bytes.
+//   - `pub let` (public + immutable = .rodata) so a future
+//     libpdx-argv link can resolve the UND ref against it.
+
+module ToolIdent = structure {
+
+  // ============================================================================
+  // PDX_TOOL_NAME — lowercase tool name, NUL-terminated. Read by
+  // libpdx-argv VersionBackend::emit_default at run time via the
+  // `lea rdi, [rip + PDX_TOOL_NAME]` idiom (segment 1a of the
+  // ENH-032 emit_default body); the byte-count is computed via
+  // VersionBackend::version_strlen and clamped to
+  // TOOL_NAME_UPPER_MAX (32 bytes) for the uppercase mirror.
+  // "mkdir" fits trivially; the array is 6 bytes including NUL.
+  // ============================================================================
+  pub let PDX_TOOL_NAME : [u8; 6] = "mkdir\0"
+
+}
