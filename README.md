@@ -1,12 +1,13 @@
 # mkdir
 
-paideia-os directory create — at v1.1-A a minimum viable body that
-walks argv positionals and calls the real `sys_mkdir` syscall
+paideia-os directory create — as of `v1.3.0` a minimum viable body
+that walks argv positionals and calls the real `sys_mkdir` syscall
 (paideia-os sysno 79, kernel body at
 `src/kernel/core/syscall/sys_mkdir.pdx`, R56.M3-004 #1793) per
-positional with mode 0755.
+positional with mode 0755. See `CHANGELOG.md` for the full
+`v1.1-A` → `v1.2.0` → `v1.3.0` → `v1.4.0` lineage.
 
-## Synopsis (v1.1-A)
+## Synopsis (v1.3.0)
 
     mkdir <PATH> [<PATH>...]
 
@@ -17,10 +18,13 @@ Every positional is created with mode `0755` (`0x1ED`) and a
 (passed to `sys_exit` verbatim). No positional → exit 2 with
 `mkdir: missing operand\n`.
 
-No flags are recognised at v1.1-A. `-p`, `-m`, `-v`, `--dry-run`,
-`--schema`, `--version` all wait on v1.2-A (see `CHANGELOG.md`
-Unreleased v1.2-A follow-ups). `--help` remains shell-dispatched to
-`doc mkdir`.
+`-p`, `-m`, `-v`, `--dry-run`, `--schema` are not yet recognised.
+`-p` (idempotent parent-creation) and `-m <mode>` (octal mode +
+`sys_chmod`) planning is tracked in `design/mkdir-v1.2-planning.md`
+(paideia-os/mkdir#33; implementation targets a future `v1.2.0-A`
+release — planning only, no code yet). `--json` landed at `v1.3.0`
+(`mkdir.ENH-002`, fix #17; see `CHANGELOG.md`). `--help` remains
+shell-dispatched to `doc mkdir`.
 
 Install:
 
@@ -28,14 +32,15 @@ Install:
 
 `pkg` verifies the dual-signed `manifest.pdxsig` (ML-DSA-65 under
 `author_pk` + `paideia_root_pk`) before extracting into
-`/pkgs/mkdir-1.0.0/` and symlinking `/bin/mkdir`.
-(The `1.0.0` path stays until v1.1-A cuts a `1.1.0` tag.)
+`/pkgs/mkdir-<version>/` and symlinking `/bin/mkdir`. Current tag:
+`v1.4.0` (see `CHANGELOG.md`; no standalone `v1.1.0` tag was ever
+cut — that work shipped folded into `v1.2.0`).
 
 ## Description (SUPERSEDED — v1.0.0 tag)
 
 **The v1.0.0 description below documents the M1..M5 STUB scaffold
-that v1.1-A retires at HEAD.** See `CHANGELOG.md` Unreleased v1.1-A
-for the file-by-file retirement inventory and the new
+that v1.1-A retires at HEAD.** See `CHANGELOG.md` v1.1-A (folded
+into tag `v1.2.0`) for the file-by-file retirement inventory and the new
 `_start` shape; `design/architecture.md` §"v1.1-A extraction" for
 the register plan + encoder discipline.
 

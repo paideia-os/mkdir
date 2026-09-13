@@ -4,7 +4,53 @@ Semver-tagged release history. Every entry corresponds to a git tag on
 this repository and (starting at 1.0.0) a dual-signed
 `manifest.pdxsig` at the same commit.
 
-## Unreleased — v1.2.0 (Wave E omnibus)
+## 1.4.0 — 2026-09-13 — Release closer (fix #31)
+
+Administrative release-closer: this repository accumulated four
+stacked `## Unreleased` CHANGELOG headers (Wave E, v1.1-B, v1.1-A,
+Enhancement v1.x) across three actual `git tag` cuts (`v1.0.0`,
+`v1.2.0`, `v1.3.0`) without the version bookkeeping ever catching
+up. Closes paideia-os/mkdir#31 by:
+
+- Finalising the "Unreleased — v1.2.0 (Wave E omnibus)" header below
+  into a dated `## 1.2.0` entry matching the existing `v1.2.0` tag
+  (commit `ce36a5f`).
+- Demoting the v1.1-B / v1.1-A / Enhancement-v1.x headers to `###`
+  sub-entries annotated "folded into tag `v1.2.0`" — no standalone
+  `v1.1.0` tag was ever cut (confirmed against `git tag`), so those
+  three waves ship under the `v1.2.0` release, not a `v1.1.0` one.
+- Backfilling a `## 1.3.0` entry (below) for the `mkdir.ENH-002`
+  `--json` commit (fix #17, `16bd442`), which landed with no
+  CHANGELOG/VERSION/manifest paperwork at all.
+- Bumping `VERSION` (`1.2.0` → `1.4.0`), `README.md`'s version
+  banner, and regenerating `manifest.pdxsig`'s placeholder file
+  inventory and `%ver` field to `1.4.0` (still unsigned —
+  `author_pk`/`paideia_root_pk` remain PLACEHOLDER pending the
+  v0.33 crypto rollout, T-INFRA-001/002).
+
+**Versioning note.** Issue #31 was filed as "v1.1-C release closer"
+against a plan to cut a `v1.1.0` tag. By the time it landed, `v1.2.0`
+and `v1.3.0` had already shipped ahead of it in git history. Cutting
+`v1.1.0` now, behind two already-released tags, would violate
+monotonic tag ordering along mainline, so this closer ships as
+`v1.4.0` — the next semver after the current latest tag (`v1.3.0`) —
+per the issue's own "or next semver if already exists" fallback,
+applied to the de-facto latest tag rather than the literal `v1.1.0`
+string.
+
+No source (`src/`) changes in this release.
+
+## 1.3.0 — 2026-09-13 — `--json` stdout output (fix #17)
+
+Backfilled entry — the originating commit (`16bd442`,
+`mkdir.ENH-002: --json output on stdout (fix #17)`, already tagged
+`v1.3.0`) touched only `src/mkdir.pdx` (149 lines) and shipped with
+no CHANGELOG/VERSION/manifest update. See `git show v1.3.0` for the
+file-level diff; the `--json` flag serialises the per-invocation
+result to stdout instead of (or alongside) the human-readable exit
+path. No caps/schema/deps changes.
+
+## 1.2.0 — 2026-09-13 — Wave E omnibus (tag `v1.2.0`)
 
 Bundles the paideia-os/mkdir open-issue drain. Closes five issues in
 one signed release cut:
@@ -202,7 +248,7 @@ posture cat/src/tool_ident.pdx took at v1.2.0-A.
   exec per R90-XREPO.013.M2-001 rather than seeding a caller-
   side cap_table.
 
-## Unreleased — v1.1-B (userspace cwd-relative resolution)
+### v1.1-B (userspace cwd-relative resolution) — folded into tag `v1.2.0`
 
 Closes paideia-os/mkdir#25 (`mkdir.ENH-010 wire relative-path
 resolution to the kernel cwd (R86 sys_getcwd)`).
@@ -321,7 +367,7 @@ userspace so the argv-visible path IS the on-disk path.
   surface. `-p` multi-level with parent creation still relands at
   v1.2-A.
 
-## Unreleased — v1.1-A (real body extraction)
+### v1.1-A (real body extraction) — folded into tag `v1.2.0`
 
 Retires the M1-001 STUB scaffold: the M1..M5 tree dispatched every
 create/probe/stamp/commit step through placeholder `sys_cap_invoke`
@@ -405,7 +451,7 @@ can invoke and observe a directory afterwards.
   the audit hookup at v1.2-A once a real `libpdx-semantic-pipe
   send_record` consumer exists.
 
-## Unreleased — Enhancement v1.x (milestone #6)
+### Enhancement v1.x (milestone #6) — folded into tag `v1.2.0`
 
 Post-1.0 correctness + doc-truth fixes tracked in
 `design/enhancement-plan.md`. Landing incrementally; each entry below

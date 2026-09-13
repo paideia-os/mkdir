@@ -1,12 +1,12 @@
 %pdxsig 0.1
 %tool  mkdir
-%ver   1.2.0
-%wave  R50 + R90-XREPO.013.M3-006 + R107-M0-001
-%git   b12b264344e83ac51074c4f72233ff2f2ee4d8de
+%ver   1.4.0
+%wave  R50 + R90-XREPO.013.M3-006 + R107-M0-001 + mkdir#31-release-closer
+%git   PLACEHOLDER_HEAD_AT_TAG_v1_4_0____________________________
 %plan  design/tooling/plan.md §D4 + §6.4 (paideia-os);
 %plan  design/round-retrospectives/r90-xrepo-wave3-plan.md §R90-XREPO.013.M3-006 (paideia-os).
 
-# manifest.pdxsig — mkdir 1.2.0 dual-signed release manifest
+# manifest.pdxsig — mkdir 1.4.0 dual-signed release manifest
 #
 # Layout per design/tooling/plan.md §D4:
 #   1. [manifest]      header + per-file content-hash table (below)
@@ -39,23 +39,27 @@
 # row here; nothing else is in the package.
 
 [manifest]
-# v1.2.0 body (M5-era hash rows retired at v1.1-A; the current
+# v1.4.0 body (M5-era hash rows retired at v1.1-A; the current
 # per-file SHA-256 table is regenerated at signing-bot time per
 # design/tooling/plan.md §D4). Placeholder rows below name the
-# v1.2.0 file inventory only — the SHA-256 columns are recomputed
+# v1.4.0 file inventory only — the SHA-256 columns are recomputed
 # on the next signed release cut by the paideia-signing-bot.
-PLACEHOLDER_SHA256_v1_2_0_mkdir_src_mkdir_pdx_______________________  src/mkdir.pdx
-PLACEHOLDER_SHA256_v1_2_0_mkdir_src_tool_ident_pdx__________________  src/tool_ident.pdx
-PLACEHOLDER_SHA256_v1_2_0_mkdir_tests_mk_dot_smoke_pdx______________  tests/mk_dot_smoke.pdx
-PLACEHOLDER_SHA256_v1_2_0_mkdir_tests_README_md_____________________  tests/README.md
-PLACEHOLDER_SHA256_v1_2_0_mkdir_caps_decl___________________________  caps.decl
-PLACEHOLDER_SHA256_v1_2_0_mkdir_deps_list___________________________  deps.list
-PLACEHOLDER_SHA256_v1_2_0_mkdir_doc_mkdir_pdxdoc____________________  doc/mkdir.pdxdoc
-PLACEHOLDER_SHA256_v1_2_0_mkdir_LICENSE_____________________________  LICENSE
-PLACEHOLDER_SHA256_v1_2_0_mkdir_README_md___________________________  README.md
-PLACEHOLDER_SHA256_v1_2_0_mkdir_VERSION_____________________________  VERSION
-PLACEHOLDER_SHA256_v1_2_0_mkdir_design_architecture_md______________  design/architecture.md
-PLACEHOLDER_SHA256_v1_2_0_mkdir_design_enhancement_plan_md__________  design/enhancement-plan.md
+# No src/caps/schema/deps changes since v1.2.0 other than the
+# v1.3.0 --json addition to src/mkdir.pdx (fix #17) and the
+# v1.2-planning design doc added at v1.4.0 (mkdir#33, planning only).
+PLACEHOLDER_SHA256_v1_4_0_mkdir_src_mkdir_pdx_______________________  src/mkdir.pdx
+PLACEHOLDER_SHA256_v1_4_0_mkdir_src_tool_ident_pdx__________________  src/tool_ident.pdx
+PLACEHOLDER_SHA256_v1_4_0_mkdir_tests_mk_dot_smoke_pdx______________  tests/mk_dot_smoke.pdx
+PLACEHOLDER_SHA256_v1_4_0_mkdir_tests_README_md_____________________  tests/README.md
+PLACEHOLDER_SHA256_v1_4_0_mkdir_caps_decl___________________________  caps.decl
+PLACEHOLDER_SHA256_v1_4_0_mkdir_deps_list___________________________  deps.list
+PLACEHOLDER_SHA256_v1_4_0_mkdir_doc_mkdir_pdxdoc____________________  doc/mkdir.pdxdoc
+PLACEHOLDER_SHA256_v1_4_0_mkdir_LICENSE_____________________________  LICENSE
+PLACEHOLDER_SHA256_v1_4_0_mkdir_README_md___________________________  README.md
+PLACEHOLDER_SHA256_v1_4_0_mkdir_VERSION_____________________________  VERSION
+PLACEHOLDER_SHA256_v1_4_0_mkdir_design_architecture_md______________  design/architecture.md
+PLACEHOLDER_SHA256_v1_4_0_mkdir_design_enhancement_plan_md__________  design/enhancement-plan.md
+PLACEHOLDER_SHA256_v1_4_0_mkdir_design_mkdir_v1_2_planning_md_______  design/mkdir-v1.2-planning.md
 
 [capabilities]
 # Copied verbatim from caps.decl for the fast-path verifier (`pkg
@@ -104,11 +108,11 @@ MkdirRecord@0.1
 # content changes, not layout changes.
 
 [author-sig]
-PLACEHOLDER_AUTHOR_SIGNATURE_v1_2_0_mkdir_wave_E________________
-PLACEHOLDER_AUTHOR_SIGNATURE_v1_2_0_mkdir_wave_E________________
-PLACEHOLDER_AUTHOR_SIGNATURE_v1_2_0_mkdir_wave_E________________
-PLACEHOLDER_AUTHOR_SIGNATURE_v1_2_0_mkdir_wave_E________________
-PLACEHOLDER_AUTHOR_SIGNATURE_v1_2_0_mkdir_wave_E________________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_4_0_mkdir_release_closer________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_4_0_mkdir_release_closer________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_4_0_mkdir_release_closer________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_4_0_mkdir_release_closer________
+PLACEHOLDER_AUTHOR_SIGNATURE_v1_4_0_mkdir_release_closer________
 
 # ============================================================================
 # §3  [paideia-sig] — ML-DSA-65 signature under paideia_root_pk
@@ -127,10 +131,10 @@ PLACEHOLDER_AUTHOR_SIGNATURE_v1_2_0_mkdir_wave_E________________
 # (I3 shared exit-code convention).
 
 [paideia-sig]
-PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_2_0_mkdir_wave_E__________
-PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_2_0_mkdir_wave_E__________
-PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_2_0_mkdir_wave_E__________
-PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_2_0_mkdir_wave_E__________
-PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_2_0_mkdir_wave_E__________
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_4_0_mkdir_release_closer__
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_4_0_mkdir_release_closer__
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_4_0_mkdir_release_closer__
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_4_0_mkdir_release_closer__
+PLACEHOLDER_PAIDEIA_ROOT_SIGNATURE_v1_4_0_mkdir_release_closer__
 
-# EOF — end of dual-signed manifest for mkdir 1.2.0
+# EOF — end of dual-signed manifest for mkdir 1.4.0
