@@ -209,6 +209,36 @@ module Mkdir = structure {
   pub let err_path_too_long_msg   : [u8; 32] = "mkdir: resolved path too long\n\0\0"
   pub let err_path_too_long_len   : u64 = 30
 
+  // mkdir.ENH-002 (paideia-os/mkdir#17): --json diagnostics.
+  pub let err_unknown_flag_msg    : [u8; 24] = "mkdir: unknown flag\n\0\0\0\0"
+  pub let err_unknown_flag_len    : u64 = 20
+
+  // --json literal (byte-exact match: `--json\0`).
+  pub let flag_json_lit           : [u8; 8]  = "--json\0\0"
+  pub let flag_json_lit_len       : u64 = 6
+
+  // JSON emit pieces.  A single successful mkdir emits:
+  //   {"tool":"mkdir","path":"<path>","mode":493,"status":0}\n
+  //
+  // Composed piecewise: HEAD + <path bytes> + TAIL. The path bytes are
+  // whichever composed path was handed to sys_mkdir (either argv[i] on
+  // the absolute-fast-path or _mkdir_resolved_scratch on the cwd-
+  // resolved arm), sourced from _mkdir_record_buf[0] (path_ptr) and
+  // _mkdir_record_buf[8] (path_len). Ordering matches the record
+  // layout so a downstream consumer parsing the JSON sees the same
+  // path bytes it would see reading _mkdir_record_buf[path_ptr].
+  //
+  // Mode is always the frozen 0755 = 493; status is always 0 (the
+  // json emit only runs after a successful sys_mkdir). If v1.3+ adds
+  // -m / --mode, the mode literal is composed from _mkdir_record_buf
+  // [16] via a decimal formatter; the shape here anticipates that by
+  // isolating the mode in the TAIL blob.
+  pub let json_head               : [u8; 24] = "{\"tool\":\"mkdir\",\"path\":\""
+  pub let json_head_len           : u64 = 24
+
+  pub let json_tail               : [u8; 32] = "\",\"mode\":493,\"status\":0}\n\0\0\0\0\0\0\0\0"
+  pub let json_tail_len           : u64 = 25
+
   // -----------------------------------------------------------------------
   // .bss scratches
   //
@@ -231,6 +261,12 @@ module Mkdir = structure {
   // sys_semantic_send.pdx §Section 2) is 7.5x this size; the [1, 240]
   // length gate never trips on our 32-byte emit.
   pub let mut _mkdir_record_buf       : [u8; 32]  = uninit @align(8)
+
+  // mkdir.ENH-002 (paideia-os/mkdir#17): --json toggle slot. Zeroed at
+  // _start entry; set to 1 by the flag-recognition arm below whenever
+  // argv[i] is byte-exact "--json". Consulted in the success arm after
+  // sys_semantic_send to decide whether to emit the JSON diagnostic.
+  pub let mut _mkdir_flag_json        : u64       = uninit @align(8)
 
   // -----------------------------------------------------------------------
   // _start -- user program entry point. Never returns.
@@ -292,6 +328,16 @@ module Mkdir = structure {
         mov [r11 + 24], rax;                   // status = 0 (success only)
 
         // ==========================================================
+        // mkdir.ENH-002 (paideia-os/mkdir#17): zero the --json flag
+        // slot at entry so a stale value from a prior process image
+        // (loader-side .bss reuse; rare but defensible) cannot bleed
+        // through into this invocation.
+        // ==========================================================
+        xor rax, rax;
+        lea r11, [rip + _mkdir_flag_json];
+        mov [r11], rax;
+
+        // ==========================================================
         // Phase 1 -- per-positional loop.
         // ==========================================================
 
@@ -305,6 +351,47 @@ module Mkdir = structure {
         // Classify first byte.
         xor rax, rax;
         mov_b rax, [r15];
+
+        // ==========================================================
+        // mkdir.ENH-002 (paideia-os/mkdir#17): flag arm.
+        //
+        // A leading '-' means this positional is a flag, not a path.
+        // v1.2.0 recognises exactly one flag (--json); any other
+        // '-' prefix is rejected with exit 2 (MK_MISSING_PATH is
+        // repurposed here as UNKNOWN_FLAG's exit code, matching the
+        // POSIX shell convention of "usage error" == 2).
+        //
+        // On match: set _mkdir_flag_json = 1, advance r13, loop.
+        // On mismatch: emit `mkdir: unknown flag\n` and sys_exit(2).
+        // ==========================================================
+        cmp rax, 0x2D;                         // '-'
+        jne mkdir_after_flag_check;
+
+        // Byte-exact compare argv[i] against "--json\0". 7 bytes
+        // including NUL. r15 = argv[i], compare byte-by-byte.
+        xor rcx, rcx;
+      mkdir_flag_cmp_top:
+        cmp rcx, 7;                            // 6 payload + NUL
+        jae mkdir_flag_matched;
+        xor rax, rax;
+        mov_b rax, [r15 + rcx*1];
+        lea r11, [rip + flag_json_lit];
+        xor rdx, rdx;
+        mov_b rdx, [r11 + rcx*1];
+        cmp rax, rdx;
+        jne mkdir_unknown_flag;
+        add rcx, 1;
+        jmp mkdir_flag_cmp_top;
+
+      mkdir_flag_matched:
+        // --json recognised; record and consume the positional.
+        lea r11, [rip + _mkdir_flag_json];
+        mov rax, 1;
+        mov [r11], rax;
+        add r13, 1;
+        jmp mkdir_loop_head;
+
+      mkdir_after_flag_check:
         cmp rax, 0x2F;                         // '/'
         je  mkdir_use_raw_absolute;
 
@@ -511,6 +598,57 @@ module Mkdir = structure {
         mov rax, 115;                          // SC+ ID 115 = sys_semantic_send
         syscall;
 
+        // ==========================================================
+        // mkdir.ENH-002 (paideia-os/mkdir#17): --json diagnostic emit.
+        //
+        // If _mkdir_flag_json is set, compose and emit
+        //   {"tool":"mkdir","path":"<path>","mode":493,"status":0}\n
+        // to stdout (fd 1) as three sys_write calls: HEAD, path bytes,
+        // TAIL. Path bytes are sourced from _mkdir_record_buf[0]
+        // (path_ptr, u64) and _mkdir_record_buf[8] (path_len, u64) so
+        // the JSON echoes the SAME bytes the semantic-pipe record
+        // carries. Three separate writes rather than one composed
+        // scratch: mkdir owns no larger scratch, and the stdout fd is
+        // UART-fast-pathed for fd 1 like fd 2 per src/kernel/core/
+        // syscall/dispatch.pdx §sys_write. The three writes are not
+        // atomic against a concurrent writer on the same fd but a
+        // single-tool process holds the tty exclusively per shell.M4
+        // KIND_TTY handoff so interleaving is not a concern.
+        //
+        // Register discipline: r11 first reloaded to _mkdir_flag_json
+        // for the read, then re-lea'd to _mkdir_record_buf for the
+        // path_ptr/path_len loads. No live register survives across
+        // the three syscalls (rdi/rsi/rdx/rax scratch; r15 already
+        // pinned as raw argv pointer but not consulted here).
+        // ==========================================================
+        lea r11, [rip + _mkdir_flag_json];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  mkdir_after_json;
+
+        // HEAD: write json_head bytes to fd 1.
+        mov rdi, 1;                            // fd = stdout
+        lea rsi, [rip + json_head];
+        mov rdx, 24;                           // json_head_len
+        mov rax, 1;                            // SC+ ID 1 = sys_write
+        syscall;
+
+        // PATH: write path_ptr, path_len bytes to fd 1.
+        lea r11, [rip + _mkdir_record_buf];
+        mov rdi, 1;
+        mov rsi, [r11 + 0];                    // path_ptr
+        mov rdx, [r11 + 8];                    // path_len
+        mov rax, 1;
+        syscall;
+
+        // TAIL: write json_tail bytes to fd 1.
+        mov rdi, 1;
+        lea rsi, [rip + json_tail];
+        mov rdx, 25;                           // json_tail_len
+        mov rax, 1;
+        syscall;
+
+      mkdir_after_json:
         // Success on this positional; advance i and loop.
         add r13, 1;
         jmp mkdir_loop_head;
@@ -573,6 +711,17 @@ module Mkdir = structure {
         mov rax, 12;
         syscall;
         mov rdi, 4;                            // MK_PATH_TOO_LONG
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      mkdir_unknown_flag:
+        // mkdir.ENH-002 (paideia-os/mkdir#17): unknown flag exit path.
+        lea rdi, [rip + err_unknown_flag_msg];
+        mov rsi, 20;                           // err_unknown_flag_len
+        mov rax, 12;                           // SC+ ID 12 = sys_debug_puts
+        syscall;
+        mov rdi, 2;                            // usage error
         mov rax, 60;
         syscall;
         hlt
